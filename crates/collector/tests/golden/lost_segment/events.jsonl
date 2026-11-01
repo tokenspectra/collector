@@ -1,0 +1,1 @@
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","kind":"gap_lost","stream_off":36,"len":32,"window_start_ns":null,"index":null}
