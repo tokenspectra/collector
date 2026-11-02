@@ -2,12 +2,17 @@
 # requires-python = ">=3.11"
 # dependencies = ["openai==3.42.1", "httpx[http2]==0.28.1", "h2==4.4.1"]
 # ///
-"""Captures real OpenAI-protocol traffic into golden .pcapng fixtures.
+"""Captures real Wire Protocol traffic into golden .pcapng fixtures.
 
-Starts mock_openai.py on loopback, then for each scenario starts dumpcap on
-`lo`, drives the official OpenAI Python SDK (or httpx) against the mock over
+Starts mock_server.py on loopback, then for each scenario starts dumpcap on
+`lo`, drives a client (an official SDK, or httpx) against the mock over
 HTTP/1.1 or h2c, stops dumpcap and writes
 crates/collector/tests/fixtures/<scenario>.pcapng.
+
+Scenarios live with their protocol: capture_openai.py, ... each export
+`SCENARIOS`, a dict from fixture name to a function of the port. A new
+protocol adds its module and one line to SCENARIO_MODULES, plus its client
+SDK to the dependencies above.
 
 Run once, from the repo root, and commit the files; CI only replays them.
 dumpcap needs the wireshark group:
@@ -26,61 +31,26 @@ import threading
 import time
 from pathlib import Path
 
-import httpx
-import openai
+import capture_openai
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE.parent.parent / "crates/collector/tests/fixtures"
-MODEL = "mock-model"
-MESSAGES = [{"role": "user", "content": "Say hello."}]
+
+# One line per Wire Protocol.
+SCENARIO_MODULES = [capture_openai]
 
 
-def sdk(port, http2):
-    http_client = httpx.Client(http1=not http2, http2=http2)
-    return openai.OpenAI(
-        base_url=f"http://127.0.0.1:{port}/v1", api_key="none", http_client=http_client, max_retries=0
-    )
+def scenarios():
+    table = {}
+    for module in SCENARIO_MODULES:
+        for name, run in module.SCENARIOS.items():
+            if name in table:
+                sys.exit(f"scenario {name} defined twice")
+            table[name] = run
+    return table
 
 
-def json_calls(c):
-    c.chat.completions.create(model=MODEL, messages=MESSAGES, seed=7, max_tokens=4)
-    c.completions.create(model=MODEL, prompt="Say hello.", max_tokens=4)
-
-
-def sse_calls(c):
-    for _ in c.chat.completions.create(
-        model=MODEL, messages=MESSAGES, seed=7, max_tokens=4, stream=True,
-        stream_options={"include_usage": True},
-    ):
-        pass
-    for _ in c.completions.create(model=MODEL, prompt="Say hello.", max_tokens=4, stream=True):
-        pass
-
-
-def http_other(port):
-    with httpx.Client(base_url=f"http://127.0.0.1:{port}") as c:
-        c.get("/health")
-        c.get("/v1/models")
-        # Not JSON: the pair is http_other, not a Workunit.
-        c.post("/v1/chat/completions", content=b'{"model":', headers={"content-type": "application/json"})
-
-
-def with_sdk(http2, calls):
-    def run(port):
-        c = sdk(port, http2)
-        calls(c)
-        c.close()
-
-    return run
-
-
-SCENARIOS = {
-    "openai_h1_json": with_sdk(False, json_calls),
-    "openai_h1_sse": with_sdk(False, sse_calls),
-    "openai_h2c_json": with_sdk(True, json_calls),
-    "openai_h2c_sse": with_sdk(True, sse_calls),
-    "http_other_h1": http_other,
-}
+SCENARIOS = scenarios()
 
 
 def capture(name, port, dumpcap):
@@ -118,7 +88,7 @@ def main():
     ap.add_argument("--dumpcap", default="dumpcap")
     args = ap.parse_args()
     server = subprocess.Popen(
-        [sys.executable, str(HERE / "mock_openai.py"), "--port", str(args.port)],
+        [sys.executable, str(HERE / "mock_server.py"), "--port", str(args.port)],
         stdout=subprocess.PIPE, text=True,
     )
     try:

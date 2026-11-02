@@ -8,6 +8,7 @@
 //! the pipeline runs. Nothing here feeds back into the pipeline: stats are
 //! diagnostics, never part of the deterministic outputs.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -193,7 +194,8 @@ pub struct Registry {
     pub(crate) flows_new: AtomicU64,
     pub(crate) flows_with_workunit: AtomicU64,
     accounted: [Labeled<2>; 5],
-    workunits: [Labeled<4>; 3],
+    /// `[outcome][http_class]` by Wire Protocol id.
+    workunits: Mutex<BTreeMap<&'static str, [[u64; 4]; 3]>>,
     pub(crate) gaps: AtomicU64,
     pub(crate) gap_bytes: AtomicU64,
     pub(crate) retransmit_bytes: AtomicU64,
@@ -226,7 +228,13 @@ impl Default for Registry {
             flows_new: AtomicU64::new(0),
             flows_with_workunit: AtomicU64::new(0),
             accounted: std::array::from_fn(|_| zeros()),
-            workunits: std::array::from_fn(|_| zeros()),
+            // Built-in protocols are listed from the start, at zero.
+            workunits: Mutex::new(
+                crate::wire::BUILTIN
+                    .iter()
+                    .map(|p| (p.id(), [[0; 4]; 3]))
+                    .collect(),
+            ),
             gaps: AtomicU64::new(0),
             gap_bytes: AtomicU64::new(0),
             retransmit_bytes: AtomicU64::new(0),
@@ -260,8 +268,9 @@ impl Registry {
         add(&self.accounted[bucket_idx(bucket)][dir.idx()], n);
     }
 
-    pub(crate) fn add_workunit(&self, outcome: Outcome, class: HttpClass) {
-        add(&self.workunits[outcome.idx()][class.idx()], 1);
+    pub(crate) fn add_workunit(&self, protocol: &'static str, outcome: Outcome, class: HttpClass) {
+        let mut w = self.workunits.lock().unwrap_or_else(|e| e.into_inner());
+        w.entry(protocol).or_insert([[0; 4]; 3])[outcome.idx()][class.idx()] += 1;
     }
 
     pub(crate) fn set_window(&self, w: WindowStats, lag_s: f64) {
@@ -284,7 +293,7 @@ impl Registry {
             flows_new: self.flows_new.load(Ordering::Relaxed),
             flows_with_workunit: self.flows_with_workunit.load(Ordering::Relaxed),
             accounted: std::array::from_fn(|b| load(&self.accounted[b])),
-            workunits: std::array::from_fn(|o| load(&self.workunits[o])),
+            workunits_by_protocol: self.workunits.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             gaps: self.gaps.load(Ordering::Relaxed),
             gap_bytes: self.gap_bytes.load(Ordering::Relaxed),
             retransmit_bytes: self.retransmit_bytes.load(Ordering::Relaxed),
@@ -324,8 +333,9 @@ pub struct Snapshot {
     pub flows_with_workunit: u64,
     /// `[bucket][dir]`, in [`BUCKETS`] and [`DIRS`] order.
     pub accounted: [[u64; 2]; 5],
-    /// `[outcome][http_class]`, in [`Outcome::ALL`] and [`HttpClass::ALL`] order.
-    pub workunits: [[u64; 4]; 3],
+    /// `[outcome][http_class]`, in [`Outcome::ALL`] and [`HttpClass::ALL`]
+    /// order, by Wire Protocol id.
+    pub workunits_by_protocol: BTreeMap<&'static str, [[u64; 4]; 3]>,
     pub gaps: u64,
     pub gap_bytes: u64,
     pub retransmit_bytes: u64,
@@ -378,16 +388,29 @@ impl Snapshot {
         self.accounted.iter().flatten().sum()
     }
 
+    /// `[outcome][http_class]` over every protocol.
+    pub fn workunits(&self) -> [[u64; 4]; 3] {
+        let mut t = [[0; 4]; 3];
+        for w in self.workunits_by_protocol.values() {
+            for (o, row) in w.iter().enumerate() {
+                for (c, n) in row.iter().enumerate() {
+                    t[o][c] += n;
+                }
+            }
+        }
+        t
+    }
+
     pub fn workunits_by(&self, o: Outcome, c: HttpClass) -> u64 {
-        self.workunits[o.idx()][c.idx()]
+        self.workunits()[o.idx()][c.idx()]
     }
 
     pub fn workunits_with(&self, o: Outcome) -> u64 {
-        self.workunits[o.idx()].iter().sum()
+        self.workunits()[o.idx()].iter().sum()
     }
 
     pub fn workunits_total(&self) -> u64 {
-        self.workunits.iter().flatten().sum()
+        self.workunits().iter().flatten().sum()
     }
 }
 
@@ -664,12 +687,18 @@ pub fn render_prometheus(s: &Snapshot) -> String {
     p.family(
         name,
         "counter",
-        "Request Workunits by outcome and response status class.",
+        "Request Workunits by Wire Protocol, outcome and response status class.",
     );
-    for o in Outcome::ALL {
-        for c in HttpClass::ALL {
-            let labels = format!("outcome=\"{}\",http_class=\"{}\"", o.as_str(), c.as_str());
-            p.sample(name, &labels, s.workunits_by(o, c));
+    for (protocol, w) in &s.workunits_by_protocol {
+        for o in Outcome::ALL {
+            for c in HttpClass::ALL {
+                let labels = format!(
+                    "protocol=\"{protocol}\",outcome=\"{}\",http_class=\"{}\"",
+                    o.as_str(),
+                    c.as_str()
+                );
+                p.sample(name, &labels, w[o.idx()][c.idx()]);
+            }
         }
     }
     for (name, help, v) in [
@@ -860,12 +889,14 @@ mod tests {
     fn prometheus_lists_every_series() {
         let r = Registry::default();
         r.add_accounted(Bucket::Workunit, Dir::Resp, 7);
-        r.add_workunit(Outcome::Ok, HttpClass::S2xx);
+        r.add_workunit("openai", Outcome::Ok, HttpClass::S2xx);
         let text = render_prometheus(&r.snapshot());
         assert!(
             text.contains("ts_collector_accounted_bytes_total{bucket=\"workunit\",direction=\"resp\"} 7\n")
         );
-        assert!(text.contains("ts_collector_workunits_total{outcome=\"ok\",http_class=\"2xx\"} 1\n"));
+        assert!(text.contains(
+            "ts_collector_workunits_total{protocol=\"openai\",outcome=\"ok\",http_class=\"2xx\"} 1\n"
+        ));
         assert!(text.contains("ts_collector_packets_total{verdict=\"other\"} 0\n"));
         let samples = text.lines().filter(|l| !l.starts_with('#')).count();
         assert!(text.contains("ts_collector_capture_packets_total{cut=\"truncated\"} 0\n"));

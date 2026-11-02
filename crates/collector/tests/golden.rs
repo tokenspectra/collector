@@ -350,7 +350,12 @@ fn openai_json_over_http1_and_h2c() {
             assert_eq!(w.model.as_deref(), Some("mock-model"));
             assert!(w.sse_events.is_none() && w.usage.is_some());
             assert!(w.completed_ts_ns.unwrap() > w.received_ts_ns);
+            assert_eq!(
+                (w.protocol, w.output_tokens, &w.extra),
+                ("openai", Some(4), &None)
+            );
         }
+        assert_eq!(c.workunits[0].input_tokens, Some(9));
         assert_eq!(c.workunits[0].seed, Some(serde_json::json!(7)));
         assert_eq!(c.workunits[0].response_id.as_deref(), Some("chatcmpl-mock-0001"));
         assert_eq!(c.workunits[0].finish_reason[0].finish_reason, "stop");

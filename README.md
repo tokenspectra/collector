@@ -14,8 +14,8 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 ## In short
 
 - **Input:** live capture (dumpcap ring buffer, read as each file closes) or `.pcap`/`.pcapng` files, through one deterministic parser.
-- **Layers:** L0 pcapng chunks → L1 Flows (TCP reassembly) → L2 HTTP/1.1, HTTP/2, SSE → L3 OpenAI Wire Protocol → Request Workunits.
-- **Every Flow gets a protocol verdict and byte accounting,** OpenAI or not.
+- **Layers:** L0 pcapng chunks → L1 Flows (TCP reassembly) → L2 HTTP/1.1, HTTP/2 → L3 Wire Protocols (OpenAI today; one module each) → Request Workunits.
+- **Every Flow gets a protocol verdict and byte accounting,** whether a Wire Protocol claims it or not.
 - **Hashing:** BLAKE3, written as multihashes (`f1e20…`, spec §6), over 100% of payload: chunks, Flow streams per Slice, bodies.
 - **Storage:** write-once objects through the `object_store` crate (local FS for the PoC, S3-compatible later): compressed chunks, packs, Parquet index tables. Reads by hash go through the control plane and are verified.
 
@@ -25,6 +25,7 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 - Stage 2 (TS-25): protocol identification, byte accounting, HTTP/1.1, h2c, SSE and OpenAI Request Workunits.
 - Stage 3 (TS-28): console logging with verbosity levels, and one counter registry read by the window log line, an on-demand snapshot and Prometheus `/metrics` (spec §14).
 - Stage 4 (TS-26): BLAKE3 packet hashes and a Merkle root per chunk, the Slice hash chain, the Capture Rate cut, and the object store: zstd pcapng chunks, packs and Parquet index tables (spec §6–8).
+- Stage 5 (TS-29): a generic Wire Protocol layer: the `WireProtocol` trait and registry, shared SSE and NDJSON framing, OpenAI Chat Completions and legacy Completions ported onto it (spec §5).
 
 Implementation is tracked in Multica.
 
@@ -40,8 +41,10 @@ Implementation is tracked in Multica.
 | `net` | | Bounds-checked Ethernet/SLL/raw, IPv4/IPv6, TCP/UDP decoding |
 | `assembler`, `tcp` | §4 | Flows and Slices: TCP reassembly per direction, gaps, retransmits, `mid_stream_start`, UDP datagrams, other IP protocols |
 | `decode` | §5 | Protocol verdicts, request/response pairing, Workunit decisions, byte accounting per Flow, direction and Slice |
-| `http1`, `http2`, `hpack`, `sse` | §5 | Hand-written, bounds-checked parsers: HTTP/1.1 (chunked included), h2c frames, HPACK, server-sent events |
-| `openai` | §5 | The OpenAI Wire Protocol: which exchanges are Request Workunits, and the record fields read from their bodies |
+| `http1`, `http2`, `hpack` | §5 | Hand-written, bounds-checked parsers: HTTP/1.1 (chunked included), h2c frames, HPACK |
+| `wire` | §5 | The `WireProtocol` trait, the registry (`wire::BUILTIN`) and matching precedence |
+| `wire::framing` | §5 | Response framing shared by every protocol: SSE (data-only and named events), NDJSON, whole JSON |
+| `wire::openai` | §5 | The OpenAI Wire Protocol: Chat Completions and legacy Completions |
 | `output` | | JSON Lines tables (below) |
 | `chunk` | §6, §8 | L0 chunks as pcapng, written byte for byte; the Merkle root over a chunk's packet hashes |
 | `capture` | §7 | The Capture Rate cut: which packets a chunk keeps in full, the keyed draw per Workunit |
@@ -101,7 +104,7 @@ Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: re
 - `--no-bodies` turns this off. Hashes, lengths and every table stay the same; only `bodies/` and `by-exchange/` are missing.
 - **`by-exchange/`** is a view for people. A live run adds each window's exchanges as the window closes; the end of a run, or `collector views <out>`, rebuilds it from scratch:
   - `by-exchange/<flow>/<exchange>.request.<ext>` and `.response.<ext>` are symlinks to `../../bodies/<hash>`. `<flow>` is the Flow id with every character outside `[A-Za-z0-9._-]` replaced by `_`. `<ext>` is `json`, `sse` or `bin`, from the parsed media type. Empty bodies get no link.
-  - `<exchange>.response.merged.json`, for SSE Workunits only, joins the streamed chunks into one `chat.completion` (or `text_completion`) object: per choice, `role`, `content` and `reasoning` joined and the last `finish_reason`; `id`, `created` and `model` from the first event; the last `usage`. `incomplete: true` means `[DONE]` never arrived or an event didn't parse (`unparsed_events`).
+  - `<exchange>.response.merged.json`, for OpenAI SSE Workunits only, joins the streamed chunks into one `chat.completion` (or `text_completion`) object: per choice, `role`, `content` and `reasoning` joined and the last `finish_reason`; `id`, `created` and `model` from the first event; the last `usage`. `incomplete: true` means `[DONE]` never arrived or an event didn't parse (`unparsed_events`).
   - The merged file is derived and lossy. It is not evidence: it is never hashed, stored or compared with the API Tap. The raw body in `bodies/` is the source.
 - Bodies hold plaintext prompts and outputs (spec §10).
 - `bodies/` is the local view; the store keeps the same bodies in packs.
@@ -118,7 +121,9 @@ Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: re
 
 ### Request Workunits
 
-A request/response pair is a Request Workunit when the request is `POST /v1/chat/completions` or `POST /v1/completions` with a body that parses as JSON, and the response is `application/json`, or `text/event-stream` when the request set `"stream": true` (spec §5). Everything else is `http_other`.
+A request/response pair is a Request Workunit when a registered Wire Protocol claims its route, reads its request body, and accepts its response media type (spec §5). For OpenAI: `POST /v1/chat/completions` or `POST /v1/completions` with a JSON body, answered with `application/json`, or `text/event-stream` when the request set `"stream": true`. Everything else is `http_other`.
+
+**Adding a Wire Protocol** takes one module under `crates/collector/src/wire/` implementing `WireProtocol` (routes, optional header sniffing, request parsing, the response `Framing`, a frame decoder) and one line in `wire::BUILTIN`. Its fields beyond the common columns go in `extra`. `crates/collector/tests/wire_protocol.rs` registers a protocol that lives only in that test.
 
 The record follows the TS-15 capture record where the Link shows the field:
 
@@ -128,11 +133,13 @@ The record follows the TS-15 capture record where the Link shows the field:
 | received / completed timestamps | `received_ts_ns`, `completed_ts_ns` | capture time of the first request byte and the last response byte |
 | `model`, `stream` | `model`, `stream` | from the request body; also `seed`, `n` |
 | client request as received | `request_body_hash`, `request_body_len` | BLAKE3 of the body as on the wire (chunked encoding removed, content coding kept): the cross-check key with the API Tap (spec §11) |
-| `finish_reason` | `finish_reason` | per choice index, from the JSON body or the SSE chunks |
-| `usage` | `usage` | as sent |
+| | `protocol`, `endpoint` | the Wire Protocol's id (`openai`) and the route pattern the request matched |
+| `finish_reason` | `finish_reason` | per choice index, from the JSON body or the stream's frames |
+| `usage` | `usage`, `input_tokens`, `output_tokens` | `usage` as sent; the token counts read from it when the protocol reports them (OpenAI: `prompt_tokens`, `completion_tokens`) |
 | | `response_body_hash`, `response_id`, `response_model`, `status` | |
 | | `sse_events`, `sse_done` | each event's body offset, length and capture time; whether `data: [DONE]` arrived. One hash covers the whole SSE body (spec §6) |
 | | `complete` | both messages reached their end with no gap |
+| | `extra` | protocol-specific fields as one JSON object, `null` when there are none (always for OpenAI) |
 | `manifest_id`, `upstream`, forwarded request, token ids, logprobs, `scorable` | | not on the Link: the API Tap's side |
 
 A body with a gap has `body_hash: null`. A request body that is incomplete, has a gap, uses a content coding or exceeds `DecoderConfig::max_body` (16 MiB) cannot be checked as JSON, so its pair is `http_other`.
@@ -210,7 +217,7 @@ cargo build
 sg wireshark -c "target/debug/collector -v --metrics-addr 127.0.0.1:9464 ring -i lo -w 5 -t 120"
 ```
 
-1. Make some traffic on `lo` (e.g. `uv run fixtures/capture/mock_openai.py` and a client, or `curl localhost:<port>`). Every 5 s an INFO `window closed` line appears; with `-v`, a DEBUG `workunit` line per OpenAI request.
+1. Make some traffic on `lo` (e.g. `uv run fixtures/capture/mock_server.py` and a client, or `curl localhost:<port>`). Every 5 s an INFO `window closed` line appears; with `-v`, a DEBUG `workunit` line per OpenAI request.
 2. Press `s`, then Enter: each prints the snapshot table. The keys are not echoed.
 3. From another shell: `curl -s 127.0.0.1:9464/metrics | grep ts_collector_workunits_total`.
 4. Snapshot without a terminal: `kill -USR1 $(pgrep -x collector)` prints the same table. Or run detached, e.g. `target/debug/collector files -o out/ big.pcapng </dev/null &` then `kill -USR1 %1`.
@@ -238,16 +245,17 @@ cargo test --workspace
   - **Synthetic** fixtures, built packet by packet in `tests/support/fixtures.rs` and written by `cargo run -p collector --example gen_fixtures`: edge cases a live run can't produce on demand (lost segment, retransmit with different bytes, mid-stream start, Flows spanning windows, UDP, non-HTTP TCP, a TLS Flow on the plaintext Link, gRPC over h2c, HTTP/1.1 pipelining and a request whose response lands in the next window).
   - `dumpcap_keepalive-*`: real dumpcap ring files of a keep-alive Flow whose SYN predates the capture.
 - **Store** (`tests/store.rs`): every body, Workunit record and chunk is fetched by hash and verifies; each chunk's packets match the `packets` table and its Merkle root; Slice hashes are recomputed from the streams; two runs write byte-identical stores, and a re-run finds every object already there; an object with other bytes is never overwritten; a Capture Rate of 0 truncates exactly the Workunit packets and changes no table but `chunks`; the alarm cap; Parquet holds the same rows as the JSONL tables.
+- **Wire Protocols** (`tests/wire_protocol.rs`): a protocol defined only in the test, registered with one line, decodes NDJSON and named-SSE Workunits, wins a shared path by header and falls through to OpenAI on a body it cannot read, resumes NDJSON framing after a lost segment, and fills `protocol`, the token counts, `extra` and the `protocol` metric label. Framing unit tests split SSE (both styles) and NDJSON across segments and gaps.
 - **Logs and stats** (`tests/observe.rs`): the registry's final counters equal what the tables say, bytes by bucket sum to every Flow's bytes, `/metrics` is scraped and parsed, a `-v` run over every golden case logs one DEBUG line per expected Workunit, `SIGUSR1` prints the snapshot during a ring run, and runs at `-qq` and at `-vv` with metrics write identical output trees. The keypress snapshot needs a terminal, so it is in the smoke test above.
 - Besides the expected tables, the tests check that every body with a `body_hash` is kept under its hash, that every `by-exchange/` link resolves to a body matching its name, and that `--no-bodies` changes no table. They also check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
-- **Capturing the OpenAI fixtures again** (only when the mock or the scenarios change; CI never captures). Needs [uv](https://docs.astral.sh/uv/) and dumpcap; Python dependencies are pinned in the scripts:
+- **Capturing the protocol fixtures again** (only when the mock or the scenarios change; CI never captures). Needs [uv](https://docs.astral.sh/uv/) and dumpcap; Python dependencies are pinned in the scripts:
 
   ```sh
   sg wireshark -c "uv run fixtures/capture/capture.py"                  # every scenario
   sg wireshark -c "uv run fixtures/capture/capture.py openai_h2c_sse"   # one scenario
   ```
 
-  `fixtures/capture/mock_openai.py` serves fixed bodies on loopback, so only client headers and timing vary between captures. A small vLLM model would add realism, but the mock needs no GPU and keeps bodies fixed.
+  `fixtures/capture/mock_server.py` serves HTTP/1.1 and h2c on loopback; each Wire Protocol adds its routes in its own module (`mock_openai.py`) and its scenarios in another (`capture_openai.py`), plus one line in each script's list. It serves fixed bodies, so only client headers and timing vary between captures. A small vLLM model would add realism, but the mock needs no GPU and keeps bodies fixed.
 - **Live equals offline:** needs capture rights, so it is skipped unless enabled:
 
   ```sh

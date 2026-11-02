@@ -27,8 +27,10 @@ Everything below these eight points is proposal, not settled.
 - packet input: live and from files;
 - Flow assembly (TCP; UDP as datagrams);
 - protocol identification for every Flow;
-- HTTP/1.1, HTTP/2 and SSE;
-- the OpenAI Wire Protocol → Request Workunits;
+- HTTP/1.1 and HTTP/2;
+- a pluggable Wire Protocol layer (§5) with shared response framing (SSE, NDJSON) → Request Workunits:
+  - OpenAI Chat Completions and legacy Completions (TS-29);
+  - OpenAI Responses, Anthropic Messages and Ollama native, one module each (TS-30 to TS-32);
 - hashing, the Capture Rate cut, the object-store layout;
 - metadata and records sent to the control plane.
 
@@ -36,7 +38,7 @@ Everything below these eight points is proposal, not settled.
 - TLS decryption (§9);
 - Intermediate Workunits;
 - Signatures and Kinds;
-- Wire Protocols other than OpenAI (Anthropic Messages, gRPC, Dynamo TCP);
+- Wire Protocols that are not HTTP (gRPC payloads, Dynamo TCP);
 - QUIC payload parsing;
 - assigning statuses, which stays with the Classifier.
 
@@ -46,7 +48,7 @@ Everything below these eight points is proposal, not settled.
 L0  network packets on a Link   → pcapng chunk per window     every Flow, any protocol
 L1  Flow (TCP stream, per dir)  → Flow index + Slice hashes   every Flow, any protocol
 L2  HTTP message                → header block, body bytes    Flows that parse as HTTP
-L3  Wire Protocol               → Request Workunit record     HTTP that parses as OpenAI
+L3  Wire Protocol               → Request Workunit record     HTTP that a registered protocol reads
 ```
 
 - L0 and L1 don't depend on the protocol. Every byte on every Link reaches L1, so byte accounting and hashing cover 100% of traffic.
@@ -107,12 +109,35 @@ Ports and ALPN are hints at most. A Flow is a protocol only when its bytes parse
 | refines `http2`: `content-type: application/grpc` | `grpc` (parsed as HTTP/2, payload opaque) |
 | none of these | `opaque` |
 
-**Within HTTP**, a message pair is an OpenAI Request Workunit only if:
-- it is `POST /v1/chat/completions` or `POST /v1/completions`;
-- the request body is JSON;
-- the response is `application/json`, or `text/event-stream` when `stream=true`.
+**Within HTTP**, a message pair is a Request Workunit only if a registered Wire Protocol:
+- claims the request: one of its routes matches the method and path, and its headers do not rule it out;
+- reads the request body;
+- accepts the response's media type, which also fixes the response framing.
 
 Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other paths, or unparseable JSON.
+
+**Wire Protocols (TS-29).** Each protocol is one module behind the `WireProtocol` trait, listed once in a fixed registry. Adding one changes nothing outside its module but that registry line. A protocol declares:
+- **routes:** an HTTP method and a path pattern, matched against the path without query or fragment (absolute-form targets are reduced to their path). `*` matches any run of characters other than `/`. The pattern is the record's `endpoint`;
+- **header sniffing**, optional: for each matching route, `yes` (a header only this protocol sends, e.g. `anthropic-version`), `maybe` (no evidence), or `no` (ruled out). This serves gateways and self-hosted servers that expose several APIs on one port;
+- **request reading:** whether a complete, uncoded request body of at most `max_body` is its request, and the common request fields. Saying no is body sniffing: the next claim gets the body;
+- **response framing:** from the request and the response media type, `json`, `sse` or `ndjson`, or none (not a Workunit);
+- **a frame decoder:** frames in, common record fields and `extra` out. Protocols never see bytes.
+
+**Precedence is deterministic.** The claims on a request are ordered by header evidence (`yes` before `maybe`), then route specificity (more literal characters first, so an exact path beats a pattern), then registry order. The request body goes to each claim in that order; the first that reads it owns the exchange. The OpenAI module is first in the registry.
+
+**Response framing** is shared, so protocols handle events, not bytes. Bodies are framed after chunked encoding is removed; a content coding hides the frames, so the response is not read.
+
+| Framing | Frames | After a gap |
+|---|---|---|
+| `json` | The whole body, read once complete | Not read |
+| `sse` | Events (WHATWG `text/event-stream`): lines end in CRLF, LF or CR, a blank line ends an event, only events with `data` are reported. Each frame carries its `event:` name when it has one, so one framer serves data-only streams (OpenAI Chat) and named-event streams (OpenAI Responses, Anthropic) | Framing stops: event boundaries are lost |
+| `ndjson` | One JSON value per line, LF with an optional CR before it, blank lines skipped (Ollama native) | The cut line is lost; framing starts again at the next line, since a JSON line holds no raw newline |
+
+- A frame splits across any number of TCP segments, HTTP/1 chunks or HTTP/2 DATA frames; a frame's capture time is that of its last byte.
+- Lines longer than 16 MiB are dropped, not truncated. An SSE event that loses a field line this way is dropped whole (a comment line loses nothing). Either way the frame counts as lost, so the Workunit is `errored` (§14). An NDJSON body's last line may lack its newline.
+- When response bytes arrive before the request body is read (a server that answers early), they are held, up to `max_body`, and replayed once a protocol owns the exchange.
+
+**The common record** (`workunits`, §8) stays compatible with TS-15 and is the same for every protocol: `protocol` (the protocol's id), `endpoint`, `model`, `stream`, `status`, timing, body hashes and byte counts, `finish_reason` per choice index, `usage` as sent with `input_tokens` and `output_tokens` read from it when the protocol reports them, `complete`. `seed`, `n`, `response_id`, `response_model` are filled where the protocol has them. `sse_events` and `sse_done` are set for `sse` framing only; `sse_done` means the protocol's end-of-stream marker arrived (`data: [DONE]` for OpenAI). Protocol-specific fields go in `extra`, one JSON object built from the protocol's own typed struct, `null` when empty, never new top-level columns.
 
 **Byte accounting.** For each Flow, direction and Slice, every stream byte falls in exactly one bucket:
 
@@ -129,7 +154,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
   - `http_other` needs an Allowlist rule;
   - on a Flow covered by a Placement, `unexplained` bytes mean no Provenance, so Refuted ([ADR-0002](https://github.com/tokenspectra/tokenspectra/blob/main/docs/adr/0002-reproduce-every-byte-no-byte-accounting.md));
   - elsewhere, they leave the Slice Characterized or Unknown.
-- **Non-OpenAI Flows are hashed and stored like every other Flow.** L0 and L1 don't care about the protocol. The only difference is retention (§7): these Flows are the alarm, so they're kept in full.
+- **Flows with no Workunit are hashed and stored like every other Flow.** L0 and L1 don't care about the protocol. The only difference is retention (§7): these Flows are the alarm, so they're kept in full.
 
 ## 6. Hashing
 
@@ -235,7 +260,7 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - The links point at the store and never copy it. `--no-bodies` writes neither tree.
   - **Nothing from the Operator goes into a name unchecked.** `{flow}` is the Flow id with every character outside `[A-Za-z0-9._-]` replaced by `_`. `{exchange}` is the exchange number. `{ext}` comes from a fixed list chosen by the parsed media type: `json` for `application/json`, `sse` for `text/event-stream`, otherwise `bin`.
   - The tree is local output only. The object store keeps packs and the index (§8); the Store serves the same views on read (§11).
-- **Merged view of OpenAI streaming (proposal).** An SSE response is a series of `chat.completion.chunk` events, one token delta each. `{exchange}.response.merged.json` joins them into one `chat.completion` object, shaped like a non-streaming response:
+- **Merged view of OpenAI streaming (proposal).** Written for OpenAI SSE Workunits only, chosen by route, since the `http` row carries no protocol. An SSE response is a series of `chat.completion.chunk` events, one token delta each. `{exchange}.response.merged.json` joins them into one `chat.completion` object, shaped like a non-streaming response:
   - per choice `index`: `role`, `content` and `reasoning` joined in event order, the last `finish_reason`; plus `id`, `created`, `model` from the first event and the last `usage`;
   - `"incomplete": true` when `[DONE]` never arrived or an event did not parse, with the count of unparsed events, so a cut-off capture is still readable but never looks whole.
 - **The merged view sits beside the raw SSE body, never in its place.** It is derived, like the links:
@@ -312,7 +337,8 @@ Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in 
 3. **Live equals offline:** a live `RingSource` run and a `FileSource` run over the same dumpcap files give the same output.
 4. **Round trip:** every stored body and chunk can be fetched by hash, and verifies.
    - Locally: every `body_hash` has a file in `bodies/` named by it, whose `b3sum` matches the name, and every `by-exchange/` link resolves to it.
-5. **ROADMAP A2:** metadata for 100% of External Flows, and a Request Workunit for every OpenAI request, on a real Tap.
+5. **ROADMAP A2:** metadata for 100% of External Flows, and a Request Workunit for every request of a registered Wire Protocol, on a real Tap.
+6. **Wire Protocols:** a protocol registered only in a test decodes its Workunits with no change outside its module but one registry line. The framing has unit tests for SSE (both styles) and NDJSON, with frames split across TCP segments and gaps mid-stream.
 
 ## 13. Open questions
 
@@ -322,7 +348,9 @@ Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in 
 - **The `workunit_id` scheme**, and whether TS-15's UUID moves to it.
 - **dumpcap throughput and drops** at Link speed. Only loopback has been tested so far.
 - **Keyed-hash key management** (rotation, disclosure for audits), for the Payload privacy work.
-- **Anthropic Messages** (`/v1/messages`) as the second Wire Protocol. It needs its own research.
+- **Frame offsets for NDJSON.** `sse_events` records each SSE event's offset, length and capture time. NDJSON lines get the same from the framer but are not written yet; whether they go in `sse_events`, a renamed column, or `extra` is for TS-32 to settle.
+- **Merged views for other protocols.** The merge (§8) knows OpenAI chunks only. Each protocol could supply its own, which needs the protocol on the `http` row or a join with `workunits`.
+- **`extra` across protocols.** One JSON column keeps the schema fixed (§8 Parquet). If a field turns out common to several protocols, it should become a column rather than stay in `extra`.
 - **Keyed BLAKE3 in multihash.** The multicodec table has no code for keyed BLAKE3. Written under `0x1e`, a keyed hash would look like a plain one. The Payload privacy work (§10) needs its own code, from the private-use range or registered.
 - **Who writes `by-exchange/`.** The Collector writes it now, as each window closes (TS-28). It could move to a separate tool over the Collector's output: the merge is more parsing of Operator bytes, and the Collector is the component that must stay small.
 - **Bodies and the Capture Rate.** Bodies are kept by default (§8). Whether the Capture Rate also drops bodies of Workunits it doesn't keep, as it truncates their packets in L0 (§7), is open. So is a size cap per body, and the window a body belongs to when its message spans two.
@@ -337,7 +365,7 @@ Console logs and counters for the people running a Collector (TS-28). **They are
 - **ERROR:** dumpcap missing, not permitted or failing; write failures in the output; anything that ends the run.
 - **WARN:** capture drops reported by dumpcap or pcapng; a Flow that hits the reassembly buffer cap (`gap_buffer_limit`); a body over the size cap (`DecoderConfig::max_body`), hashed and counted but not read.
 - **INFO:** one line when dumpcap starts, with the interface and the capture filter (`none` if unset), so a filtered run is visible (§3); one line per closed window and one summary on exit. The window line has packets, bytes, Flows (new, active, closed), Request Workunits (`ok`, `errored`, `incomplete`), the share of accounted bytes in the `workunit` bucket, the share of closed Flows that carried a Workunit, gaps, and packets/s and Mbit/s over the window length.
-- **DEBUG:** one line per Request Workunit as it is emitted: `workunit_id`, Flow, request direction, method, path, model, HTTP status, `stream`, request and response body bytes, outcome. Also each new and closed Flow (with its verdict), gaps and anomalies.
+- **DEBUG:** one line per Request Workunit as it is emitted: `workunit_id`, Flow, Wire Protocol, request direction, method, path, model, HTTP status, `stream`, request and response body bytes, outcome. Also each new and closed Flow (with its verdict), gaps and anomalies.
 - **TRACE:** each reassembled segment.
 
 **Counters: one registry, three views.** One in-process registry, updated by the pipeline. The registry sits beside the sink: it sees every record on its way out and forwards it unchanged. It is read by:
@@ -355,7 +383,7 @@ Metrics, all prefixed `ts_collector_` (labels in brackets):
 | `flows_active` | Flows seen and not yet closed (gauge) |
 | `flows_with_workunit_total` | Closed Flows that carried at least one Request Workunit; over `flows_total`, the share of Flows that carry Workunits |
 | `accounted_bytes_total` `[bucket, direction]` | Stream bytes per bucket (§5) and direction (`orig`, `resp`); `workunit` over the sum is the share of bandwidth that is Workunits |
-| `workunits_total` `[outcome, http_class]` | Request Workunits. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the response could not be read: a body or SSE event that isn't JSON, a content coding, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
+| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding, a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
 | `gaps_total`, `gap_bytes_total` | Gaps (§4) and their bytes |
 | `retransmit_bytes_total`, `retransmit_differing_bytes_total` | Retransmitted stream bytes, and those that differ from the first copy |
 | `retransmits_differing_total` | `retransmit_differs` anomalies |
