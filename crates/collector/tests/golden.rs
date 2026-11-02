@@ -17,7 +17,7 @@ use collector::decode::{Bucket, Buckets, HttpVersion, Verdict};
 use collector::flow::Dir;
 use collector::{FileSource, RingSource};
 
-use collect::{collect_files, fixture_dir, fixture_paths, tables, tables_and_bodies};
+use collect::{collect_files, fixture_dir, fixture_paths, run_to_dir, tables, tables_and_bodies};
 
 /// Real traffic from `fixtures/capture/capture.py`: the OpenAI SDK against
 /// the mock server, captured with dumpcap on `lo`.
@@ -435,7 +435,7 @@ fn body_hashes_do_not_depend_on_framing() {
         collect_files(&[&format!("{name}.pcapng")])
             .workunits
             .iter()
-            .map(|w| (w.request_body_b3.clone(), w.response_body_b3.clone()))
+            .map(|w| (w.request_body_hash.clone(), w.response_body_hash.clone()))
             .collect()
     };
     assert_eq!(hashes("openai_h1_json"), hashes("openai_h2c_json"));
@@ -443,7 +443,7 @@ fn body_hashes_do_not_depend_on_framing() {
     let h = hashes("openai_h1_json");
     assert!(h
         .iter()
-        .all(|(a, b)| a.as_ref().unwrap().starts_with("b3:") && b.is_some()));
+        .all(|(a, b)| a.as_ref().unwrap().starts_with("f1e20") && b.is_some()));
 }
 
 #[test]
@@ -498,7 +498,7 @@ fn http1_edge_cases() {
         (
             metrics.body_len,
             metrics.body_gap_bytes,
-            metrics.body_b3.as_deref()
+            metrics.body_hash.as_deref()
         ),
         (20, 10, None)
     );
@@ -607,11 +607,7 @@ fn corrupted_payloads_never_break_accounting() {
             .unwrap();
             // Every kept body still matches its name.
             for (b3, body) in &sink.bodies {
-                assert_eq!(
-                    *b3,
-                    format!("b3:{}", blake3::hash(body).to_hex()),
-                    "{case} round {round}"
-                );
+                assert_eq!(*b3, collector::mh::of(body), "{case} round {round}");
             }
             for f in &sink.flows {
                 for (stats, bytes) in [
@@ -629,8 +625,8 @@ fn corrupted_payloads_never_break_accounting() {
     }
 }
 
-/// Every body with a `body_b3` in the `http` table is kept under
-/// `bodies/b3_{hash}`, and the file hashes to its name. `--no-bodies` keeps
+/// Every body with a `body_hash` in the `http` table is kept under
+/// `bodies/{multihash}`, and the file hashes to its name. `--no-bodies` keeps
 /// none and leaves every table unchanged.
 #[test]
 fn bodies_are_kept_by_hash_unless_opted_out() {
@@ -643,15 +639,15 @@ fn bodies_are_kept_by_hash_unless_opted_out() {
         for line in http.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
             let row: serde_json::Value = serde_json::from_slice(line).unwrap();
             for m in ["request", "response"] {
-                if let Some(b3) = row[m]["body_b3"].as_str() {
-                    want.insert(b3.replacen("b3:", "b3_", 1));
+                if let Some(b3) = row[m]["body_hash"].as_str() {
+                    want.insert(b3.to_string());
                 }
             }
         }
         let got: std::collections::BTreeSet<String> = bodies.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(got, want, "{case}");
         for (name, body) in &bodies {
-            assert_eq!(*name, format!("b3_{}", blake3::hash(body).to_hex()), "{case}");
+            assert_eq!(*name, collector::mh::of(body), "{case}");
         }
         kept_any |= bodies.iter().any(|(_, b)| !b.is_empty());
 
@@ -666,12 +662,83 @@ fn bodies_are_kept_by_hash_unless_opted_out() {
 fn workunit_bodies_are_readable_by_hash() {
     let c = collect_files(&["openai_h1_sse.pcapng"]);
     let w = &c.workunits[0];
-    let req = &c.bodies[w.request_body_b3.as_ref().unwrap()];
+    let req = &c.bodies[w.request_body_hash.as_ref().unwrap()];
     assert!(req.starts_with(b"{") && req.len() as u64 == w.request_body_len);
     // One blob per SSE response, chunked encoding removed.
-    let resp = &c.bodies[w.response_body_b3.as_ref().unwrap()];
+    let resp = &c.bodies[w.response_body_hash.as_ref().unwrap()];
     assert!(resp.starts_with(b"data: {") && resp.ends_with(b"data: [DONE]\n\n"));
     // The /metrics body with a lost segment has no hash and is not kept.
     let c = collect_files(&["http1_edge.pcapng"]);
     assert!(!c.bodies.values().any(|b| b.starts_with(fixtures::EDGE_C_CHUNK)));
+}
+
+/// Every `by-exchange/` link resolves to a body in `bodies/` whose hash is
+/// its name (spec §12, locally). SSE Workunits get a merged view, the same
+/// over HTTP/1.1 and h2c and across runs.
+#[test]
+fn by_exchange_links_resolve_and_sse_is_merged() {
+    let mut links = 0;
+    for (case, files) in cases() {
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        let out = run_to_dir(&mut FileSource::new(fixture_paths(&names)));
+        let root = out.path().join(collector::views::BY_EXCHANGE);
+        let Ok(flows) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for flow in flows {
+            for f in std::fs::read_dir(flow.unwrap().path()).unwrap() {
+                let path = f.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if name.ends_with(".merged.json") {
+                    continue;
+                }
+                let target = std::fs::read_link(&path).unwrap();
+                assert!(target.starts_with("../../bodies"), "{case} {name}");
+                let hash = target.file_name().unwrap().to_string_lossy().into_owned();
+                let body = std::fs::read(&path).expect("link resolves");
+                assert_eq!(collector::mh::of(&body), hash, "{case} {name}");
+                links += 1;
+            }
+        }
+    }
+    assert!(links > 0);
+
+    let merged = |name: &str| -> Vec<serde_json::Value> {
+        let out = run_to_dir(&mut FileSource::new(fixture_paths(&[&format!("{name}.pcapng")])));
+        let mut files: Vec<_> = walk(&out.path().join(collector::views::BY_EXCHANGE))
+            .into_iter()
+            .filter(|p| p.to_string_lossy().ends_with(".merged.json"))
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+            .collect()
+    };
+    let h1 = merged("openai_h1_sse");
+    assert_eq!(h1.len(), 2);
+    assert_eq!(h1[0]["object"], "chat.completion");
+    assert_eq!(h1[0]["choices"][0]["message"]["content"], "Hello, world!");
+    assert_eq!(h1[0]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(h1[0]["usage"]["completion_tokens"], 4);
+    assert_eq!(h1[0]["incomplete"], false);
+    assert_eq!(h1[1]["object"], "text_completion");
+    assert_eq!(h1[1]["choices"][0]["text"], "Hello, world!");
+    assert_eq!(h1, merged("openai_h2c_sse"));
+    assert_eq!(h1, merged("openai_h1_sse"));
+    // JSON Workunits have no merged view.
+    assert!(merged("openai_h1_json").is_empty());
+}
+
+fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten() {
+        let p = e.unwrap().path();
+        if p.is_dir() && !p.is_symlink() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
 }

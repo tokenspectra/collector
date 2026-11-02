@@ -6,8 +6,9 @@
 //! Workunits). Rows are written in a fixed order with fixed field order, so
 //! the files are byte-identical across runs.
 //!
-//! HTTP bodies go to `bodies/b3_{blake3}`, one file per distinct body, until
-//! packs exist (spec §8). `b3sum` of a file reproduces its name.
+//! HTTP bodies go to `bodies/{multihash}`, one file per distinct body, until
+//! packs exist (spec §8). `b3sum` of a file prints the last 64 digits of its
+//! name.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -18,6 +19,7 @@ use serde::Serialize;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
+use crate::mh;
 
 pub const TABLES: [&str; 6] = ["packets", "segments", "events", "flows", "http", "workunits"];
 
@@ -69,15 +71,15 @@ impl JsonlSink {
 
     /// Moves a finished body to its name; an identical body may already be
     /// there.
-    fn keep_body(&mut self, key: &BodyKey, b3: Option<&str>) -> io::Result<()> {
+    fn keep_body(&mut self, key: &BodyKey, hash: Option<&str>) -> io::Result<()> {
         let open = self.open.remove(key);
-        let Some(b3) = b3 else {
+        let Some(hash) = hash.filter(|h| mh::parse(h).is_some()) else {
             if let Some((path, _)) = open {
                 std::fs::remove_file(path)?;
             }
             return Ok(());
         };
-        let target = self.bodies.join(b3.replacen("b3:", "b3_", 1));
+        let target = self.bodies.join(hash);
         match open {
             Some((path, mut file)) => {
                 file.flush()?;
@@ -165,8 +167,8 @@ impl RecordSink for JsonlSink {
         }
     }
 
-    fn body_end(&mut self, key: &BodyKey, b3: Option<&str>) {
-        if let Err(e) = self.keep_body(key, b3) {
+    fn body_end(&mut self, key: &BodyKey, hash: Option<&str>) {
+        if let Err(e) = self.keep_body(key, hash) {
             self.error.get_or_insert(e);
         }
     }

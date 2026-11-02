@@ -25,7 +25,7 @@ pub struct Collected {
     pub flows: Vec<FlowRecord>,
     pub exchanges: Vec<ExchangeRecord>,
     pub workunits: Vec<WorkunitRecord>,
-    /// Kept bodies by `b3:` hash.
+    /// Kept bodies by hash name.
     pub bodies: BTreeMap<String, Vec<u8>>,
     open_bodies: BTreeMap<BodyKey, Vec<u8>>,
     pub streams: BTreeMap<(String, Dir), Vec<u8>>,
@@ -89,10 +89,10 @@ impl RecordSink for Collected {
             .extend_from_slice(data);
     }
 
-    fn body_end(&mut self, key: &BodyKey, b3: Option<&str>) {
+    fn body_end(&mut self, key: &BodyKey, hash: Option<&str>) {
         let body = self.open_bodies.remove(key).unwrap_or_default();
-        if let Some(b3) = b3 {
-            self.bodies.insert(b3.to_string(), body);
+        if let Some(hash) = hash {
+            self.bodies.insert(hash.to_string(), body);
         }
     }
 }
@@ -163,4 +163,22 @@ pub fn tables_and_bodies(source: &mut dyn PacketSource, keep_bodies: bool) -> (F
         })
         .collect();
     (tables, bodies)
+}
+
+/// Runs `source` into a fresh output directory, bodies and views included,
+/// the way the CLI does.
+pub fn run_to_dir(source: &mut dyn PacketSource) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut sink = JsonlSink::create(dir.path()).expect("sink");
+    run(
+        source,
+        WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut sink,
+    )
+    .expect("run");
+    sink.finish().expect("finish");
+    collector::views::write(dir.path()).expect("views");
+    dir
 }

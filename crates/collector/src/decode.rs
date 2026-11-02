@@ -28,6 +28,7 @@ use crate::flow::{Dir, FlowId, FlowKind};
 use crate::http::{Head, HeadReply, Lab, Out, StartLine};
 use crate::http1::{parse_request_line, parse_status_line, H1};
 use crate::http2::{H2, PREFACE};
+use crate::mh;
 use crate::openai;
 use crate::sse::{self, Sse};
 
@@ -153,8 +154,9 @@ pub struct MessageRecord {
     /// kept), gaps included.
     pub body_len: u64,
     pub body_gap_bytes: u64,
-    /// `b3:` BLAKE3 of the body; `null` when part of it was never captured.
-    pub body_b3: Option<String>,
+    /// BLAKE3 of the body as a multihash (`f1e20…`, spec §6); `null` when
+    /// part of it was never captured.
+    pub body_hash: Option<String>,
     /// The message reached its declared end.
     pub complete: bool,
 }
@@ -187,7 +189,7 @@ pub struct SseEventRecord {
 /// the field.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WorkunitRecord {
-    /// `b3:` BLAKE3 of (Flow id, 0x00, request direction, request start
+    /// Multihash BLAKE3 of (Flow id, 0x00, request direction, request start
     /// offset as u64 big-endian): unique, and stable across re-runs.
     pub workunit_id: String,
     pub flow: FlowId,
@@ -205,9 +207,9 @@ pub struct WorkunitRecord {
     pub status: u16,
     pub response_content_type: Option<String>,
     /// The request body hash, for the cross-check with the API Tap.
-    pub request_body_b3: Option<String>,
+    pub request_body_hash: Option<String>,
     pub request_body_len: u64,
-    pub response_body_b3: Option<String>,
+    pub response_body_hash: Option<String>,
     pub response_body_len: u64,
     pub response_id: Option<String>,
     pub response_model: Option<String>,
@@ -230,10 +232,10 @@ pub trait RecordSink {
     /// More bytes of a body, as hashed: chunked encoding removed, content
     /// coding kept. Only called when [`DecoderConfig::keep_bodies`] is set.
     fn body_data(&mut self, _key: &BodyKey, _data: &[u8]) {}
-    /// The body is complete: keep it under `b3` (its `body_b3`), or drop it
+    /// The body is complete: keep it under `hash` (its `body_hash`), or drop it
     /// when `None` (a gap). Called once per body that had `body_data`, and
     /// for empty bodies.
-    fn body_end(&mut self, _key: &BodyKey, _b3: Option<&str>) {}
+    fn body_end(&mut self, _key: &BodyKey, _hash: Option<&str>) {}
 }
 
 pub struct Decoder<'a> {
@@ -504,8 +506,8 @@ impl Body {
         }
     }
 
-    fn b3(&self) -> Option<String> {
-        (self.gap == 0).then(|| format!("b3:{}", self.hasher.finalize().to_hex()))
+    fn hash(&self) -> Option<String> {
+        (self.gap == 0).then(|| mh::name(&self.hasher.finalize()))
     }
 }
 
@@ -541,7 +543,7 @@ impl Msg {
             content_encoding: self.head.header_str("content-encoding"),
             body_len: self.body.len,
             body_gap_bytes: self.body.gap,
-            body_b3: self.body.b3(),
+            body_hash: self.body.hash(),
             complete: self.complete && self.body.gap == 0,
         }
     }
@@ -889,7 +891,7 @@ impl FlowState {
             h.update(self.id.as_str().as_bytes());
             h.update(&[0, req.dir.idx() as u8]);
             h.update(&req.start.to_be_bytes());
-            format!("b3:{}", h.finalize().to_hex())
+            mh::name(&h.finalize())
         });
         sink.exchange(&ExchangeRecord {
             flow: self.id.clone(),
@@ -910,7 +912,7 @@ impl FlowState {
                     exchange: ex.seq,
                     dir: m.dir,
                 };
-                sink.body_end(&key, m.body.b3().as_deref());
+                sink.body_end(&key, m.body.hash().as_deref());
             }
         }
         let Some(workunit_id) = workunit_id else { return };
@@ -943,9 +945,9 @@ impl FlowState {
             n: request.n,
             status,
             response_content_type: resp.head.media_type(),
-            request_body_b3: req.body.b3(),
+            request_body_hash: req.body.hash(),
             request_body_len: req.body.len,
-            response_body_b3: resp.body.b3(),
+            response_body_hash: resp.body.hash(),
             response_body_len: resp.body.len,
             response_id: ex.response.id.clone(),
             response_model: ex.response.model.clone(),

@@ -31,6 +31,12 @@ enum Cmd {
         out: PathBuf,
         files: Vec<PathBuf>,
     },
+    /// Rebuild `by-exchange/` in an output directory from its `http.jsonl`
+    /// and `bodies/`.
+    Views {
+        #[arg(default_value = "ts-captures")]
+        out: PathBuf,
+    },
     /// Capture live with a dumpcap ring buffer and assemble Flows.
     Ring {
         /// Window (Slice) length in seconds; also dumpcap's `-b interval`.
@@ -73,6 +79,16 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (mut source, window_s, out): (Box<dyn PacketSource>, u32, PathBuf) = match cli.cmd {
         Cmd::Files { window_s, out, files } => (Box::new(FileSource::new(files)), window_s, out),
+        Cmd::Views { out } => {
+            let s = collector::views::write(&out)?;
+            eprintln!(
+                "collector: {} body links, {} merged views -> {}",
+                s.links,
+                s.merged,
+                out.display()
+            );
+            return Ok(());
+        }
         Cmd::Ring {
             window_s,
             interface,
@@ -107,6 +123,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         &mut sink,
     )?;
     sink.finish()?;
+    // Views for people, derived from the tables and bodies just written.
+    if !cli.no_bodies {
+        collector::views::write(&out)?;
+    }
     eprintln!(
         "collector: {} packets, {} windows -> {}",
         summary.packets,

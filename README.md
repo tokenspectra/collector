@@ -50,16 +50,22 @@ Hashing of chunks and Slices, the Capture Rate cut and the object store come nex
 | `segments` | in-order run of stream bytes | stream offset → (window, packet, offset in packet), capture time |
 | `events` | gap or anomaly | `gap_lost`, `gap_truncated`, `retransmit_differs`, … |
 | `flows` | Flow per Slice | Flow metadata, `verdict`, and `orig_bytes`/`resp_bytes` buckets |
-| `http` | HTTP request/response pair | method, target, status, content type, body length, `body_b3`, bucket, `workunit_id` |
+| `http` | HTTP request/response pair | method, target, status, content type, body length, `body_hash`, bucket, `workunit_id` |
 | `workunits` | Request Workunit | the record below |
 
 ### Bodies
 
-Every HTTP body that has a `body_b3` is kept as `<out>/bodies/b3_<blake3>`: requests and responses, Workunit or `http_other` (spec §8). `b3sum` of a file reproduces its name, and identical bodies are stored once.
+Every hash is a multihash in base16 (spec §6): `f1e20` followed by the 64 hex digits `b3sum` prints. That covers `body_hash`, `request_body_hash`, `response_body_hash`, `workunit_id` and body file names. `collector::mh::parse` accepts only that form.
+
+Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: requests and responses, Workunit or `http_other` (spec §8). `b3sum` of a file prints the last 64 digits of its name, and identical bodies are stored once.
 
 - The bytes are the bytes that were hashed: chunked encoding removed, content coding kept, one file per SSE response.
-- A body with a gap has no `body_b3` and is not kept; its packets are still in L0.
-- `--no-bodies` turns this off. Hashes, lengths and every table stay the same; only `bodies/` is missing.
+- A body with a gap has no `body_hash` and is not kept; its packets are still in L0.
+- `--no-bodies` turns this off. Hashes, lengths and every table stay the same; only `bodies/` and `by-exchange/` are missing.
+- **`by-exchange/`** is a view for people, written after each run and rebuilt with `collector views <out>`:
+  - `by-exchange/<flow>/<exchange>.request.<ext>` and `.response.<ext>` are symlinks to `../../bodies/<hash>`. `<flow>` is the Flow id with every character outside `[A-Za-z0-9._-]` replaced by `_`. `<ext>` is `json`, `sse` or `bin`, from the parsed media type. Empty bodies get no link.
+  - `<exchange>.response.merged.json`, for SSE Workunits only, joins the streamed chunks into one `chat.completion` (or `text_completion`) object: per choice, `role`, `content` and `reasoning` joined and the last `finish_reason`; `id`, `created` and `model` from the first event; the last `usage`. `incomplete: true` means `[DONE]` never arrived or an event didn't parse (`unparsed_events`).
+  - The merged file is derived and lossy. It is not evidence: it is never hashed, stored or compared with the API Tap. The raw body in `bodies/` is the source.
 - Bodies hold plaintext prompts and outputs (spec §10).
 - Packs replace the per-body files once the object store lands.
 
@@ -81,18 +87,18 @@ The record follows the TS-15 capture record where the Link shows the field:
 
 | TS-15 field | `workunits` column | Notes |
 |---|---|---|
-| `workunit_id` | `workunit_id` | `b3:` BLAKE3 of (Flow id, `0x00`, request direction, request start offset as u64 big-endian): the spec §6 proposal. Unique and stable across re-runs; not a content hash |
+| `workunit_id` | `workunit_id` | Multihash BLAKE3 of (Flow id, `0x00`, request direction, request start offset as u64 big-endian): the spec §6 proposal. Unique and stable across re-runs; not a content hash |
 | received / completed timestamps | `received_ts_ns`, `completed_ts_ns` | capture time of the first request byte and the last response byte |
 | `model`, `stream` | `model`, `stream` | from the request body; also `seed`, `n` |
-| client request as received | `request_body_b3`, `request_body_len` | BLAKE3 of the body as on the wire (chunked encoding removed, content coding kept): the cross-check key with the API Tap (spec §11) |
+| client request as received | `request_body_hash`, `request_body_len` | BLAKE3 of the body as on the wire (chunked encoding removed, content coding kept): the cross-check key with the API Tap (spec §11) |
 | `finish_reason` | `finish_reason` | per choice index, from the JSON body or the SSE chunks |
 | `usage` | `usage` | as sent |
-| | `response_body_b3`, `response_id`, `response_model`, `status` | |
+| | `response_body_hash`, `response_id`, `response_model`, `status` | |
 | | `sse_events`, `sse_done` | each event's body offset, length and capture time; whether `data: [DONE]` arrived. One hash covers the whole SSE body (spec §6) |
 | | `complete` | both messages reached their end with no gap |
 | `manifest_id`, `upstream`, forwarded request, token ids, logprobs, `scorable` | | not on the Link: the API Tap's side. The bodies themselves are stored by hash in the next stage |
 
-A body with a gap has `body_b3: null`. A request body that is incomplete, has a gap, uses a content coding or exceeds `DecoderConfig::max_body` (16 MiB) cannot be checked as JSON, so its pair is `http_other`.
+A body with a gap has `body_hash: null`. A request body that is incomplete, has a gap, uses a content coding or exceeds `DecoderConfig::max_body` (16 MiB) cannot be checked as JSON, so its pair is `http_other`.
 
 ### Not in v1
 
@@ -113,7 +119,8 @@ sg wireshark -c "cargo run -- ring -i lo -w 10 -t 60"
 - `-o/--out` defaults to `ts-captures/` in the current directory (created if missing).
 - `-d/--ring-dir` defaults to `<tmp>/tokenspectra-ring-<interface>`.
 - If dumpcap is missing, not runnable (not in the `wireshark` group) or fails (e.g. unknown interface), `ring` exits non-zero with a message saying which, and how to fix it. `files` never needs dumpcap.
-- `--no-bodies`: keep hashes only, no `bodies/` directory.
+- `--no-bodies`: keep hashes only, no `bodies/` or `by-exchange/` directory.
+- `collector views <out>`: rebuild `by-exchange/` from `http.jsonl` and `bodies/`.
 - Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter).
 
 ## Tests
@@ -126,7 +133,7 @@ cargo test --workspace
   - **Captured OpenAI traffic** (`openai_h1_json`, `openai_h1_sse`, `openai_h2c_json`, `openai_h2c_sse`, `http_other_h1`): the official OpenAI Python SDK (and httpx for `/health`, `/v1/models` and a malformed body) against a mock OpenAI-compatible server, over HTTP/1.1 and h2c, captured with dumpcap. See below.
   - **Synthetic** fixtures, built packet by packet in `tests/support/fixtures.rs` and written by `cargo run -p collector --example gen_fixtures`: edge cases a live run can't produce on demand (lost segment, retransmit with different bytes, mid-stream start, Flows spanning windows, UDP, non-HTTP TCP, a TLS Flow on the plaintext Link, gRPC over h2c, HTTP/1.1 pipelining and a request whose response lands in the next window).
   - `dumpcap_keepalive-*`: real dumpcap ring files of a keep-alive Flow whose SYN predates the capture.
-- Besides the expected tables, the tests check that every body with a `body_b3` is kept under its hash and that `--no-bodies` changes no table. They also check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
+- Besides the expected tables, the tests check that every body with a `body_hash` is kept under its hash, that every `by-exchange/` link resolves to a body matching its name, and that `--no-bodies` changes no table. They also check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
 - **Capturing the OpenAI fixtures again** (only when the mock or the scenarios change; CI never captures). Needs [uv](https://docs.astral.sh/uv/) and dumpcap; Python dependencies are pinned in the scripts:
 
   ```sh
