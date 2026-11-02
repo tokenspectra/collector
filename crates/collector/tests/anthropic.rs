@@ -1,7 +1,8 @@
 //! Outcomes of Anthropic Messages streams through the whole pipeline
 //! (TS-31, spec §5): only a stream that reaches `message_stop` is `ok`, a
 //! `max_tokens` stop included; a clean HTTP end without `message_stop`, or
-//! an in-band `error` event, is `errored`; a gap is `incomplete`.
+//! an in-band `error` event, is `errored`; a gap is `incomplete`. A whole
+//! JSON body that is neither a `message` nor an `error` is `errored`.
 
 #[path = "support/collect.rs"]
 mod collect;
@@ -64,15 +65,27 @@ fn end(stop_reason: &str, stop: bool) -> String {
 /// One connection: a streamed `/v1/messages` request, then `body` as an SSE
 /// response cut into segments at `cuts`; the piece `lose` is never captured.
 fn exchange(port: u16, body: &str, cuts: &[usize], lose: Option<usize>) -> Vec<Frame> {
-    let req_body =
-        r#"{"model":"m","max_tokens":2,"messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    connection(port, true, body, cuts, lose)
+}
+
+/// A `/v1/messages` request, streamed or not, answered with `body` as SSE
+/// or as one JSON document.
+fn connection(port: u16, stream: bool, body: &str, cuts: &[usize], lose: Option<usize>) -> Vec<Frame> {
+    let req_body = format!(
+        r#"{{"model":"m","max_tokens":2,"messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+    );
+    let media_type = if stream {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
     let req = format!(
         "POST /v1/messages HTTP/1.1\r\nhost: 10.0.0.2:8000\r\ncontent-type: application/json\r\n\
          anthropic-version: 2023-06-01\r\ncontent-length: {}\r\n\r\n{req_body}",
         req_body.len()
     );
     let head = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-type: {media_type}\r\ncontent-length: {}\r\n\r\n",
         body.len()
     );
     let at = T0 + u64::from(port) * MS;
@@ -177,4 +190,32 @@ fn only_a_stream_that_reaches_message_stop_is_ok() {
     assert_eq!(w.finish_reason[0].finish_reason, "max_tokens");
     assert_eq!(w.output_tokens, Some(2));
     assert_eq!(w.outcome(), Outcome::Ok, "max_tokens is a whole response");
+}
+
+#[test]
+fn a_json_body_that_is_not_a_message_or_an_error_is_errored() {
+    let message = r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2}}"#;
+    let mut frames = connection(43101, false, message, &[], None);
+    frames.extend(connection(43102, false, r#"{"type":"unexpected"}"#, &[], None));
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    std::io::Write::write_all(&mut file, &fixtures::pcapng(&frames)).expect("write");
+    let mut c = Collected::default();
+    run(
+        &mut FileSource::new(vec![file.path().to_path_buf()]),
+        WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut c,
+    )
+    .expect("run");
+
+    let w = by_port(&c, 43101);
+    assert_eq!((w.protocol, w.stream, w.complete), ("anthropic", false, true));
+    assert_eq!(w.response_id.as_deref(), Some("msg_1"));
+    assert_eq!(w.outcome(), Outcome::Ok, "a message");
+
+    let w = by_port(&c, 43102);
+    assert_eq!((w.stream, w.complete, w.status), (false, true, 200));
+    assert!(w.response_id.is_none() && w.finish_reason.is_empty());
+    assert_eq!(w.outcome(), Outcome::Errored, "an unexpected JSON type");
 }

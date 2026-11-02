@@ -11,7 +11,8 @@
 //! input usage), `content_block_start`/`_delta`/`_stop`, `message_delta`
 //! (`stop_reason`, cumulative usage), `message_stop` (the end-of-stream
 //! marker), `ping`, and `error`, which may arrive mid-stream after a 200.
-//! Unknown event types are skipped, since the API may add new ones.
+//! Unknown event types are skipped, since the API may add new ones; a whole
+//! JSON body of any type but `message` or `error` is not read.
 //!
 //! Outcome: `done` is set only by `message_stop`. A stream that ends
 //! without it (a clean HTTP end), or that carries an in-band `error` event,
@@ -165,18 +166,24 @@ impl ResponseDecoder for Decoder {
             self.unreadable += 1;
             return;
         };
-        // The data's `type` repeats the event name; a JSON body has only
-        // the former.
+        // The API names every stream event, so a frame without a name is
+        // a whole JSON body: a `message`, or an `error` on a non-2xx status.
+        if frame.event.is_none() {
+            self.json_body = true;
+            match v.get("type").and_then(Value::as_str) {
+                Some("message") => self.message(&v),
+                Some("error") => self.error_type = v.get("error").and_then(|e| str_field(e, "type")),
+                _ => self.unreadable += 1,
+            }
+            return;
+        }
+        // The data's `type` repeats the event name.
         let kind = v
             .get("type")
             .and_then(Value::as_str)
             .map(str::as_bytes)
             .or(frame.event);
         match kind {
-            Some(b"message") => {
-                self.json_body = true;
-                self.message(&v);
-            }
             Some(b"message_start") => match v.get("message") {
                 Some(m) => self.message(m),
                 None => self.unreadable += 1,
@@ -189,14 +196,11 @@ impl ResponseDecoder for Decoder {
             }
             Some(b"message_stop") => self.done = true,
             Some(b"error") => {
-                // An SSE event fails the stream in band; a JSON body is the
-                // error response itself.
-                match frame.event {
-                    Some(_) => self.failed = true,
-                    None => self.json_body = true,
-                }
+                // Fails the stream in band, behind HTTP 200.
+                self.failed = true;
                 self.error_type = v.get("error").and_then(|e| str_field(e, "type"));
             }
+            // New event types may be added (API versioning policy).
             Some(_) => {}
             None => self.unreadable += 1,
         }
@@ -340,6 +344,18 @@ mod tests {
         );
         // A JSON body has no end-of-stream marker.
         assert!(!r.done && r.unreadable == 0);
+    }
+
+    #[test]
+    fn a_json_body_must_be_a_message_or_an_error() {
+        for body in [
+            r#"{"type":"unexpected"}"#,
+            r#"{"type":"message_stop"}"#,
+            "{}",
+            "[1]",
+        ] {
+            assert_eq!(decode(&[(None, body)]).unreadable, 1, "{body}");
+        }
     }
 
     #[test]
