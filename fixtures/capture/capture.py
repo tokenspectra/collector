@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai==3.42.1", "httpx[http2]==0.28.1", "h2==4.4.1"]
+# dependencies = ["openai==3.42.1", "ollama==0.6.3", "httpx[http2]==0.28.1", "h2==4.4.1"]
 # ///
 """Captures real Wire Protocol traffic into golden .pcapng fixtures.
 
@@ -12,13 +12,16 @@ crates/collector/tests/fixtures/<scenario>.pcapng.
 Scenarios live with their protocol: capture_openai.py, ... each export
 `SCENARIOS`, a dict from fixture name to a function of the port. A new
 protocol adds its module and one line to SCENARIO_MODULES, plus its client
-SDK to the dependencies above.
+SDK to the dependencies above. A module that sets `PORT` is captured against
+a real server already listening there (capture_ollama.py: a local Ollama)
+instead of the mock.
 
 Run once, from the repo root, and commit the files; CI only replays them.
 dumpcap needs the wireshark group:
 
     sg wireshark -c "uv run fixtures/capture/capture.py"
     sg wireshark -c "uv run fixtures/capture/capture.py openai_h2c_sse"   # one scenario
+    sg wireshark -c "uv run fixtures/capture/capture.py ollama_native ollama_openai_compat"   # needs Ollama
 """
 
 import argparse
@@ -31,6 +34,7 @@ import threading
 import time
 from pathlib import Path
 
+import capture_ollama
 import capture_openai
 import capture_openai_responses
 
@@ -38,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE.parent.parent / "crates/collector/tests/fixtures"
 
 # One line per Wire Protocol.
-SCENARIO_MODULES = [capture_openai, capture_openai_responses]
+SCENARIO_MODULES = [capture_openai, capture_openai_responses, capture_ollama]
 
 
 def scenarios():
@@ -47,14 +51,16 @@ def scenarios():
         for name, run in module.SCENARIOS.items():
             if name in table:
                 sys.exit(f"scenario {name} defined twice")
-            table[name] = run
+            table[name] = (run, getattr(module, "PORT", None))
     return table
 
 
 SCENARIOS = scenarios()
 
 
-def capture(name, port, dumpcap):
+def capture(name, mock_port, dumpcap):
+    run, port = SCENARIOS[name]
+    port = port or mock_port
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / f"{name}.pcapng"
         cmd = [dumpcap, "-i", "lo", "-f", f"tcp port {port}", "-w", str(path)]
@@ -73,7 +79,7 @@ def capture(name, port, dumpcap):
             proc.kill()
             sys.exit(f"dumpcap did not start (run under `sg wireshark -c ...`?):\n{''.join(log)}")
         time.sleep(0.3)
-        SCENARIOS[name](port)
+        run(port)
         time.sleep(0.3)
         proc.send_signal(signal.SIGINT)
         proc.wait(10)

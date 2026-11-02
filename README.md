@@ -26,6 +26,7 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 - Stage 3 (TS-28): console logging with verbosity levels, and one counter registry read by the window log line, an on-demand snapshot and Prometheus `/metrics` (spec §14).
 - Stage 4 (TS-26): BLAKE3 packet hashes and a Merkle root per chunk, the Slice hash chain, the Capture Rate cut, and the object store: zstd pcapng chunks, packs and Parquet index tables (spec §6–8).
 - Stage 5 (TS-29): a generic Wire Protocol layer: the `WireProtocol` trait and registry, shared SSE and NDJSON framing, OpenAI Chat Completions and legacy Completions ported onto it (spec §5).
+- Stage 6 (TS-32): the Ollama native Wire Protocol: `/api/chat`, `/api/generate` (NDJSON or JSON) and `/api/embed`.
 
 Implementation is tracked in Multica.
 
@@ -45,6 +46,7 @@ Implementation is tracked in Multica.
 | `wire` | §5 | The `WireProtocol` trait, the registry (`wire::BUILTIN`) and matching precedence |
 | `wire::framing` | §5 | Response framing shared by every protocol: SSE (data-only and named events), NDJSON, whole JSON |
 | `wire::openai` | §5 | The OpenAI Wire Protocol: Chat Completions and legacy Completions |
+| `wire::ollama` | §5 | The Ollama native Wire Protocol: `/api/chat`, `/api/generate`, `/api/embed` |
 | `output` | | JSON Lines tables (below) |
 | `chunk` | §6, §8 | L0 chunks as pcapng, written byte for byte; the Merkle root over a chunk's packet hashes |
 | `capture` | §7 | The Capture Rate cut: which packets a chunk keeps in full, the keyed draw per Workunit |
@@ -121,7 +123,7 @@ Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: re
 
 ### Request Workunits
 
-A request/response pair is a Request Workunit when a registered Wire Protocol claims its route, reads its request body, and accepts its response media type (spec §5). For OpenAI: `POST /v1/chat/completions`, `POST /v1/completions` or `POST /v1/responses` (the Responses API) with a JSON body, answered with `application/json`, or `text/event-stream` when the request set `"stream": true`. Everything else is `http_other`.
+A request/response pair is a Request Workunit when a registered Wire Protocol claims its route, reads its request body, and accepts its response media type (spec §5). For OpenAI: `POST /v1/chat/completions`, `POST /v1/completions` or `POST /v1/responses` (the Responses API) with a JSON body, answered with `application/json`, or `text/event-stream` when the request set `"stream": true`. For Ollama native: `POST /api/chat`, `/api/generate` or `/api/embed` with a JSON object body, answered with `application/json`, or `application/x-ndjson` when the request streams (chat and generate stream unless `"stream": false`). Ollama's `/v1/*` endpoints are OpenAI's. Everything else is `http_other`.
 
 **Adding a Wire Protocol** takes one module under `crates/collector/src/wire/` implementing `WireProtocol` (routes, optional header sniffing, request parsing, the response `Framing`, a frame decoder) and one line in `wire::BUILTIN`. Its fields beyond the common columns go in `extra`. `crates/collector/tests/wire_protocol.rs` registers a protocol that lives only in that test.
 
@@ -133,13 +135,13 @@ The record follows the TS-15 capture record where the Link shows the field:
 | received / completed timestamps | `received_ts_ns`, `completed_ts_ns` | capture time of the first request byte and the last response byte |
 | `model`, `stream` | `model`, `stream` | from the request body; also `seed`, `n` |
 | client request as received | `request_body_hash`, `request_body_len` | BLAKE3 of the body as on the wire (chunked encoding removed, content coding kept): the cross-check key with the API Tap (spec §11) |
-| | `protocol`, `endpoint` | the Wire Protocol's id (`openai`) and the route pattern the request matched |
+| | `protocol`, `endpoint` | the Wire Protocol's id (`openai`, `ollama`) and the route pattern the request matched |
 | `finish_reason` | `finish_reason` | per choice index, from the JSON body or the stream's frames |
-| `usage` | `usage`, `input_tokens`, `output_tokens` | `usage` as sent; the token counts read from it when the protocol reports them (OpenAI: `prompt_tokens`, `completion_tokens`) |
+| `usage` | `usage`, `input_tokens`, `output_tokens` | `usage` as sent; the token counts read from it when the protocol reports them (OpenAI: `prompt_tokens`, `completion_tokens`). Ollama sends no usage object: `usage` is `null`, the counts are `prompt_eval_count` and `eval_count`, and `finish_reason` is `done_reason` |
 | | `response_body_hash`, `response_id`, `response_model`, `status` | |
 | | `sse_events`, `sse_done` | each event's body offset, length and capture time; whether `data: [DONE]` arrived. One hash covers the whole SSE body (spec §6) |
 | | `complete` | both messages reached their end with no gap |
-| | `extra` | protocol-specific fields as one JSON object, `null` when there are none (always for OpenAI) |
+| | `extra` | protocol-specific fields as one JSON object, `null` when there are none (always for OpenAI). Ollama: `total_duration`, `load_duration`, `prompt_eval_duration`, `eval_duration` (ns), `done` (streams only: the `"done": true` line arrived) and `error` |
 | `manifest_id`, `upstream`, forwarded request, token ids, logprobs, `scorable` | | not on the Link: the API Tap's side |
 
 A body with a gap has `body_hash: null`. A request body that is incomplete, has a gap, uses a content coding or exceeds `DecoderConfig::max_body` (16 MiB) cannot be checked as JSON, so its pair is `http_other`.
@@ -177,7 +179,7 @@ python3 tools/llm_traffic.py --stream --count 5 --interval 10
 
 When the script ends, wait one window and press Ctrl-C in terminal 1. Then open `viewer/index.html` in the browser, choose `ts-captures-demo/`, and go to **Request Workunits › conversation**.
 
-- `tools/llm_traffic.py` speaks `POST /v1/chat/completions`, or the Responses API `POST /v1/responses` with `--api responses` (Ollama serves both). Flags: `--api`, `--model`, `--host` (e.g. `http://localhost:8000` for vLLM), `--stream`, `--multiturn`, `--count`, `--seed`; see `--help`.
+- `tools/llm_traffic.py` speaks `POST /v1/chat/completions`, or the Responses API `POST /v1/responses` with `--api responses` (Ollama serves both; they decode as OpenAI). Ollama's native `/api/chat`, `/api/generate` and `/api/embed` decode as `ollama`. Flags: `--api`, `--model`, `--host` (e.g. `http://localhost:8000` for vLLM), `--stream`, `--multiturn`, `--count`, `--seed`; see `--help`.
 - Ollama also talks to its own llama.cpp runner on a random loopback port (`/completion`, `/tokenize`, `/health`). That shows up as `http_other`; the viewer still rebuilds its conversation from the templated prompt.
 - `ts-captures*` is gitignored. Bodies hold the prompts and replies in plaintext.
 

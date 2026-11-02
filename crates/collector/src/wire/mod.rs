@@ -13,6 +13,7 @@
 //! and their hashes cover the bytes as on the wire.
 
 pub mod framing;
+pub mod ollama;
 pub mod openai;
 pub mod openai_responses;
 
@@ -26,7 +27,11 @@ pub use framing::{Frame, Framing};
 
 /// Every Wire Protocol the Collector decodes, in precedence order (see
 /// [`Protocols::claims`]). A new protocol adds one line here.
-pub const BUILTIN: &[&dyn WireProtocol] = &[&openai::OpenAi, &openai_responses::OpenAiResponses];
+pub const BUILTIN: &[&dyn WireProtocol] = &[
+    &openai::OpenAi,
+    &openai_responses::OpenAiResponses,
+    &ollama::Ollama,
+];
 
 /// A route a protocol serves: an HTTP method and a path pattern.
 ///
@@ -422,7 +427,7 @@ mod tests {
     fn builtin_ids_are_unique() {
         assert_eq!(
             Protocols::default().ids().collect::<Vec<_>>(),
-            ["openai", "openai_responses"]
+            ["openai", "openai_responses", "ollama"]
         );
     }
 

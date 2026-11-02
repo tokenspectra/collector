@@ -125,6 +125,9 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 
 **Precedence is deterministic.** The claims on a request are ordered by header evidence (`yes` before `maybe`), then route specificity (more literal characters first, so an exact path beats a pattern), then registry order. The request body goes to each claim in that order; the first that reads it owns the exchange. The OpenAI module is first in the registry.
 
+**Per protocol.**
+- **Ollama native (`ollama`, TS-32).** Routes `POST /api/chat`, `/api/generate`, `/api/embed`; no header sniffing (the paths are its own); the request is any JSON object. Chat and generate stream unless the request sets `"stream": false`: the response is `ndjson` (`application/x-ndjson`), the last line carrying `"done": true`; otherwise, and always for embed, it is one `json` object. `model` and `options.seed` come from the request; from the last object, `done_reason` → `finish_reason[0]`, `prompt_eval_count` → `input_tokens`, `eval_count` → `output_tokens`. Ollama sends no usage object, so `usage` is null. `extra`: `total_duration`, `load_duration`, `prompt_eval_duration`, `eval_duration` (ns, as sent), `done` (streams only: whether the `"done": true` line arrived, the NDJSON counterpart of `sse_done`) and `error`. Ollama's OpenAI-compatible `/v1/*` endpoints are claimed by OpenAI, not here; a captured fixture checks it.
+
 **Response framing** is shared, so protocols handle events, not bytes. Bodies are framed after chunked encoding is removed; a content coding hides the frames, so the response is not read.
 
 | Framing | Frames | After a gap |
@@ -391,7 +394,7 @@ Metrics, all prefixed `ts_collector_` (labels in brackets):
 | `flows_active` | Flows seen and not yet closed (gauge) |
 | `flows_with_workunit_total` | Closed Flows that carried at least one Request Workunit; over `flows_total`, the share of Flows that carry Workunits |
 | `accounted_bytes_total` `[bucket, direction]` | Stream bytes per bucket (§5) and direction (`orig`, `resp`); `workunit` over the sum is the share of bandwidth that is Workunits |
-| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`, `openai_responses`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding, a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
+| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`, `openai_responses`, `ollama`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding, a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
 | `gaps_total`, `gap_bytes_total` | Gaps (§4) and their bytes |
 | `retransmit_bytes_total`, `retransmit_differing_bytes_total` | Retransmitted stream bytes, and those that differ from the first copy |
 | `retransmits_differing_total` | `retransmit_differs` anomalies |
