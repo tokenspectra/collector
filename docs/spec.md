@@ -134,7 +134,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 | `ndjson` | One JSON value per line, LF with an optional CR before it, blank lines skipped (Ollama native) | The cut line is lost; framing starts again at the next line, since a JSON line holds no raw newline |
 
 - A frame splits across any number of TCP segments, HTTP/1 chunks or HTTP/2 DATA frames; a frame's capture time is that of its last byte.
-- Lines longer than 16 MiB are dropped, not truncated. An NDJSON body's last line may lack its newline.
+- Lines longer than 16 MiB are dropped, not truncated. An SSE event that loses a field line this way is dropped whole (a comment line loses nothing). Either way the frame counts as lost, so the Workunit is `errored` (§14). An NDJSON body's last line may lack its newline.
 - When response bytes arrive before the request body is read (a server that answers early), they are held, up to `max_body`, and replayed once a protocol owns the exchange.
 
 **The common record** (`workunits`, §8) stays compatible with TS-15 and is the same for every protocol: `protocol` (the protocol's id), `endpoint`, `model`, `stream`, `status`, timing, body hashes and byte counts, `finish_reason` per choice index, `usage` as sent with `input_tokens` and `output_tokens` read from it when the protocol reports them, `complete`. `seed`, `n`, `response_id`, `response_model` are filled where the protocol has them. `sse_events` and `sse_done` are set for `sse` framing only; `sse_done` means the protocol's end-of-stream marker arrived (`data: [DONE]` for OpenAI). Protocol-specific fields go in `extra`, one JSON object built from the protocol's own typed struct, `null` when empty, never new top-level columns.

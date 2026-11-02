@@ -389,3 +389,44 @@ fn without_the_registry_line_only_openai_is_decoded() {
         .count();
     assert_eq!(other, 4);
 }
+
+/// An SSE line over 16 MiB is dropped, so a complete exchange whose
+/// response lost one is `errored`, not `ok` (spec §14).
+#[test]
+fn an_oversized_sse_line_makes_the_workunit_errored() {
+    const CHUNK: &str =
+        "{\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}";
+    let mut body = format!("data: {CHUNK}\n\ndata: ").into_bytes();
+    body.resize(body.len() + (16 << 20) + 1, b'x');
+    body.extend_from_slice(b"\n\ndata: [DONE]\n\n");
+    let req = request(
+        "/v1/chat/completions",
+        "",
+        "{\"model\":\"m\",\"messages\":[],\"stream\":true}",
+    );
+    let head = response_head("text/event-stream", body.len());
+    let cuts: Vec<usize> = (1..=body.len() / 60_000).map(|i| i * 60_000).collect();
+    let frames = exchange(40008, T0, &req, &head, &body, &cuts, None);
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    std::io::Write::write_all(&mut file, &fixtures::pcapng(&frames)).expect("write");
+
+    let mut c = Collected::default();
+    run(
+        &mut FileSource::new(vec![file.path().to_path_buf()]),
+        WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut c,
+    )
+    .expect("run");
+    let w = by_port(&c, 40008);
+    assert_eq!(w.protocol, "openai");
+    assert!(w.complete, "both messages are whole");
+    assert_eq!(
+        w.sse_events.as_ref().map(Vec::len),
+        Some(2),
+        "the long event is not a frame"
+    );
+    assert_eq!(w.sse_done, Some(true));
+    assert_eq!(w.outcome(), collector::stats::Outcome::Errored);
+}

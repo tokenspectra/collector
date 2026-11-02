@@ -6,7 +6,8 @@
 //!   events with at least one `data` field are reported, with their `event`
 //!   name when they have one, so the same framer serves data-only streams
 //!   (OpenAI Chat) and named-event streams (OpenAI Responses, Anthropic). A
-//!   gap loses the event boundaries, so framing stops there.
+//!   gap loses the event boundaries, so framing stops there. An event with
+//!   an over-long field line is dropped whole and counted as lost.
 //! - [`Framing::Ndjson`]: one JSON value per line (Ollama native). Lines end
 //!   in LF, with an optional CR before it; blank lines are skipped. A JSON
 //!   line never holds a raw newline, so after a gap framing drops the cut
@@ -116,7 +117,7 @@ impl Framer {
     pub fn finish(&mut self, ts_ns: u64, out: &mut Vec<Framed>) {
         match self {
             // An unterminated event is discarded (WHATWG).
-            Framer::Sse(_) => {}
+            Framer::Sse(s) => s.finish(),
             Framer::Ndjson(n) => n.finish(ts_ns, out),
         }
     }
@@ -125,7 +126,7 @@ impl Framer {
     /// them, so the response was not read whole.
     pub fn lost(&self) -> u64 {
         match self {
-            Framer::Sse(s) => u64::from(s.broken),
+            Framer::Sse(s) => u64::from(s.broken) + s.dropped,
             Framer::Ndjson(n) => n.lost,
         }
     }
@@ -145,6 +146,10 @@ pub struct Sse {
     event: Option<Vec<u8>>,
     data: Vec<u8>,
     has_data: bool,
+    /// The current event lost a field line to [`MAX_LINE`].
+    damaged: bool,
+    /// Events dropped for an over-long line.
+    dropped: u64,
     /// Stopped at a gap.
     broken: bool,
 }
@@ -184,13 +189,24 @@ impl Sse {
         self.broken = true;
     }
 
+    /// An unterminated event is discarded; it counts as lost only if it
+    /// lost a line, like any other event.
+    pub fn finish(&mut self) {
+        let open_line_lost = self.line_too_long && !self.line.starts_with(b":");
+        if (std::mem::take(&mut self.damaged) || open_line_lost) && !self.broken {
+            self.dropped += 1;
+        }
+    }
+
     fn end_line(&mut self, ts_ns: u64, out: &mut Vec<Framed>) {
         let line = std::mem::take(&mut self.line);
         let too_long = std::mem::take(&mut self.line_too_long);
         if line.is_empty() && !too_long {
             let event = self.event.take();
+            let damaged = std::mem::take(&mut self.damaged);
+            self.dropped += u64::from(damaged);
             if let Some(start) = self.event_start.take() {
-                if self.has_data {
+                if self.has_data && !damaged {
                     let mut data = std::mem::take(&mut self.data);
                     data.pop();
                     out.push(Framed {
@@ -206,7 +222,11 @@ impl Sse {
             self.has_data = false;
             return;
         }
-        if too_long || line.starts_with(b":") {
+        if line.starts_with(b":") {
+            return;
+        }
+        if too_long {
+            self.damaged = true;
             return;
         }
         let (name, value) = match line.iter().position(|&b| b == b':') {
@@ -421,6 +441,32 @@ mod tests {
         );
         assert_eq!(got, [ev(0, 18, 0, Some("a"), "1")]);
         assert_eq!(lost, 1);
+    }
+
+    #[test]
+    fn sse_drops_an_event_with_an_over_long_line() {
+        let long = vec![b'x'; MAX_LINE + 1];
+        let l = long.len() as u64;
+        let (got, lost) = run(
+            Framing::Sse,
+            &[
+                In::Bytes(b"data: a\n\ndata: "),
+                In::Bytes(&long),
+                In::Bytes(b"\ndata: b\n\n: "),
+                In::Bytes(&long),
+                In::Bytes(b"\ndata: [DONE]\n\n"),
+            ],
+        );
+        // The second event lost its first line, so all of it goes; an
+        // over-long comment loses nothing.
+        assert_eq!(
+            got,
+            [ev(0, 9, 0, None, "a"), ev(9 + l + 16, l + 17, 4, None, "[DONE]")]
+        );
+        assert_eq!(lost, 1);
+        // Unterminated at the end of the body: still lost.
+        let (got, lost) = run(Framing::Sse, &[In::Bytes(b"data: "), In::Bytes(&long)]);
+        assert_eq!((got.len(), lost), (0, 1));
     }
 
     #[test]
