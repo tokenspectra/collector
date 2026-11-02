@@ -1,7 +1,7 @@
 //! `collector`: run Flow assembly over capture files or a live dumpcap ring.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +69,11 @@ struct Cli {
     /// --capture-rate is below 1.
     #[arg(long, global = true)]
     capture_key: Option<String>,
+    /// Benchmarks only: don't fsync object-store writes. Faster, but a
+    /// machine crash can then lose chunks, packs or index files that a
+    /// manifest in the log already names. Never use it in production.
+    #[arg(long, global = true)]
+    no_fsync: bool,
     /// Captured bytes left in a truncated packet.
     #[arg(long, global = true, default_value_t = 128)]
     truncate_to: u32,
@@ -200,6 +205,24 @@ fn parse_key(hex: &str) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
+/// Creates `dir` and its missing parents; with `durable`, syncs the parent
+/// of each directory it created, so the new directories survive a crash.
+fn create_durable_dir(dir: &Path, durable: bool) -> std::io::Result<()> {
+    let missing: Vec<PathBuf> = dir
+        .ancestors()
+        .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
+        .map(Path::to_path_buf)
+        .collect();
+    std::fs::create_dir_all(dir)?;
+    if durable {
+        for d in &missing {
+            let parent = d.parent().filter(|p| !p.as_os_str().is_empty());
+            collector::manifest::sync_dir(parent.unwrap_or(Path::new(".")))?;
+        }
+    }
+    Ok(())
+}
+
 fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let decoder_cfg = DecoderConfig {
         keep_bodies: !cli.no_bodies,
@@ -261,10 +284,18 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.capture_rate < 1.0 && store_cfg.capture.key.is_none() {
         return Err("--capture-rate below 1 needs --capture-key: the draw must be unpredictable".into());
     }
-    std::fs::create_dir_all(&out)?;
     let store_dir = cli.store.clone().unwrap_or_else(|| out.join("store"));
-    std::fs::create_dir_all(&store_dir)?;
-    let object_store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&store_dir)?);
+    create_durable_dir(&out, !cli.no_fsync)?;
+    create_durable_dir(&store_dir, !cli.no_fsync)?;
+    // Each put is synced (the file and the directories it adds) before it
+    // returns, so the objects a window's manifest names are on disk before
+    // the manifest is appended to the log (spec §11).
+    if cli.no_fsync {
+        warn!("--no-fsync: object-store writes are not synced; for benchmarks only");
+    }
+    let object_store = Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(&store_dir)?.with_fsync(!cli.no_fsync),
+    );
     let registry = Registry::new();
     if let Some(addr) = &cli.metrics_addr {
         let bound = serve_metrics(addr.as_str(), registry.clone())

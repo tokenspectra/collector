@@ -6,7 +6,11 @@ offline run does (tables, bodies, views, object store, manifest log), and
 reports input bytes and packets per CPU-second. The pipeline is one
 thread, so CPU time is the cost on one core; wall time includes waiting on
 the disk. Each configuration runs --runs times into a fresh directory; the
-best run is reported.
+best run is reported. CPU time and peak RSS are each run's own, read with
+wait4() on that child alone.
+
+`default` is the durable setting, with every object-store write synced;
+`no-fsync` shows what syncing costs (that flag is for benchmarks only).
 
     python3 tools/bench.py ../e2e/ring/*.pcapng
     python3 tools/bench.py --runs 3 --out-dir /dev/shm/bench ../e2e/ring/*.pcapng
@@ -16,7 +20,6 @@ import argparse
 import json
 import os
 import platform
-import resource
 import shutil
 import subprocess
 import sys
@@ -29,6 +32,7 @@ BIN = Path(__file__).resolve().parent.parent / "target/release/collector"
 CONFIGS = {
     "default": [],
     "no-bodies": ["--no-bodies"],
+    "no-fsync": ["--no-fsync"],
 }
 
 
@@ -45,18 +49,24 @@ def cpu_model():
 def run_once(files, extra, out_root):
     out = Path(tempfile.mkdtemp(dir=out_root))
     try:
-        before = resource.getrusage(resource.RUSAGE_CHILDREN)
         t0 = time.perf_counter()
-        subprocess.run([str(BIN), "-q", *extra, "files", "-o", str(out), *map(str, files)], check=True)
+        # The collector logs to stdout; keep it off the JSON report.
+        child = subprocess.Popen([str(BIN), "-q", *extra, "files", "-o", str(out), *map(str, files)], stdout=sys.stderr)
+        # This child's own usage. RUSAGE_CHILDREN would fold in every earlier
+        # child (cargo, previous runs), and its ru_maxrss is their maximum.
+        _, status, usage = os.wait4(child.pid, 0)
+        child.returncode = os.waitstatus_to_exitcode(status)
         wall = time.perf_counter() - t0
-        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        if child.returncode != 0:
+            raise subprocess.CalledProcessError(child.returncode, child.args)
         manifests = [json.loads(l) for l in open(out / "manifests.jsonl")]
         totals = {k: sum(m["totals"][k] for m in manifests) for k in ("packets", "bytes", "workunits", "flows")}
         return {
             "wall_s": wall,
-            "user_s": after.ru_utime - before.ru_utime,
-            "sys_s": after.ru_stime - before.ru_stime,
-            "max_rss_mib": after.ru_maxrss / 1024,
+            "user_s": usage.ru_utime,
+            "sys_s": usage.ru_stime,
+            # Linux reports KiB.
+            "max_rss_mib": usage.ru_maxrss / 1024,
             "windows": len(manifests),
             **totals,
         }

@@ -109,17 +109,41 @@ impl Ingest {
         })
     }
 
-    /// POSTs one manifest line; returns the HTTP status.
-    fn post(&self, key: &str, body: &[u8], timeout: Duration) -> Result<(u16, String), ShipError> {
+    /// POSTs one manifest line; returns the HTTP status. The request gives
+    /// up after `timeout`, or as soon as `budget` runs out: the shutdown
+    /// deadline is checked between reads, so a slow ingest cannot hold a
+    /// run past it.
+    fn post(
+        &self,
+        key: &str,
+        body: &[u8],
+        timeout: Duration,
+        budget: &mut Budget<'_>,
+    ) -> Result<(u16, String), ShipError> {
         let unavailable = |e: io::Error| ShipError::Unavailable(format!("{}:{}: {e}", self.host, self.port));
+        let end = Instant::now() + timeout;
+        // Time left for the next step: the request's and the budget's,
+        // whichever runs out first.
+        let left = |budget: &mut Budget<'_>| -> Result<Duration, ShipError> {
+            let request = end.saturating_duration_since(Instant::now());
+            match budget.remaining().map_or(request, |b| b.min(request)) {
+                d if d.is_zero() => Err(ShipError::Unavailable(format!(
+                    "{}:{}: no response in time",
+                    self.host, self.port
+                ))),
+                d => Ok(d),
+            }
+        };
         let addr = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .map_err(unavailable)?
             .next()
             .ok_or_else(|| ShipError::Unavailable(format!("{}: no address", self.host)))?;
-        let mut conn = TcpStream::connect_timeout(&addr, timeout).map_err(unavailable)?;
-        conn.set_read_timeout(Some(timeout)).map_err(unavailable)?;
-        conn.set_write_timeout(Some(timeout)).map_err(unavailable)?;
+        // A connect cannot be interrupted, so it gets at most CONNECT_TIMEOUT:
+        // one started just before shutdown overruns the budget by no more.
+        let mut conn =
+            TcpStream::connect_timeout(&addr, left(budget)?.min(CONNECT_TIMEOUT)).map_err(unavailable)?;
+        conn.set_write_timeout(Some(left(budget)?)).map_err(unavailable)?;
         let host = if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
         } else {
@@ -133,7 +157,19 @@ impl Ingest {
         conn.write_all(head.as_bytes()).map_err(unavailable)?;
         conn.write_all(body).map_err(unavailable)?;
         let mut resp = Vec::new();
-        conn.take(64 << 10).read_to_end(&mut resp).map_err(unavailable)?;
+        let mut buf = [0u8; 4096];
+        while resp.len() < 64 << 10 {
+            // Short reads, so a shutdown request is seen within a SLICE.
+            conn.set_read_timeout(Some(left(budget)?.min(SLICE)))
+                .map_err(unavailable)?;
+            match conn.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => resp.extend_from_slice(&buf[..n]),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(unavailable(e)),
+            }
+        }
         let text = String::from_utf8_lossy(&resp);
         let status = text
             .lines()
@@ -143,6 +179,73 @@ impl Ingest {
             .ok_or_else(|| ShipError::Unavailable("no HTTP status in the response".into()))?;
         let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b).trim();
         Ok((status, body.chars().take(200).collect()))
+    }
+}
+
+/// The shutdown budget: once [`Shipper::finish`] names a deadline, no
+/// request starts after it and none runs past it.
+struct Budget<'a> {
+    /// Where `finish` sends the deadline; `None` for a one-off pass.
+    stop: Option<&'a mpsc::Receiver<Instant>>,
+    deadline: Option<Instant>,
+}
+
+impl<'a> Budget<'a> {
+    /// No deadline: `collector ship`.
+    fn unbounded() -> Self {
+        Budget {
+            stop: None,
+            deadline: None,
+        }
+    }
+
+    fn new(stop: &'a mpsc::Receiver<Instant>) -> Self {
+        Budget {
+            stop: Some(stop),
+            deadline: None,
+        }
+    }
+
+    /// Takes a shutdown request, if one came.
+    fn poll(&mut self) {
+        if self.deadline.is_some() {
+            return;
+        }
+        if let Some(stop) = self.stop {
+            match stop.try_recv() {
+                Ok(d) => self.deadline = Some(d),
+                Err(mpsc::TryRecvError::Disconnected) => self.deadline = Some(Instant::now()),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    /// Waits up to `wait` for a shutdown request (only while none came).
+    fn wait(&mut self, wait: Duration) {
+        match (self.deadline, self.stop) {
+            (None, Some(stop)) => match stop.recv_timeout(wait) {
+                Ok(d) => self.deadline = Some(d),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => self.deadline = Some(Instant::now()),
+            },
+            (Some(d), _) => std::thread::sleep(wait.min(d.saturating_duration_since(Instant::now()))),
+            (None, None) => std::thread::sleep(wait),
+        }
+    }
+
+    /// Time left before the deadline; `None` while there is none.
+    fn remaining(&mut self) -> Option<Duration> {
+        self.poll();
+        self.deadline.map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    fn stopping(&mut self) -> bool {
+        self.poll();
+        self.deadline.is_some()
+    }
+
+    fn spent(&mut self) -> bool {
+        self.remaining().is_some_and(|d| d.is_zero())
     }
 }
 
@@ -183,6 +286,17 @@ fn dedup_key(line: &[u8]) -> Option<String> {
 /// and stops at the first failure. The cursor advances past each line the
 /// ingest accepts.
 pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Shipped, ShipError> {
+    ship_lines(out, ingest, timeout, &mut Budget::unbounded())
+}
+
+/// [`ship_pending`] within a shutdown budget: no line is sent once it is
+/// spent; the rest stay pending.
+fn ship_lines(
+    out: &Path,
+    ingest: &Ingest,
+    timeout: Duration,
+    budget: &mut Budget<'_>,
+) -> Result<Shipped, ShipError> {
     let mut shipped = Shipped::default();
     let file = match File::open(out.join(LOG)) {
         Ok(f) => f,
@@ -213,11 +327,16 @@ pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Sh
             shipped.pending += 1;
             continue;
         }
+        if budget.spent() {
+            shipped.pending += 1;
+            result = Err(ShipError::Unavailable("shutdown budget spent".into()));
+            continue;
+        }
         let body = &line[..line.len() - 1];
         let sent = match dedup_key(body) {
             None => Err(ShipError::BadLine(offset)),
             Some(key) => ingest
-                .post(&key, body, timeout)
+                .post(&key, body, timeout, budget)
                 .and_then(|(status, text)| match status {
                     200..=299 => {
                         debug!(window = %key, status, "manifest shipped");
@@ -273,6 +392,10 @@ impl Shipper {
 }
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// A connect cannot be cut short by the budget, so it is kept brief.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest wait on the ingest between checks for a shutdown request.
+const SLICE: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 fn run(
@@ -283,29 +406,27 @@ fn run(
 ) -> Result<Shipped, ShipError> {
     let mut total = Shipped::default();
     let mut backoff = poll;
-    let mut deadline: Option<Instant> = None;
+    let mut budget = Budget::new(stopped);
     loop {
-        let pass = ship_pending(out, ingest, TIMEOUT);
+        let pass = ship_lines(out, ingest, TIMEOUT, &mut budget);
         let wait = match pass {
             Ok(s) => {
                 total.sent += s.sent;
                 total.pending = s.pending;
                 backoff = poll;
-                if deadline.is_some() {
+                if budget.stopping() {
                     return Ok(total);
                 }
                 poll
             }
             Err(e) if e.retryable() => {
-                if backoff == poll {
+                if backoff == poll && !budget.stopping() {
                     warn!(error = %e, "manifests not shipped yet; retrying");
                 }
                 total.pending = pending_lines(out).unwrap_or(total.pending);
                 backoff = (backoff * 2).min(MAX_BACKOFF);
-                match deadline {
-                    Some(d) if Instant::now() + backoff >= d => {
-                        return Err(e);
-                    }
+                match budget.remaining() {
+                    Some(left) if left <= backoff => return Err(e),
                     _ => backoff,
                 }
             }
@@ -314,15 +435,7 @@ fn run(
                 return Err(e);
             }
         };
-        if deadline.is_none() {
-            match stopped.recv_timeout(wait) {
-                Ok(d) => deadline = Some(d),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => deadline = Some(Instant::now()),
-            }
-        } else {
-            std::thread::sleep(wait);
-        }
+        budget.wait(wait);
     }
 }
 
@@ -384,6 +497,72 @@ mod tests {
             Some("c/7")
         );
         assert_eq!(dedup_key(b"{}"), None);
+    }
+
+    /// An ingest that accepts connections and reads requests but never
+    /// answers. Returns its URL and how many connections it accepted.
+    fn silent_ingest() -> (Ingest, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming().flatten() {
+                count.fetch_add(1, Ordering::SeqCst);
+                // Keep it open, unanswered.
+                held.push(conn);
+            }
+        });
+        (
+            Ingest::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
+            accepted,
+        )
+    }
+
+    fn three_lines(dir: &Path) -> Vec<u8> {
+        let log = b"{\"collector\":\"c\",\"window_start_ns\":0}\n{\"collector\":\"c\",\"window_start_ns\":1}\n{\"collector\":\"c\",\"window_start_ns\":2}\n".to_vec();
+        std::fs::write(dir.join(LOG), &log).unwrap();
+        log
+    }
+
+    /// A slow ingest cannot hold shutdown past the budget: the request in
+    /// flight is cut short, no other starts, and every line stays pending.
+    #[test]
+    fn a_slow_ingest_cannot_hold_shutdown() {
+        for wait in [Duration::from_millis(300), Duration::ZERO] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = three_lines(dir.path());
+            let (ingest, accepted) = silent_ingest();
+            let shipper =
+                Shipper::spawn(dir.path().to_path_buf(), ingest, Duration::from_millis(10)).unwrap();
+            // The first POST is in flight, waiting on the ingest (TIMEOUT is 10 s).
+            let t = Instant::now();
+            while accepted.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    t.elapsed() < Duration::from_secs(5),
+                    "no request reached the ingest"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let t = Instant::now();
+            let res = shipper.finish(wait);
+            let took = t.elapsed();
+            assert!(
+                took < wait + Duration::from_millis(500),
+                "finish({wait:?}) took {took:?}"
+            );
+            assert!(res.as_ref().is_err_and(ShipError::retryable), "{res:?}");
+            assert_eq!(
+                accepted.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "no request after the first"
+            );
+            assert_eq!(pending_lines(dir.path()).unwrap(), 3);
+            assert_eq!(read_cursor(dir.path()).unwrap(), 0);
+            assert_eq!(std::fs::read(dir.path().join(LOG)).unwrap(), log);
+        }
     }
 
     #[test]

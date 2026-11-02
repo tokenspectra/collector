@@ -86,11 +86,18 @@ impl Log {
     /// partial last line, left by a crash mid-write, is cut off first: it
     /// was never complete, so it was never shipped.
     pub fn open(dir: &Path) -> io::Result<Self> {
+        let path = dir.join(LOG);
+        let created = !path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(dir.join(LOG))?;
+            .open(&path)?;
+        if created {
+            // The log's directory entry must be durable too, or a crash
+            // could lose the whole file with the manifests synced into it.
+            sync_dir(dir)?;
+        }
         let len = file.metadata()?.len();
         if len > 0 {
             let complete = complete_len(&mut file, len)?;
@@ -110,6 +117,17 @@ impl Log {
         self.file.write_all(&line)?;
         self.file.sync_data()
     }
+}
+
+/// Makes the entries of directory `dir` durable: a new file or
+/// subdirectory in it survives a crash once this returns. A no-op off Unix,
+/// where a directory cannot be opened and synced.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Length of `file` up to and including its last newline.

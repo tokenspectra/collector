@@ -93,10 +93,10 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start_ns}/{table}.parquet
 
 ### Manifests and shipping (spec §11)
 
-When a window is sealed, after its objects are written, its manifest is appended to `<out>/manifests.jsonl` and synced to disk: site, Collector, window, Links, the window's `chunks` rows, its pack key, each index table's key and row count, and totals (packets, wire bytes, kept and truncated bytes, Flow rows, exchanges, Request Workunits, events, blobs). Like every other output it comes from the capture only, so two runs write the same lines.
+When a window is sealed, after its objects are written and synced to disk, its manifest is appended to `<out>/manifests.jsonl` and synced to disk: site, Collector, window, Links, the window's `chunks` rows, its pack key, each index table's key and row count, and totals (packets, wire bytes, kept and truncated bytes, Flow rows, exchanges, Request Workunits, events, blobs). Like every other output it comes from the capture only, so two runs write the same lines.
 
 - **The log is the source of truth** and is only appended to, across runs too. A crash mid-write leaves a partial last line, which the next run cuts off before appending.
-- **`--ingest http://host:port/path`** starts a shipper: it POSTs each new line as the window is sealed, with `Idempotency-Key: <collector>/<window_start_ns>`. Any 2xx is accepted; 408, 429, 5xx and connection errors are retried with backoff, and for up to `--ship-wait-s` (default 30) at the end of the run; any other status (409: the ingest holds that window with other bytes) stops the shipper.
+- **`--ingest http://host:port/path`** starts a shipper: it POSTs each new line as the window is sealed, with `Idempotency-Key: <collector>/<window_start_ns>`. Any 2xx is accepted; 408, 429, 5xx and connection errors are retried with backoff, and for up to `--ship-wait-s` (default 30) at the end of the run, a hard bound: a slow ingest cannot hold the run past it; any other status (409: the ingest holds that window with other bytes) stops the shipper.
 - **`manifests.shipped`** holds how far the log has shipped, as a byte offset. It is the shipper's state, not an output. Without `--ingest`, or with lines left over, `collector ship --ingest <url> <out>` sends the rest.
 - The ingest deduplicates by Collector and window, so a re-run over the same capture only repeats what it holds. `tools/mock_ingest.py` is a stand-in for it (the control-plane Store is out of scope here).
 
@@ -287,7 +287,7 @@ cargo test --workspace
   ```sh
   sg wireshark -c "tools/live_e2e.sh ../e2e 200"   # 200 s of traffic, about 1.5 GB of capture
   ```
-- **Throughput:** `tools/bench.py <files>` runs the release binary over a capture and reports bytes, packets and Request Workunits per CPU-second (the pipeline is one thread, so per core), with and without `--no-bodies`. Over the ring files `live_e2e.sh` leaves in `<work>/ring/`:
+- **Throughput:** `tools/bench.py <files>` runs the release binary over a capture and reports bytes, packets and Request Workunits per CPU-second (the pipeline is one thread, so per core), with and without `--no-bodies`, and with `--no-fsync` (benchmarks only) to show what syncing the store costs. CPU time and peak RSS are each run's own. Point `--out-dir` at a real disk: on tmpfs, syncing costs nothing. Over the ring files `live_e2e.sh` leaves in `<work>/ring/`:
 
   ```sh
   python3 tools/bench.py ../e2e/ring/*.pcapng
