@@ -238,15 +238,11 @@ pub struct WorkunitRecord {
     /// Both messages reached their end with no gap.
     pub complete: bool,
     /// The Wire Protocol's id ([`wire::WireProtocol::id`]).
-    #[serde(skip)]
     pub protocol: &'static str,
     /// Token counts from the usage the protocol reports, if it does.
-    #[serde(skip)]
     pub input_tokens: Option<u64>,
-    #[serde(skip)]
     pub output_tokens: Option<u64>,
     /// Protocol-specific fields, as one JSON object ([`wire::extra`]).
-    #[serde(skip)]
     pub extra: Option<serde_json::Value>,
     /// The protocol read the response: the whole body, or every frame.
     /// Diagnostics only, never written to the table.

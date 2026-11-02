@@ -195,6 +195,10 @@ const WORKUNITS: &[Column] = &[
     ("sse_events", Json),
     ("sse_done", Bool),
     ("complete", Bool),
+    ("protocol", Str),
+    ("input_tokens", Int),
+    ("output_tokens", Int),
+    ("extra", Json),
 ];
 
 const CHUNKS: &[Column] = &[
