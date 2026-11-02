@@ -20,6 +20,7 @@
 //! verdicts and buckets; it never assigns a status.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -30,7 +31,9 @@ use crate::http1::{parse_request_line, parse_status_line, H1};
 use crate::http2::{H2, PREFACE};
 use crate::mh;
 use crate::openai;
+use crate::source::CapturedPacket;
 use crate::sse::{self, Sse};
+use crate::window::PacketRef;
 
 /// Bytes held per direction while the verdict is open.
 const MAX_DETECT: usize = 16 << 10;
@@ -259,6 +262,24 @@ pub struct WindowClose {
     pub capture_drops: Option<u64>,
 }
 
+/// Names the Request Workunit some stream bytes belong to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkunitTag {
+    pub workunit_id: String,
+    /// Capture time of the request's first byte.
+    pub received_ts_ns: u64,
+}
+
+/// Stream bytes `[start, start + len)` of one direction and their bucket,
+/// with the Request Workunit when the bucket is `workunit`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub start: u64,
+    pub len: u64,
+    pub bucket: Bucket,
+    pub workunit: Option<Arc<WorkunitTag>>,
+}
+
 /// Receives everything the Collector produces.
 pub trait RecordSink {
     fn packet(&mut self, rec: &PacketRecord);
@@ -277,6 +298,16 @@ pub trait RecordSink {
     /// A window closed. Its Flow rows may still follow, once their bytes
     /// have buckets.
     fn window_closed(&mut self, _w: &WindowClose) {}
+    /// A packet as captured, placed at `at` in L0, before its
+    /// [`packet`](Self::packet) record.
+    fn captured(&mut self, _pkt: &CapturedPacket, _at: PacketRef) {}
+    /// The bucketed spans of one TCP direction covered by the Flow row that
+    /// follows, in stream order.
+    fn spans(&mut self, _flow: &FlowId, _dir: Dir, _spans: &[Span]) {}
+    /// An L0 chunk was written (spec §6–8).
+    fn chunk(&mut self, _rec: &crate::store::ChunkRecord) {}
+    /// A pack item was written (spec §8).
+    fn blob(&mut self, _rec: &crate::store::BlobRecord) {}
 }
 
 pub struct Decoder<'a> {
@@ -368,6 +399,11 @@ impl Decoder<'_> {
         self.sink.window_closed(w);
     }
 
+    /// Hands the sink a packet as captured, before the assembler sees it.
+    pub fn captured(&mut self, pkt: &CapturedPacket, at: PacketRef) {
+        self.sink.captured(pkt, at);
+    }
+
     /// Flows with protocol state still held.
     pub fn open_flows(&self) -> usize {
         self.flows.len()
@@ -416,11 +452,30 @@ impl Parser {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Label {
     Bucket(Bucket),
+    /// Bucket `workunit`, in this Request Workunit.
+    Workunit(Arc<WorkunitTag>),
     /// Belongs to an exchange whose bucket is not known yet.
     Exchange(u64),
+}
+
+impl Label {
+    fn settled(bucket: Bucket, tag: &Option<Arc<WorkunitTag>>) -> Self {
+        match (bucket, tag) {
+            (Bucket::Workunit, Some(t)) => Label::Workunit(t.clone()),
+            (b, _) => Label::Bucket(b),
+        }
+    }
+
+    fn bucket(&self) -> Option<Bucket> {
+        match self {
+            Label::Bucket(b) => Some(*b),
+            Label::Workunit(_) => Some(Bucket::Workunit),
+            Label::Exchange(_) => None,
+        }
+    }
 }
 
 /// The labeled bytes of one direction not yet reported in a Slice row.
@@ -443,10 +498,10 @@ impl Ledger {
         }
     }
 
-    fn resolve(&mut self, id: u64, bucket: Bucket) {
+    fn resolve(&mut self, id: u64, label: &Label) {
         for (_, l) in self.spans.iter_mut() {
             if *l == Label::Exchange(id) {
-                *l = Label::Bucket(bucket);
+                *l = label.clone();
             }
         }
     }
@@ -457,33 +512,54 @@ impl Ledger {
             return None;
         }
         let mut out = Buckets::default();
-        let mut at = self.base;
-        for &(len, label) in &self.spans {
-            let (s, e) = (at.max(start), (at + len).min(end));
-            at += len;
-            if s < e {
-                match label {
-                    Label::Bucket(b) => out.add(b, e - s),
-                    Label::Exchange(_) => return None,
-                }
-            }
-            if at >= end {
-                break;
-            }
+        for (s, e, label) in self.within(start, end) {
+            out.add(label.bucket()?, e - s);
         }
         Some(out)
     }
 
+    /// The labeled pieces of `[start, end)`, clipped to it.
+    fn within(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, u64, &Label)> {
+        let mut at = self.base;
+        self.spans
+            .iter()
+            .map_while(move |(len, label)| {
+                let piece = (at.max(start), (at + len).min(end), label);
+                let before = at;
+                at += len;
+                (before < end).then_some(piece)
+            })
+            .filter(|(s, e, _)| s < e)
+    }
+
+    /// The spans of `[start, end)`, which must all be settled.
+    fn settled(&self, start: u64, end: u64, grpc: bool) -> Vec<Span> {
+        self.within(start, end)
+            .map(|(s, e, label)| {
+                let (bucket, workunit) = match label {
+                    _ if grpc => (Bucket::Unexplained, None),
+                    Label::Workunit(t) => (Bucket::Workunit, Some(t.clone())),
+                    l => (l.bucket().expect("settled"), None),
+                };
+                Span {
+                    start: s,
+                    len: e - s,
+                    bucket,
+                    workunit,
+                }
+            })
+            .collect()
+    }
+
     /// Forgets spans before `end`.
     fn prune(&mut self, end: u64) {
-        while let Some(&(len, label)) = self.spans.front() {
-            if self.base + len <= end {
-                self.base += len;
+        while let Some((len, _)) = self.spans.front_mut() {
+            if self.base + *len <= end {
+                self.base += *len;
                 self.spans.pop_front();
             } else {
                 if self.base < end {
-                    let cut = end - self.base;
-                    self.spans[0] = (len - cut, label);
+                    *len -= end - self.base;
                     self.base = end;
                 }
                 break;
@@ -612,6 +688,8 @@ struct Exchange {
     request: Option<openai::Request>,
     response: openai::Response,
     bucket: Option<Bucket>,
+    /// Set once the bucket is `workunit`.
+    tag: Option<Arc<WorkunitTag>>,
 }
 
 /// Which way a direction's first bytes point.
@@ -842,6 +920,11 @@ impl FlowState {
                 }
             }
             let slice = self.held.pop_front().expect("front");
+            for (dir, (s, e)) in [(Dir::Orig, (os, oe)), (Dir::Resp, (rs, re))] {
+                if s < e {
+                    sink.spans(&self.id, dir, &self.ledgers[dir.idx()].settled(s, e, self.grpc));
+                }
+            }
             self.ledgers[0].prune(oe);
             self.ledgers[1].prune(re);
             let verdict = if self.grpc {
@@ -876,6 +959,7 @@ impl FlowState {
                 request: None,
                 response: openai::Response::default(),
                 bucket: None,
+                tag: None,
             },
         );
         if let Some(s) = h2_stream {
@@ -906,8 +990,16 @@ impl FlowState {
         if ex.bucket.is_none() {
             ex.bucket = classify(ex, self.grpc, req_closed, resp_closed);
             if let Some(b) = ex.bucket {
+                if b == Bucket::Workunit {
+                    let req = ex.req.as_ref().expect("a Workunit has a request");
+                    ex.tag = Some(Arc::new(WorkunitTag {
+                        workunit_id: workunit_id(&self.id, req),
+                        received_ts_ns: req.first_ts,
+                    }));
+                }
+                let label = Label::settled(b, &ex.tag);
                 for l in &mut self.ledgers {
-                    l.resolve(id, b);
+                    l.resolve(id, &label);
                 }
             }
         }
@@ -930,14 +1022,7 @@ impl FlowState {
             Some(Verdict::Http2) => HttpVersion::Http2,
             _ => HttpVersion::Http1,
         };
-        let workunit_id = (bucket == Bucket::Workunit).then(|| {
-            let req = ex.req.as_ref().expect("a Workunit has a request");
-            let mut h = blake3::Hasher::new();
-            h.update(self.id.as_str().as_bytes());
-            h.update(&[0, req.dir.idx() as u8]);
-            h.update(&req.start.to_be_bytes());
-            mh::name(&h.finalize())
-        });
+        let workunit_id = ex.tag.as_ref().map(|t| t.workunit_id.clone());
         sink.exchange(&ExchangeRecord {
             flow: self.id.clone(),
             exchange: ex.seq,
@@ -1021,6 +1106,17 @@ impl FlowState {
             self.settle(id, sink);
         }
     }
+}
+
+/// `blake3(flow_id ‖ 0x00 ‖ request direction ‖ request start offset as u64
+/// big-endian)`: unique and stable across re-runs, not a content hash
+/// (spec §6).
+fn workunit_id(flow: &FlowId, req: &Msg) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(flow.as_str().as_bytes());
+    h.update(&[0, req.dir.idx() as u8]);
+    h.update(&req.start.to_be_bytes());
+    mh::name(&h.finalize())
 }
 
 /// The exchange's bucket, or `None` while it depends on bytes still to come.
@@ -1118,10 +1214,13 @@ impl Out for Ctx<'_> {
             Lab::Unexplained => Label::Bucket(Bucket::Unexplained),
             Lab::Gap => Label::Bucket(Bucket::Gap),
             Lab::Msg(s) => match self.f.exchange_of(self.dir, s) {
-                Some(id) => match self.f.exchanges[&id].bucket {
-                    Some(b) => Label::Bucket(b),
-                    None => Label::Exchange(id),
-                },
+                Some(id) => {
+                    let ex = &self.f.exchanges[&id];
+                    match ex.bucket {
+                        Some(b) => Label::settled(b, &ex.tag),
+                        None => Label::Exchange(id),
+                    }
+                }
                 None => Label::Bucket(Bucket::Unexplained),
             },
         };
@@ -1299,7 +1398,7 @@ mod tests {
         assert_eq!(l.tally(0, 10).unwrap().framing, 10);
         assert_eq!(l.tally(0, 12), None);
         assert_eq!(l.tally(0, 21), None);
-        l.resolve(1, Bucket::Workunit);
+        l.resolve(1, &Label::Bucket(Bucket::Workunit));
         let b = l.tally(8, 20).unwrap();
         assert_eq!((b.framing, b.workunit, b.gap, b.total()), (2, 5, 5, 12));
         l.prune(12);

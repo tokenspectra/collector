@@ -24,8 +24,9 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 - Stage 1 (TS-24): packet input and Flow assembly.
 - Stage 2 (TS-25): protocol identification, byte accounting, HTTP/1.1, h2c, SSE and OpenAI Request Workunits.
 - Stage 3 (TS-28): console logging with verbosity levels, and one counter registry read by the window log line, an on-demand snapshot and Prometheus `/metrics` (spec §14).
+- Stage 4 (TS-26): BLAKE3 packet hashes and a Merkle root per chunk, the Slice hash chain, the Capture Rate cut, and the object store: zstd pcapng chunks, packs and Parquet index tables (spec §6–8).
 
-Hashing of chunks and Slices, the Capture Rate cut and the object store come next. Implementation is tracked in Multica.
+Implementation is tracked in Multica.
 
 ## Layout
 
@@ -42,6 +43,11 @@ Hashing of chunks and Slices, the Capture Rate cut and the object store come nex
 | `http1`, `http2`, `hpack`, `sse` | §5 | Hand-written, bounds-checked parsers: HTTP/1.1 (chunked included), h2c frames, HPACK, server-sent events |
 | `openai` | §5 | The OpenAI Wire Protocol: which exchanges are Request Workunits, and the record fields read from their bodies |
 | `output` | | JSON Lines tables (below) |
+| `chunk` | §6, §8 | L0 chunks as pcapng, written byte for byte; the Merkle root over a chunk's packet hashes |
+| `capture` | §7 | The Capture Rate cut: which packets a chunk keeps in full, the keyed draw per Workunit |
+| `pack` | §8 | Packs: one zstd frame per item, plus a zstd seekable seek table |
+| `index` | §8 | Index tables as Parquet, one fixed schema per table |
+| `store` | §6–8 | `StoreSink`: holds each window, then writes its chunks, pack and index through `object_store`, write-once |
 | `stats`, `observe` | §14 | The counter registry, its snapshot table and `/metrics`; `StatsSink`, which counts and logs every record on its way to the real sink and forwards it unchanged |
 
 ### Tables
@@ -54,6 +60,35 @@ Hashing of chunks and Slices, the Capture Rate cut and the object store come nex
 | `flows` | Flow per Slice | Flow metadata, `verdict`, and `orig_bytes`/`resp_bytes` buckets |
 | `http` | HTTP request/response pair | method, target, status, content type, body length, `body_hash`, bucket, `workunit_id` |
 | `workunits` | Request Workunit | the record below |
+| `chunks` | L0 chunk (Link × window) | object key, `chunk_hash`, `merkle_root`, packets, and the Capture Rate's kept and truncated bytes |
+| `blobs` | pack item | hash, `body` or `workunit`, pack key, offset and length of its zstd frame |
+
+`packets.hash` is the BLAKE3 of the captured bytes. `flows` rows carry `orig_stats.slice_hash` and `resp_stats.slice_hash`, the Slice hash chain (spec §6).
+
+### Object store (spec §8)
+
+Every run writes, under `--store` (default `<out>/store`), once per window:
+
+```
+raw/{site}/{collector}/{link}/{yyyy}/{mm}/{dd}/{window_start_ns}-{chunk_hash}.pcapng.zst
+packs/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start_ns}.pack
+index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start_ns}/{table}.parquet
+```
+
+- **Chunks:** one pcapng per Link per window, zstd-compressed, named by the BLAKE3 of the uncompressed pcapng: `zstd -dc <chunk> | b3sum` prints the last 64 digits of its name. Wireshark opens it. Truncated packets keep their original length.
+- **Packs:** bodies (unless `--no-bodies`) and Request Workunit records, one zstd frame each; `blobs` says where. `zstd -dc` of a pack prints every item joined.
+- **Index:** the eight tables above as Parquet, one fixed schema per table.
+- Every put is create-only. Re-running over the same capture into the same store leaves identical objects alone; an object with other bytes fails the run.
+- `--site` and `--collector-id` (default `local`) fill the key prefix.
+
+### Capture Rate (spec §7)
+
+Hashes and every table cover 100% of traffic. Only the stored chunk follows the Capture Rate:
+
+- `--capture-rate <0..1>` (default 1, keep everything): the share of Request Workunits whose packets stay whole. The others are truncated to `--truncate-to` bytes (default 128).
+- The draw is keyed per window. Until the control plane sends the secrets, they come from `--capture-key <64 hex digits>`, which a rate below 1 requires.
+- Alarm traffic (`unexplained` bytes, `tls`/`opaque`/`grpc`, UDP and other IP protocols) is kept whole up to `--alarm-cap` captured bytes per Flow per Slice (default 16 MiB).
+- Handshakes, control frames, `http_other`, and packets an anomaly points at are always whole. Bodies are kept in packs at any rate.
 
 ### Bodies
 
@@ -69,7 +104,7 @@ Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: re
   - `<exchange>.response.merged.json`, for SSE Workunits only, joins the streamed chunks into one `chat.completion` (or `text_completion`) object: per choice, `role`, `content` and `reasoning` joined and the last `finish_reason`; `id`, `created` and `model` from the first event; the last `usage`. `incomplete: true` means `[DONE]` never arrived or an event didn't parse (`unparsed_events`).
   - The merged file is derived and lossy. It is not evidence: it is never hashed, stored or compared with the API Tap. The raw body in `bodies/` is the source.
 - Bodies hold plaintext prompts and outputs (spec §10).
-- Packs replace the per-body files once the object store lands.
+- `bodies/` is the local view; the store keeps the same bodies in packs.
 
 ### Verdicts and byte accounting (spec §5)
 
@@ -98,7 +133,7 @@ The record follows the TS-15 capture record where the Link shows the field:
 | | `response_body_hash`, `response_id`, `response_model`, `status` | |
 | | `sse_events`, `sse_done` | each event's body offset, length and capture time; whether `data: [DONE]` arrived. One hash covers the whole SSE body (spec §6) |
 | | `complete` | both messages reached their end with no gap |
-| `manifest_id`, `upstream`, forwarded request, token ids, logprobs, `scorable` | | not on the Link: the API Tap's side. The bodies themselves are stored by hash in the next stage |
+| `manifest_id`, `upstream`, forwarded request, token ids, logprobs, `scorable` | | not on the Link: the API Tap's side |
 
 A body with a gap has `body_hash: null`. A request body that is incomplete, has a gap, uses a content coding or exceeds `DecoderConfig::max_body` (16 MiB) cannot be checked as JSON, so its pair is `http_other`.
 
@@ -133,7 +168,7 @@ Logs go to stdout; they are diagnostics and never change an output file.
 - `-v` DEBUG adds one line per Request Workunit and per new or closed Flow; `-vv` TRACE adds every reassembled segment. `-q` keeps WARN and ERROR, `-qq` ERROR only.
 - `--log-level <error|warn|info|debug|trace>` overrides `-v`/`-q`; `RUST_LOG` overrides both. `--log-format json` writes JSON lines.
 - **Snapshot:** press `s` or Enter (stdin a terminal), or send `SIGUSR1`, for a table of totals and the last window's rates.
-- **Metrics:** `--metrics-addr 127.0.0.1:9464` serves Prometheus text at `/metrics`, `ts_collector_*` counters and gauges. Off by default.
+- **Metrics:** `--metrics-addr 127.0.0.1:9464` serves Prometheus text at `/metrics`, `ts_collector_*` counters and gauges. Off by default. Capture Rate and store counters: `capture_packets_total{cut}`, `capture_kept_bytes_total`, `capture_truncated_bytes_total`, `store_objects_total{kind}`, `store_bytes_total{kind}`, `store_existing_total`.
 
 ### Smoke test
 
@@ -162,6 +197,7 @@ cargo test --workspace
   - **Captured OpenAI traffic** (`openai_h1_json`, `openai_h1_sse`, `openai_h2c_json`, `openai_h2c_sse`, `http_other_h1`): the official OpenAI Python SDK (and httpx for `/health`, `/v1/models` and a malformed body) against a mock OpenAI-compatible server, over HTTP/1.1 and h2c, captured with dumpcap. See below.
   - **Synthetic** fixtures, built packet by packet in `tests/support/fixtures.rs` and written by `cargo run -p collector --example gen_fixtures`: edge cases a live run can't produce on demand (lost segment, retransmit with different bytes, mid-stream start, Flows spanning windows, UDP, non-HTTP TCP, a TLS Flow on the plaintext Link, gRPC over h2c, HTTP/1.1 pipelining and a request whose response lands in the next window).
   - `dumpcap_keepalive-*`: real dumpcap ring files of a keep-alive Flow whose SYN predates the capture.
+- **Store** (`tests/store.rs`): every body, Workunit record and chunk is fetched by hash and verifies; each chunk's packets match the `packets` table and its Merkle root; Slice hashes are recomputed from the streams; two runs write byte-identical stores, and a re-run finds every object already there; an object with other bytes is never overwritten; a Capture Rate of 0 truncates exactly the Workunit packets and changes no table but `chunks`; the alarm cap; Parquet holds the same rows as the JSONL tables.
 - **Logs and stats** (`tests/observe.rs`): the registry's final counters equal what the tables say, bytes by bucket sum to every Flow's bytes, `/metrics` is scraped and parsed, a `-v` run over every golden case logs one DEBUG line per expected Workunit, `SIGUSR1` prints the snapshot during a ring run, and runs at `-qq` and at `-vv` with metrics write identical output trees. The keypress snapshot needs a terminal, so it is in the smoke test above.
 - Besides the expected tables, the tests check that every body with a `body_hash` is kept under its hash, that every `by-exchange/` link resolves to a body matching its name, and that `--no-bodies` changes no table. They also check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
 - **Capturing the OpenAI fixtures again** (only when the mock or the scenarios change; CI never captures). Needs [uv](https://docs.astral.sh/uv/) and dumpcap; Python dependencies are pinned in the scripts:

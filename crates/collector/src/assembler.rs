@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::flow::{Dir, Endpoint, FlowId, FlowKind, Tuple};
+use crate::mh;
 use crate::net::{self, Decoded, Transport, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
 use crate::source::{CapturedPacket, LinkId};
 use crate::tcp::{Emit, TcpDir};
@@ -67,6 +68,9 @@ pub struct PacketRecord {
     pub ts_ns: u64,
     pub cap_len: u32,
     pub orig_len: u32,
+    /// BLAKE3 of the captured bytes, as a multihash name (spec §6). The
+    /// chunk index commits to these in a Merkle root.
+    pub hash: String,
     pub flow: Option<FlowId>,
     pub dir: Option<Dir>,
     pub tcp_flags: Option<String>,
@@ -160,6 +164,9 @@ pub struct DirStats {
     pub retransmit_bytes: u64,
     pub retransmit_diff_bytes: u64,
     pub datagrams: u64,
+    /// The Slice hash chain of this direction (spec §6), as a multihash name.
+    /// Set on every Slice row; gap bytes are left out of it.
+    pub slice_hash: Option<String>,
 }
 
 /// One Flow during one window (the future `flows` table, spec §4 and §8).
@@ -198,6 +205,44 @@ pub trait FlowSink {
     fn flow_end(&mut self, _flow: &FlowId, _slice_pending: bool) {}
 }
 
+/// One direction's Slice hash chain (spec §6):
+/// `slice_hash[n] = blake3(slice_hash[n-1] ‖ flow_id ‖ 0x00 ‖ dir ‖ bytes)`,
+/// where `dir` is `0` (orig) or `1` (resp) and `bytes` are the stream bytes
+/// delivered in Slice `n`, gaps left out. UDP and other IP protocols have no
+/// stream: each datagram's captured payload goes in with its length as a
+/// u32 big-endian prefix, so datagram boundaries are committed too.
+/// `slice_hash[-1]` is [`genesis`].
+pub(crate) struct Chain {
+    pub hasher: blake3::Hasher,
+}
+
+impl Chain {
+    fn start(prev: &blake3::Hash, flow: &FlowId, dir: Dir) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(prev.as_bytes());
+        hasher.update(flow.as_str().as_bytes());
+        hasher.update(&[0, dir.idx() as u8]);
+        Chain { hasher }
+    }
+
+    /// Ends the Slice: returns its hash and starts the next one.
+    fn advance(&mut self, flow: &FlowId, dir: Dir) -> blake3::Hash {
+        let h = self.hasher.finalize();
+        *self = Chain::start(&h, flow, dir);
+        h
+    }
+}
+
+/// The Flow's first-seen record, which seeds both chains:
+/// `blake3(flow_id ‖ 0x00 ‖ first_ts_ns as u64 big-endian)`.
+pub fn genesis(flow: &FlowId, first_ts_ns: u64) -> blake3::Hash {
+    let mut h = blake3::Hasher::new();
+    h.update(flow.as_str().as_bytes());
+    h.update(&[0]);
+    h.update(&first_ts_ns.to_be_bytes());
+    h.finalize()
+}
+
 struct FlowState {
     id: FlowId,
     tuple: Tuple,
@@ -214,6 +259,7 @@ struct FlowState {
     ended: bool,
     tcp: [TcpDir; 2],
     stats: [DirStats; 2],
+    chains: [Chain; 2],
     slice_first_ts_ns: Option<u64>,
     slice_last_ts_ns: Option<u64>,
     active: bool,
@@ -255,6 +301,7 @@ impl FlowState {
                     flow: &self.id,
                     dir,
                     stats: &mut self.stats[dir.idx()],
+                    hash: &mut self.chains[dir.idx()].hasher,
                 };
                 if self.tcp[dir.idx()].flush(&mut e) {
                     self.active = true;
@@ -267,6 +314,10 @@ impl FlowState {
 
     fn take_slice(&mut self, window_start_ns: u64) -> SliceRecord {
         let mut stats = std::mem::take(&mut self.stats);
+        for (dir, s) in [Dir::Orig, Dir::Resp].into_iter().zip(stats.iter_mut()) {
+            let h = self.chains[dir.idx()].advance(&self.id, dir);
+            s.slice_hash = Some(mh::name(&h));
+        }
         if self.tuple.kind == FlowKind::Tcp {
             for (s, t) in stats.iter_mut().zip(self.tcp.iter_mut()) {
                 s.stream_start = Some(t.slice_start);
@@ -343,6 +394,7 @@ impl Assembler {
             ts_ns: pkt.ts_ns,
             cap_len: pkt.data.len() as u32,
             orig_len: pkt.orig_len,
+            hash: mh::of(&pkt.data),
             flow: None,
             dir: None,
             tcp_flags: None,
@@ -395,8 +447,14 @@ impl Assembler {
                 let (orig, resp) = if syn_ack { (dst, src) } else { (src, dst) };
                 let max_pending = self.cfg.max_pending_bytes;
                 let max_recent = self.cfg.retransmit_window_bytes;
+                let id = FlowId::new(&tuple, generation);
+                let seed = genesis(&id, pkt.ts_ns);
                 let state = FlowState {
-                    id: FlowId::new(&tuple, generation),
+                    chains: [
+                        Chain::start(&seed, &id, Dir::Orig),
+                        Chain::start(&seed, &id, Dir::Resp),
+                    ],
+                    id,
                     tuple: tuple.clone(),
                     generation,
                     orig,
@@ -446,8 +504,10 @@ impl Assembler {
                 let s = &mut flow.stats[dir.idx()];
                 s.datagrams += 1;
                 s.gap_bytes += u64::from(d.payload_len) - d.payload.len() as u64;
+                datagram(&mut flow.chains[dir.idx()], d.payload);
             }
             _ => {
+                datagram(&mut flow.chains[dir.idx()], d.payload);
                 if d.fragment {
                     sink.event(&EventRecord {
                         flow: flow.id.clone(),
@@ -500,6 +560,12 @@ impl Assembler {
     }
 }
 
+/// Adds one datagram's captured payload to a Slice hash chain.
+fn datagram(chain: &mut Chain, payload: &[u8]) {
+    chain.hasher.update(&(payload.len() as u32).to_be_bytes());
+    chain.hasher.update(payload);
+}
+
 /// Handles one TCP segment captured at `ts_ns`; returns the stream offset of
 /// its first payload byte.
 fn tcp_packet(
@@ -515,6 +581,7 @@ fn tcp_packet(
         id,
         tcp,
         stats,
+        chains,
         syn,
         syn_ack,
         fin,
@@ -523,11 +590,13 @@ fn tcp_packet(
     } = flow;
     let (me, other) = pair(tcp, dir);
     let (my_stats, other_stats) = pair(stats, dir);
+    let (my_chain, other_chain) = pair(chains, dir);
     let mut e = Emit {
         sink: &mut *sink,
         flow: id,
         dir,
         stats: my_stats,
+        hash: &mut my_chain.hasher,
     };
 
     let is_syn = t.has(TCP_SYN);
@@ -615,6 +684,7 @@ fn tcp_packet(
                     flow: id,
                     dir: dir.other(),
                     stats: other_stats,
+                    hash: &mut other_chain.hasher,
                 };
                 other.gap_until(target as u64, EventKind::GapLost, &mut oe);
             }

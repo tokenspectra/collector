@@ -179,6 +179,9 @@ fn load<const N: usize>(a: &Labeled<N>) -> [u64; N] {
     std::array::from_fn(|i| a[i].load(Ordering::Relaxed))
 }
 
+/// Object kinds in the store (spec §8), the `kind` label.
+pub const STORE_KINDS: [&str; 3] = ["chunk", "pack", "index"];
+
 /// The counters. Shared as `Arc<Registry>` between the pipeline and the
 /// views.
 pub struct Registry {
@@ -199,6 +202,14 @@ pub struct Registry {
     pub(crate) mid_stream_starts: AtomicU64,
     pub(crate) capture_drops: AtomicU64,
     pub(crate) windows_closed: AtomicU64,
+    /// Packets stored `[full, truncated]` by the Capture Rate cut.
+    pub(crate) capture_packets: Labeled<2>,
+    pub(crate) capture_kept_bytes: AtomicU64,
+    pub(crate) capture_truncated_bytes: AtomicU64,
+    /// Objects written and their bytes, by [`STORE_KINDS`].
+    pub(crate) store_objects: Labeled<3>,
+    pub(crate) store_bytes: Labeled<3>,
+    pub(crate) store_existing: AtomicU64,
     /// `f64` bits.
     last_window_lag: AtomicU64,
     last_window: Mutex<Option<WindowStats>>,
@@ -224,6 +235,12 @@ impl Default for Registry {
             mid_stream_starts: AtomicU64::new(0),
             capture_drops: AtomicU64::new(0),
             windows_closed: AtomicU64::new(0),
+            capture_packets: zeros(),
+            capture_kept_bytes: AtomicU64::new(0),
+            capture_truncated_bytes: AtomicU64::new(0),
+            store_objects: zeros(),
+            store_bytes: zeros(),
+            store_existing: AtomicU64::new(0),
             last_window_lag: AtomicU64::new(0f64.to_bits()),
             last_window: Mutex::new(None),
         }
@@ -276,6 +293,12 @@ impl Registry {
             mid_stream_starts: self.mid_stream_starts.load(Ordering::Relaxed),
             capture_drops: self.capture_drops.load(Ordering::Relaxed),
             windows_closed: self.windows_closed.load(Ordering::Relaxed),
+            capture_packets: load(&self.capture_packets),
+            capture_kept_bytes: self.capture_kept_bytes.load(Ordering::Relaxed),
+            capture_truncated_bytes: self.capture_truncated_bytes.load(Ordering::Relaxed),
+            store_objects: load(&self.store_objects),
+            store_bytes: load(&self.store_bytes),
+            store_existing: self.store_existing.load(Ordering::Relaxed),
             last_window_lag_s: f64::from_bits(self.last_window_lag.load(Ordering::Relaxed)),
             last_window: self.last_window.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
@@ -311,6 +334,16 @@ pub struct Snapshot {
     pub mid_stream_starts: u64,
     pub capture_drops: u64,
     pub windows_closed: u64,
+    /// Packets written to L0 chunks `[full, truncated]` (spec §7).
+    pub capture_packets: [u64; 2],
+    /// Captured bytes written to chunks, and captured bytes cut off.
+    pub capture_kept_bytes: u64,
+    pub capture_truncated_bytes: u64,
+    /// Objects and bytes written, by [`STORE_KINDS`].
+    pub store_objects: [u64; 3],
+    pub store_bytes: [u64; 3],
+    /// Puts that found the same object already there.
+    pub store_existing: u64,
     pub last_window_lag_s: f64,
     pub last_window: Option<WindowStats>,
 }
@@ -422,11 +455,9 @@ pub fn pct(part: u64, whole: u64) -> String {
     }
 }
 
-/// A capture time (ns since the Unix epoch) as `YYYY-MM-DDTHH:MM:SS.mmmZ`.
-pub fn fmt_ts(ns: u64) -> String {
-    let secs = ns / 1_000_000_000;
-    let ms = (ns / 1_000_000) % 1000;
-    let (days, rem) = (secs / 86_400, secs % 86_400);
+/// The UTC calendar date (year, month, day) of a capture time.
+pub fn civil_date(ns: u64) -> (i64, i64, i64) {
+    let days = ns / 1_000_000_000 / 86_400;
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
@@ -437,6 +468,15 @@ pub fn fmt_ts(ns: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+/// A capture time (ns since the Unix epoch) as `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+pub fn fmt_ts(ns: u64) -> String {
+    let secs = ns / 1_000_000_000;
+    let ms = (ns / 1_000_000) % 1000;
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_date(ns);
     format!(
         "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{ms:03}Z",
         rem / 3600,
@@ -521,6 +561,27 @@ pub fn render_table(s: &Snapshot) -> String {
     row(&mut t, "mid-stream starts", s.mid_stream_starts.to_string());
     row(&mut t, "capture drops", s.capture_drops.to_string());
     row(&mut t, "windows closed", s.windows_closed.to_string());
+    let [full, truncated] = s.capture_packets;
+    row(
+        &mut t,
+        "capture rate cut",
+        format!(
+            "{full} packets full, {truncated} truncated; {} bytes kept, {} cut",
+            s.capture_kept_bytes, s.capture_truncated_bytes
+        ),
+    );
+    for (i, k) in STORE_KINDS.iter().enumerate() {
+        row(
+            &mut t,
+            &format!("store {k} objects"),
+            format!("{} ({} bytes)", s.store_objects[i], s.store_bytes[i]),
+        );
+    }
+    row(
+        &mut t,
+        "store objects already there",
+        s.store_existing.to_string(),
+    );
     match &s.last_window {
         None => {
             let _ = writeln!(t, "last window: none closed yet");
@@ -640,8 +701,49 @@ pub fn render_prometheus(s: &Snapshot) -> String {
             s.capture_drops,
         ),
         ("windows_closed_total", "Windows closed.", s.windows_closed),
+        (
+            "capture_kept_bytes_total",
+            "Captured bytes written to L0 chunks (spec §7).",
+            s.capture_kept_bytes,
+        ),
+        (
+            "capture_truncated_bytes_total",
+            "Captured bytes the Capture Rate cut from L0 chunks.",
+            s.capture_truncated_bytes,
+        ),
+        (
+            "store_existing_total",
+            "Object puts that found the same bytes already there.",
+            s.store_existing,
+        ),
     ] {
         p.scalar(name, "counter", help, v);
+    }
+    let name = "capture_packets_total";
+    p.family(
+        name,
+        "counter",
+        "Packets written to L0 chunks, full or truncated.",
+    );
+    for (i, cut) in ["full", "truncated"].iter().enumerate() {
+        p.sample(name, &format!("cut=\"{cut}\""), s.capture_packets[i]);
+    }
+    for (name, help, vals) in [
+        (
+            "store_objects_total",
+            "Objects written to the store, by kind.",
+            &s.store_objects,
+        ),
+        (
+            "store_bytes_total",
+            "Bytes written to the store, by kind.",
+            &s.store_bytes,
+        ),
+    ] {
+        p.family(name, "counter", help);
+        for (i, k) in STORE_KINDS.iter().enumerate() {
+            p.sample(name, &format!("kind=\"{k}\""), vals[i]);
+        }
     }
     p.scalar(
         "last_window_lag_seconds",
@@ -766,6 +868,9 @@ mod tests {
         assert!(text.contains("ts_collector_workunits_total{outcome=\"ok\",http_class=\"2xx\"} 1\n"));
         assert!(text.contains("ts_collector_packets_total{verdict=\"other\"} 0\n"));
         let samples = text.lines().filter(|l| !l.starts_with('#')).count();
-        assert_eq!(samples, 3 * 7 + 2 + 5 * 2 + 3 * 4 + 8 + 1);
+        assert!(text.contains("ts_collector_capture_packets_total{cut=\"truncated\"} 0\n"));
+        assert!(text.contains("ts_collector_store_objects_total{kind=\"chunk\"} 0\n"));
+        // + capture and store: 3 scalars, packets by cut, objects and bytes by kind.
+        assert_eq!(samples, 3 * 7 + 2 + 5 * 2 + 3 * 4 + 8 + 1 + 3 + 2 + 2 * 3);
     }
 }
