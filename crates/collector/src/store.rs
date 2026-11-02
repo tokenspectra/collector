@@ -8,7 +8,10 @@
 //! - one zstd-compressed pcapng chunk per Link, cut by the Capture Rate
 //!   (`capture`), named by the BLAKE3 hash of the uncompressed pcapng;
 //! - one pack of the window's bodies and Request Workunit records;
-//! - one Parquet file per index table.
+//! - one Parquet file per index table;
+//!
+//! and then hands the window's manifest ([`crate::manifest`]), which names
+//! them, to the sink behind it.
 //!
 //! A window is sealed once it has closed and every TCP packet in it has its
 //! bytes bucketed (a Flow row can wait a window for its response head), or
@@ -34,6 +37,7 @@ use crate::capture::{CaptureConfig, Class};
 use crate::chunk::{self, Packet};
 use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, Span, WindowClose, WorkunitRecord};
 use crate::flow::{Dir, FlowId};
+use crate::manifest::{IndexFile, Totals, WindowManifest};
 use crate::source::{CapturedPacket, LinkId};
 use crate::stats::{add, Registry};
 use crate::window::PacketRef;
@@ -334,6 +338,7 @@ impl<'a> StoreSink<'a> {
     fn write_window(&mut self, w: u64, win: &mut Window) -> Result<(), StoreError> {
         let date = date_path(w);
         let (site, collector) = (safe(&self.cfg.site), safe(&self.cfg.collector));
+        let mut chunks = Vec::with_capacity(win.chunks.len());
         for (link, held) in std::mem::take(&mut win.chunks) {
             let rec = self.write_chunk(w, &date, &link, &held)?;
             win.rows
@@ -341,9 +346,12 @@ impl<'a> StoreSink<'a> {
                 .or_default()
                 .push(serde_json::to_value(&rec)?);
             self.inner.chunk(&rec);
+            chunks.push(rec);
         }
+        let mut pack = None;
         if !win.items.is_empty() {
             let key = format!("packs/{site}/{collector}/{date}/{w}.pack");
+            pack = Some(key.clone());
             let (bytes, entries) = pack::build(win.items.iter().map(|i| &i.bytes[..]), self.cfg.zstd_level)?;
             self.put(&key, bytes, Kind::Pack)?;
             self.summary.packs += 1;
@@ -365,13 +373,59 @@ impl<'a> StoreSink<'a> {
                 self.inner.blob(&rec);
             }
         }
+        let mut index_files = Vec::with_capacity(index::TABLES.len());
         for table in index::TABLES {
             let rows = win.rows.get(table).map_or(&[][..], Vec::as_slice);
             let key = format!("index/{site}/{collector}/{date}/{w}/{table}.parquet");
             self.put(&key, index::parquet(table, rows)?, Kind::Index)?;
             self.summary.index_files += 1;
+            index_files.push(IndexFile {
+                table: table.to_string(),
+                key,
+                rows: rows.len() as u64,
+            });
         }
+        let manifest = self.build_manifest(w, win, chunks, pack, index_files);
+        self.inner.manifest(&manifest);
         Ok(())
+    }
+
+    /// The window's manifest, from what was just written (spec §11).
+    fn build_manifest(
+        &self,
+        w: u64,
+        win: &Window,
+        chunks: Vec<ChunkRecord>,
+        pack: Option<String>,
+        index: Vec<IndexFile>,
+    ) -> WindowManifest {
+        let rows = |table: &str| win.rows.get(table).map_or(&[][..], Vec::as_slice);
+        let count = |table: &str| rows(table).len() as u64;
+        let totals = Totals {
+            packets: count("packets"),
+            bytes: rows("packets")
+                .iter()
+                .filter_map(|p| p["orig_len"].as_u64())
+                .sum(),
+            kept_bytes: chunks.iter().map(|c| c.kept_bytes).sum(),
+            truncated_bytes: chunks.iter().map(|c| c.truncated_bytes).sum(),
+            flows: count("flows"),
+            exchanges: count("http"),
+            workunits: count("workunits"),
+            events: count("events"),
+            blobs: count("blobs"),
+        };
+        WindowManifest {
+            site: self.cfg.site.clone(),
+            collector: self.cfg.collector.clone(),
+            window_start_ns: w,
+            window_ns: self.cfg.window_ns,
+            links: chunks.iter().map(|c| c.link.clone()).collect(),
+            chunks,
+            pack,
+            index,
+            totals,
+        }
     }
 
     fn write_chunk(

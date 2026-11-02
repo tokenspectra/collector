@@ -873,11 +873,16 @@ fn bodies_are_kept_by_hash_unless_opted_out() {
         kept_any |= bodies.iter().any(|(_, b)| !b.is_empty());
 
         // Only the blobs are missing: every other table is the same, and the
-        // pack holds the same Workunit records, without bodies.
+        // pack holds the same Workunit records, without bodies. The manifests
+        // count the blobs, so they differ too.
         let (without, none) = tables_and_bodies(&mut FileSource::new(fixture_paths(&names)), false);
         assert!(none.is_empty(), "{case}");
-        let not_blobs =
-            |t: &Files| -> Files { t.iter().filter(|(n, _)| n != "blobs.jsonl").cloned().collect() };
+        let not_blobs = |t: &Files| -> Files {
+            t.iter()
+                .filter(|(n, _)| n != "blobs.jsonl" && n != collector::manifest::LOG)
+                .cloned()
+                .collect()
+        };
         assert_eq!(not_blobs(&without), not_blobs(&tables), "{case}");
         let records = |t: &Files, kind: &str| -> Vec<String> {
             let blobs = &t.iter().find(|(n, _)| n == "blobs.jsonl").unwrap().1;

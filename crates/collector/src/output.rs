@@ -8,6 +8,9 @@
 //! `blobs` (one row per pack item). Rows are written in a fixed order with fixed field order, so
 //! the files are byte-identical across runs.
 //!
+//! Each window's manifest is appended to the manifest log
+//! ([`manifest::LOG`](crate::manifest::LOG)) as the store seals it.
+//!
 //! HTTP bodies go to `bodies/{multihash}`, one file per distinct body, until
 //! packs exist (spec §8). `b3sum` of a file prints the last 64 digits of its
 //! name.
@@ -26,6 +29,7 @@ use serde::Serialize;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord};
+use crate::manifest::{Log, WindowManifest};
 use crate::store::{BlobRecord, ChunkRecord};
 use crate::{mh, views};
 
@@ -52,6 +56,7 @@ pub struct JsonlSink {
     workunits: BufWriter<File>,
     chunks: BufWriter<File>,
     blobs: BufWriter<File>,
+    log: Log,
     out: PathBuf,
     bodies: PathBuf,
     /// `http` rows not yet in `by-exchange/`; linked when the window closes,
@@ -64,8 +69,9 @@ pub struct JsonlSink {
 }
 
 impl JsonlSink {
-    /// Creates the table files in `dir`, which must exist, and removes a
-    /// `by-exchange/` left there by an earlier run.
+    /// Creates the table files in `dir`, which must exist, opens the
+    /// manifest log there for appending, and removes a `by-exchange/` left
+    /// there by an earlier run.
     pub fn create(dir: &Path) -> io::Result<Self> {
         let stale = dir.join(views::BY_EXCHANGE);
         if stale.exists() {
@@ -81,6 +87,7 @@ impl JsonlSink {
             workunits: open("workunits")?,
             chunks: open("chunks")?,
             blobs: open("blobs")?,
+            log: Log::open(dir)?,
             out: dir.to_owned(),
             bodies: dir.join(BODIES),
             unlinked: Vec::new(),
@@ -208,6 +215,15 @@ impl RecordSink for JsonlSink {
 
     fn blob(&mut self, rec: &BlobRecord) {
         write_row(&mut self.blobs, &mut self.error, rec);
+    }
+
+    fn manifest(&mut self, rec: &WindowManifest) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(e) = self.log.append(rec) {
+            self.error = Some(e);
+        }
     }
 
     fn body_data(&mut self, key: &BodyKey, data: &[u8]) {
