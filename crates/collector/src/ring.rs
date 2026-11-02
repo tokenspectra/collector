@@ -47,6 +47,12 @@ impl RingConfig {
         }
     }
 
+    /// The capture filter (`-f`) in [`Self::extra_args`], if any.
+    pub fn filter(&self) -> Option<&str> {
+        let i = self.extra_args.iter().position(|a| a == "-f")?;
+        self.extra_args.get(i + 1).map(String::as_str)
+    }
+
     /// The dumpcap arguments.
     pub fn args(&self) -> Result<Vec<OsString>, SourceError> {
         if self.interval_s == 0 {
@@ -99,6 +105,8 @@ impl RingSource {
     /// [`SourceError::DumpcapFailed`] with the end of its log.
     pub fn spawn(cfg: &RingConfig) -> Result<Self, SourceError> {
         let args = cfg.args()?;
+        let filter = cfg.filter().unwrap_or("none");
+        tracing::info!(interface = %cfg.interface, filter, "dumpcap starting");
         let log_path = cfg.dir.join("dumpcap.log");
         let log = std::fs::File::create(&log_path)
             .map_err(|e| SourceError::Dumpcap(format!("creating log in {}: {e}", cfg.dir.display())))?;
@@ -278,6 +286,16 @@ impl<R: BufRead> Drop for RingSource<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_filter_is_passed_to_dumpcap() {
+        let mut cfg = RingConfig::new("lo", 10, "/tmp/ring");
+        assert_eq!(cfg.filter(), None);
+        cfg.extra_args = vec!["-f".into(), "tcp port 11434".into()];
+        assert_eq!(cfg.filter(), Some("tcp port 11434"));
+        let args = cfg.args().unwrap();
+        assert_eq!(args[args.len() - 2..], ["-f", "tcp port 11434"]);
+    }
 
     #[cfg(unix)]
     #[test]

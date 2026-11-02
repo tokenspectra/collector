@@ -67,6 +67,9 @@ trait PacketSource {           // yields packets in capture order
   - `dumpcap -i <if> -b interval:<W> -b printname:stdout -w <dir>/link.pcapng`.
   - It reads each file name dumpcap prints when the file closes, then hands that file to `FileSource`.
   - **Never use `-b files:N`**: dumpcap deletes the oldest files, and we lose packets if the Collector falls behind (research §1). The Collector deletes local files itself, after upload.
+  - **Capture filter:** `ring -f/--filter <bpf>` passes a BPF capture filter to dumpcap (`-f`), e.g. `tcp port 11434` to keep only the inference port. It is for tests and local runs.
+    - Packets the filter drops never reach the Collector, so they appear nowhere: not in any byte bucket, not as a gap. A filtered run accounts for a subset of the Link, never for the whole Link.
+    - So the filter is logged when dumpcap starts (§14).
 - **`LiveSource`** (later) reads libpcap directly through the `pcap` crate, for lower latency. Only if the file handoff turns out too slow.
 - **Determinism:** the same input files always give the same output, byte for byte.
   - Every timestamp comes from the capture, never the wall clock.
@@ -310,7 +313,7 @@ Console logs and counters for the people running a Collector (TS-28). **They are
 - Level: INFO by default; `-v` DEBUG, `-vv` TRACE; `-q` WARN, `-qq` ERROR. `--log-level <error|warn|info|debug|trace>` overrides the short flags, and `RUST_LOG`, when set, overrides both.
 - **ERROR:** dumpcap missing, not permitted or failing; write failures in the output; anything that ends the run.
 - **WARN:** capture drops reported by dumpcap or pcapng; a Flow that hits the reassembly buffer cap (`gap_buffer_limit`); a body over the size cap (`DecoderConfig::max_body`), hashed and counted but not read.
-- **INFO:** one line per closed window and one summary on exit. The window line has packets, bytes, Flows (new, active, closed), Request Workunits (`ok`, `errored`, `incomplete`), the share of accounted bytes in the `workunit` bucket, the share of closed Flows that carried a Workunit, gaps, and packets/s and Mbit/s over the window length.
+- **INFO:** one line when dumpcap starts, with the interface and the capture filter (`none` if unset), so a filtered run is visible (§3); one line per closed window and one summary on exit. The window line has packets, bytes, Flows (new, active, closed), Request Workunits (`ok`, `errored`, `incomplete`), the share of accounted bytes in the `workunit` bucket, the share of closed Flows that carried a Workunit, gaps, and packets/s and Mbit/s over the window length.
 - **DEBUG:** one line per Request Workunit as it is emitted: `workunit_id`, Flow, request direction, method, path, model, HTTP status, `stream`, request and response body bytes, outcome. Also each new and closed Flow (with its verdict), gaps and anomalies.
 - **TRACE:** each reassembled segment.
 
