@@ -155,6 +155,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 - `finish_reason[0]`: `stop_reason` (`end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, ...).
 - `usage`: `message_start`'s usage with each `message_delta`'s fields laid over it, since the delta counts are cumulative (a `null` does not erase a count). `input_tokens`, `output_tokens` are read from it; as the API reports them, `input_tokens` leaves out cached prompt tokens.
 - `sse_done`: `message_stop` arrived.
+- Outcome (§14): `done` is set only by `message_stop`, so only a stream that reaches it is `ok`, whatever its `stop_reason` (`max_tokens` is a whole response, recorded as the finish reason). A stream that ends cleanly without `message_stop`, and one with an in-band `error` event behind HTTP 200, are counted as not read, so they are `errored`; a gap makes the Workunit `incomplete` first. An error body on a non-2xx status is read: an `ok` Workunit with that status and `error_type` set.
 - `extra`: `cache_creation_input_tokens`, `cache_read_input_tokens`, `stop_sequence`, and `error_type` (`error.type` of an error body or event, e.g. `overloaded_error`).
 
 **Byte accounting.** For each Flow, direction and Slice, every stream byte falls in exactly one bucket:

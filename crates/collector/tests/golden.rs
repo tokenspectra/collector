@@ -626,6 +626,7 @@ fn anthropic_sse_over_http1_chunked_and_h2c() {
         assert_eq!(c.workunits.len(), 2, "{name}");
         let ok = &c.workunits[0];
         assert!(ok.stream && ok.complete && ok.sse_done == Some(true), "{name}");
+        assert_eq!(ok.outcome(), collector::stats::Outcome::Ok, "{name}");
         // message_start, content_block_start, ping, four deltas,
         // content_block_stop, message_delta, message_stop.
         let events = ok.sse_events.as_ref().unwrap();
@@ -638,7 +639,7 @@ fn anthropic_sse_over_http1_chunked_and_h2c() {
         assert_eq!(ok.extra.as_ref().unwrap()["cache_read_input_tokens"], 6);
 
         // An `error` event after the first token: the HTTP exchange is whole,
-        // but the message never stopped.
+        // but the message never stopped, so it is `errored`.
         let cut = &c.workunits[1];
         assert_eq!((cut.status, cut.complete), (200, true), "{name}");
         assert_eq!(cut.sse_done, Some(false));
@@ -646,6 +647,7 @@ fn anthropic_sse_over_http1_chunked_and_h2c() {
         assert!(cut.finish_reason.is_empty());
         assert_eq!(cut.output_tokens, Some(1));
         assert_eq!(cut.extra.as_ref().unwrap()["error_type"], "overloaded_error");
+        assert_eq!(cut.outcome(), collector::stats::Outcome::Errored, "{name}");
 
         assert_eq!(
             bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),

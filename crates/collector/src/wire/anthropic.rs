@@ -12,6 +12,12 @@
 //! (`stop_reason`, cumulative usage), `message_stop` (the end-of-stream
 //! marker), `ping`, and `error`, which may arrive mid-stream after a 200.
 //! Unknown event types are skipped, since the API may add new ones.
+//!
+//! Outcome: `done` is set only by `message_stop`. A stream that ends
+//! without it (a clean HTTP end), or that carries an in-band `error` event,
+//! is counted as not read, so the Workunit is `errored`; a gap still makes
+//! it `incomplete` first. Any `stop_reason`, `max_tokens` included, is a
+//! whole response. A JSON error body on a non-2xx status is read.
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -68,8 +74,11 @@ impl WireProtocol for Anthropic {
         }
     }
 
-    fn decoder(&self, _endpoint: &'static str, _request: &Request) -> Box<dyn ResponseDecoder> {
-        Box::<Decoder>::default()
+    fn decoder(&self, _endpoint: &'static str, request: &Request) -> Box<dyn ResponseDecoder> {
+        Box::new(Decoder {
+            stream: request.stream,
+            ..Decoder::default()
+        })
     }
 }
 
@@ -102,6 +111,12 @@ struct Decoder {
     unreadable: u64,
     /// `message_stop` was seen.
     done: bool,
+    /// The request asked for a stream.
+    stream: bool,
+    /// The response was one JSON body (a message or an error), not events.
+    json_body: bool,
+    /// An `error` event arrived in the stream.
+    failed: bool,
 }
 
 impl Decoder {
@@ -158,7 +173,10 @@ impl ResponseDecoder for Decoder {
             .map(str::as_bytes)
             .or(frame.event);
         match kind {
-            Some(b"message") => self.message(&v),
+            Some(b"message") => {
+                self.json_body = true;
+                self.message(&v);
+            }
             Some(b"message_start") => match v.get("message") {
                 Some(m) => self.message(m),
                 None => self.unreadable += 1,
@@ -171,6 +189,12 @@ impl ResponseDecoder for Decoder {
             }
             Some(b"message_stop") => self.done = true,
             Some(b"error") => {
+                // An SSE event fails the stream in band; a JSON body is the
+                // error response itself.
+                match frame.event {
+                    Some(_) => self.failed = true,
+                    None => self.json_body = true,
+                }
                 self.error_type = v.get("error").and_then(|e| str_field(e, "type"));
             }
             Some(_) => {}
@@ -179,6 +203,7 @@ impl ResponseDecoder for Decoder {
     }
 
     fn finish(self: Box<Self>) -> Response {
+        let unfinished = self.stream && !self.json_body && !self.done;
         let usage = self.usage.map(Value::Object);
         let tokens = |k: &str| usage.as_ref().and_then(|u| u.get(k)).and_then(Value::as_u64);
         let extra = super::extra(&Extra {
@@ -202,7 +227,8 @@ impl ResponseDecoder for Decoder {
                 .collect(),
             usage,
             done: self.done,
-            unreadable: self.unreadable,
+            // Not read whole: the shared outcome check makes it `errored`.
+            unreadable: self.unreadable + u64::from(self.failed || unfinished),
             extra,
         }
     }
@@ -274,7 +300,11 @@ mod tests {
     }
 
     fn decode(frames: &[(Option<&str>, &str)]) -> Response {
-        let mut d = Anthropic.decoder(MESSAGES, &Request::default());
+        let stream = Request {
+            stream: frames.iter().any(|(e, _)| e.is_some()),
+            ..Request::default()
+        };
+        let mut d = Anthropic.decoder(MESSAGES, &stream);
         for (event, data) in frames {
             d.frame(Frame {
                 event: event.map(str::as_bytes),
@@ -387,6 +417,26 @@ mod tests {
         assert_eq!(r.id.as_deref(), Some("msg_3"));
         assert!(r.finish_reason.is_empty() && !r.done);
         assert_eq!(r.extra.unwrap()["error_type"], "overloaded_error");
+        // The frame that is not JSON, and the failure itself.
+        assert_eq!(r.unreadable, 2);
+    }
+
+    #[test]
+    fn a_stream_without_message_stop_is_not_read_whole() {
+        let start = (
+            Some("message_start"),
+            r#"{"type":"message_start","message":{"id":"msg_4","model":"m","usage":{"input_tokens":9,"output_tokens":1}}}"#,
+        );
+        let delta = (
+            Some("message_delta"),
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4}}"#,
+        );
+        let r = decode(&[start, delta]);
+        assert!(!r.done);
         assert_eq!(r.unreadable, 1);
+        // With message_stop, a max_tokens stop is a whole response.
+        let r = decode(&[start, delta, (Some("message_stop"), r#"{"type":"message_stop"}"#)]);
+        assert_eq!(r.finish_reason[0].finish_reason, "max_tokens");
+        assert!(r.done && r.unreadable == 0);
     }
 }
