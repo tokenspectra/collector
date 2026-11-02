@@ -99,8 +99,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     sink.finish()?;
     eprintln!(
-        "collector: {} packets, {} windows",
-        summary.packets, summary.windows
+        "collector: {} packets, {} windows -> {}",
+        summary.packets,
+        summary.windows,
+        out.display()
     );
     Ok(())
 }
