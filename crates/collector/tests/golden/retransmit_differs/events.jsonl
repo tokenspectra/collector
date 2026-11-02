@@ -1,0 +1,2 @@
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","kind":"retransmit_differs","stream_off":6,"len":5,"window_start_ns":1800000000000000000,"index":5}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","kind":"retransmit_differs","stream_off":28,"len":1,"window_start_ns":1800000000000000000,"index":8}

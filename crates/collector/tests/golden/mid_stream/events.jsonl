@@ -1,0 +1,1 @@
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","kind":"before_stream_start","stream_off":null,"len":4,"window_start_ns":1800000000000000000,"index":2}

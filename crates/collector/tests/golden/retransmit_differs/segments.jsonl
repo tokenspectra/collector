@@ -1,0 +1,3 @@
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","stream_off":0,"len":12,"window_start_ns":1800000000000000000,"index":3,"pkt_off":54}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","stream_off":12,"len":12,"window_start_ns":1800000000000000000,"index":9,"pkt_off":54}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","stream_off":24,"len":11,"window_start_ns":1800000000000000000,"index":7,"pkt_off":54}
