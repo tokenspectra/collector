@@ -123,7 +123,14 @@ fn final_counters_equal_the_tables() {
             stream_bytes,
             "{case}: buckets sum to the total"
         );
-        assert_eq!(s.workunits, workunits, "{case}");
+        assert_eq!(s.workunits(), workunits, "{case}");
+        // Every Workunit here is OpenAI's.
+        assert_eq!(
+            s.workunits_by_protocol.keys().collect::<Vec<_>>(),
+            [&"openai"],
+            "{case}"
+        );
+        assert_eq!(s.workunits_by_protocol["openai"], workunits, "{case}");
         assert_eq!(s.workunits_total(), c.workunits.len() as u64, "{case}");
         assert_eq!(
             s.workunits_with(Outcome::Incomplete),
@@ -359,7 +366,7 @@ fn metrics_endpoint_is_scraped_and_parses() {
         .sum();
     assert_eq!(total, sink.packets.len() as f64);
     assert_eq!(
-        v("ts_collector_workunits_total{outcome=\"ok\",http_class=\"2xx\"}"),
+        v("ts_collector_workunits_total{protocol=\"openai\",outcome=\"ok\",http_class=\"2xx\"}"),
         2.0
     );
     assert_eq!(

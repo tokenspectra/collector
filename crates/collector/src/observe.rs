@@ -172,7 +172,8 @@ impl RecordSink for StatsSink<'_> {
 
     fn workunit(&mut self, rec: &WorkunitRecord) {
         let outcome = rec.outcome();
-        self.reg.add_workunit(outcome, HttpClass::of(rec.status));
+        self.reg
+            .add_workunit(rec.protocol, outcome, HttpClass::of(rec.status));
         if let Some(seen) = self.open.get_mut(&rec.flow) {
             seen.workunits += 1;
         }
@@ -180,6 +181,7 @@ impl RecordSink for StatsSink<'_> {
         debug!(
             workunit_id = %rec.workunit_id,
             flow = %rec.flow,
+            protocol = %rec.protocol,
             dir = %req.as_ref().map_or("-", |r| dir_str(r.dir)),
             method = %req.as_ref().and_then(|r| r.method.as_deref()).unwrap_or("-"),
             path = %req.as_ref().and_then(|r| r.target.as_deref()).unwrap_or(rec.endpoint),
