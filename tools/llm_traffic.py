@@ -2,12 +2,14 @@
 """Send random prompts, and sometimes multi-turn conversations, to a local LLM server every N seconds.
 
 Traffic for the Collector to capture. Speaks the OpenAI-compatible
-POST /v1/chat/completions (Ollama, llama-server, vLLM, ...), the endpoint
-the Collector decodes as Request Workunits. Standard library only:
+POST /v1/chat/completions (Ollama, llama-server, vLLM, ...), or with
+--api responses the OpenAI Responses API POST /v1/responses (Ollama):
+both are decoded as Request Workunits. Standard library only:
 
     python3 tools/llm_traffic.py                          # Ollama on :11434, default model
     python3 tools/llm_traffic.py --model llama3.2:1b --stream --interval 10 --count 6
     python3 tools/llm_traffic.py --host http://localhost:8000 --model my-model   # vLLM
+    python3 tools/llm_traffic.py --api responses --stream               # Responses API
 """
 
 import argparse
@@ -87,15 +89,41 @@ def read_reply(resp, stream: bool) -> str:
     return "".join(parts)
 
 
+def read_responses_reply(resp, stream: bool) -> str:
+    """Pull the generated text out of a Responses API response, streamed (named SSE events) or whole."""
+    if not stream:
+        doc = json.load(resp)
+        return "".join(part.get("text", "") for item in doc.get("output", []) if item.get("type") == "message"
+                       for part in item.get("content", []) if part.get("type") == "output_text")
+    parts = []
+    for raw in resp:
+        line = raw.decode().strip()
+        if line.startswith("data:"):
+            event = json.loads(line[len("data:"):].strip())
+            if event.get("type") == "response.output_text.delta":
+                parts.append(event.get("delta") or "")
+            elif event.get("type") in ("response.completed", "response.incomplete", "response.failed", "error"):
+                break
+    return "".join(parts)
+
+
 def send(args, prompt: str, history: list[dict]) -> str:
     """POST one request; `history` holds the earlier turns of a conversation (empty for single-turn)."""
-    url = f"{args.host}/v1/chat/completions"
     messages = history + [{"role": "user", "content": prompt}]
-    payload = {"model": args.model, "messages": messages, "stream": args.stream}
+    if args.api == "responses":
+        # The full history goes in `input`: the Collector sees every turn, and
+        # it works on servers that don't store responses (Ollama).
+        url = f"{args.host}/v1/responses"
+        payload = {"model": args.model, "input": messages, "stream": args.stream}
+        read = read_responses_reply
+    else:
+        url = f"{args.host}/v1/chat/completions"
+        payload = {"model": args.model, "messages": messages, "stream": args.stream}
+        read = read_reply
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as resp:
-        return read_reply(resp, args.stream)
+        return read(resp, args.stream)
 
 
 def main() -> None:
@@ -106,6 +134,8 @@ def main() -> None:
     p.add_argument("--count", type=int, default=0, help="stop after this many rounds (default 0: run until Ctrl-C)")
     p.add_argument("--seed", type=int, help="seed the prompt choice, for a repeatable sequence")
     p.add_argument("--prompts", help="file with one prompt per line (overrides built-in list)")
+    p.add_argument("--api", choices=["chat", "responses"], default="chat",
+                   help="chat: POST /v1/chat/completions (default); responses: POST /v1/responses")
     p.add_argument("--stream", action="store_true", help="request a streamed response")
     p.add_argument("--multiturn", type=float, default=0.3,
                    help="probability (0-1) that a round is a multi-turn conversation (default 0.3)")
