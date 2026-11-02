@@ -310,6 +310,11 @@ pub fn print_snapshot(reg: &Registry, json: bool) {
 /// terminal. Keypresses are read without waiting for a line, so stdin's
 /// terminal mode is changed; [`Triggers`] restores it when dropped, and on
 /// SIGINT/SIGTERM before the default action runs.
+///
+/// With a `stop_pid` (dumpcap, for `ring`), the first SIGINT/SIGTERM does not
+/// kill the Collector: it is forwarded to dumpcap as SIGINT, which closes its
+/// last ring file and exits; the packet source then ends and the run finishes
+/// normally (store, tables, summary). A second signal takes the default action.
 #[cfg(unix)]
 pub mod triggers {
     use std::io::{IsTerminal, Read};
@@ -353,14 +358,14 @@ pub mod triggers {
         }
     }
 
-    pub fn spawn(reg: Arc<Registry>, json: bool) -> std::io::Result<Triggers> {
+    pub fn spawn(reg: Arc<Registry>, json: bool, stop_pid: Option<u32>) -> std::io::Result<Triggers> {
         let saved: Saved = Arc::new(Mutex::new(None));
         let keys = std::io::stdin().is_terminal();
         if keys {
             *saved.lock().unwrap_or_else(|e| e.into_inner()) = raw_keys();
         }
         let mut sigs = vec![SIGUSR1];
-        if keys {
+        if keys || stop_pid.is_some() {
             sigs.extend([SIGINT, SIGTERM]);
         }
         let mut signals = Signals::new(&sigs)?;
@@ -368,9 +373,15 @@ pub mod triggers {
         std::thread::Builder::new()
             .name("snapshot-signal".into())
             .spawn(move || {
+                let mut stopping = false;
                 for sig in signals.forever() {
                     if sig == SIGUSR1 {
                         print_snapshot(&r, json);
+                    } else if let Some(pid) = stop_pid.filter(|_| !stopping) {
+                        stopping = true;
+                        tracing::info!(signal = sig, "stopping: asking dumpcap to close its last file");
+                        // SAFETY: plain kill(2) on dumpcap's pid; an error just means it already exited.
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
                     } else {
                         restore(&s);
                         let _ = signal_hook::low_level::emulate_default_handler(sig);

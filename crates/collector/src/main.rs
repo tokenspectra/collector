@@ -185,6 +185,7 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         keep_bodies: !cli.no_bodies,
         ..DecoderConfig::default()
     };
+    let mut dumpcap_pid = None;
     let (mut source, window_s, out): (Box<dyn PacketSource>, u32, PathBuf) = match cli.cmd {
         Cmd::Files { window_s, out, files } => (Box::new(FileSource::new(files)), window_s, out),
         Cmd::Views { out } => {
@@ -210,7 +211,9 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(f) = filter {
                 cfg.extra_args = vec!["-f".into(), f];
             }
-            (Box::new(RingSource::spawn(&cfg)?), window_s, out)
+            let ring = RingSource::spawn(&cfg)?;
+            dumpcap_pid = ring.pid();
+            (Box::new(ring), window_s, out)
         }
     };
     if window_s == 0 {
@@ -241,20 +244,23 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!(url = %format_args!("http://{bound}/metrics"), "serving metrics");
     }
     #[cfg(unix)]
-    let _triggers =
-        match collector::observe::triggers::spawn(registry.clone(), cli.log_format == LogFormat::Json) {
-            Ok(t) => {
-                tracing::debug!(
-                    keys = t.keys,
-                    "snapshot on SIGUSR1, and on `s` or Enter with keys"
-                );
-                Some(t)
-            }
-            Err(e) => {
-                warn!(error = %e, "no snapshot triggers");
-                None
-            }
-        };
+    let _triggers = match collector::observe::triggers::spawn(
+        registry.clone(),
+        cli.log_format == LogFormat::Json,
+        dumpcap_pid,
+    ) {
+        Ok(t) => {
+            tracing::debug!(
+                keys = t.keys,
+                "snapshot on SIGUSR1, and on `s` or Enter with keys"
+            );
+            Some(t)
+        }
+        Err(e) => {
+            warn!(error = %e, "no snapshot triggers");
+            None
+        }
+    };
     let mut sink = JsonlSink::create(&out)?;
     let mut store = StoreSink::new(&mut sink, object_store, store_cfg, Some(registry.clone()));
     run(
