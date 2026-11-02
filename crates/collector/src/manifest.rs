@@ -85,12 +85,26 @@ impl Log {
     /// Opens [`LOG`] in `dir` for appending, creating it if needed. A
     /// partial last line, left by a crash mid-write, is cut off first: it
     /// was never complete, so it was never shipped.
+    ///
+    /// A new log's directory entry is synced before the first append, so a
+    /// synced line can't be lost with the file that holds it.
     pub fn open(dir: &Path) -> io::Result<Self> {
-        let mut file = OpenOptions::new()
-            .create(true)
+        let path = dir.join(LOG);
+        let mut file = match OpenOptions::new()
+            .create_new(true)
             .read(true)
             .append(true)
-            .open(dir.join(LOG))?;
+            .open(&path)
+        {
+            Ok(f) => {
+                sync_dir(dir)?;
+                f
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                OpenOptions::new().read(true).append(true).open(&path)?
+            }
+            Err(e) => return Err(e),
+        };
         let len = file.metadata()?.len();
         if len > 0 {
             let complete = complete_len(&mut file, len)?;
@@ -110,6 +124,15 @@ impl Log {
         self.file.write_all(&line)?;
         self.file.sync_data()
     }
+}
+
+/// Syncs `dir`'s entries. Only Unix can open a directory to sync it.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Length of `file` up to and including its last newline.

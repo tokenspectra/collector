@@ -6,7 +6,8 @@ offline run does (tables, bodies, views, object store, manifest log), and
 reports input bytes and packets per CPU-second. The pipeline is one
 thread, so CPU time is the cost on one core; wall time includes waiting on
 the disk. Each configuration runs --runs times into a fresh directory; the
-best run is reported.
+best run is reported. CPU time and peak RSS are the run's own process,
+from wait4(2).
 
     python3 tools/bench.py ../e2e/ring/*.pcapng
     python3 tools/bench.py --runs 3 --out-dir /dev/shm/bench ../e2e/ring/*.pcapng
@@ -16,7 +17,6 @@ import argparse
 import json
 import os
 import platform
-import resource
 import shutil
 import subprocess
 import sys
@@ -45,18 +45,22 @@ def cpu_model():
 def run_once(files, extra, out_root):
     out = Path(tempfile.mkdtemp(dir=out_root))
     try:
-        before = resource.getrusage(resource.RUSAGE_CHILDREN)
         t0 = time.perf_counter()
-        subprocess.run([str(BIN), "-q", *extra, "files", "-o", str(out), *map(str, files)], check=True)
+        child = subprocess.Popen([str(BIN), "-q", *extra, "files", "-o", str(out), *map(str, files)])
+        # This child's own usage; RUSAGE_CHILDREN's ru_maxrss is the largest
+        # of every child so far, cargo build included.
+        _, status, usage = os.wait4(child.pid, 0)
         wall = time.perf_counter() - t0
-        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        child.returncode = os.waitstatus_to_exitcode(status)
+        if child.returncode != 0:
+            raise subprocess.CalledProcessError(child.returncode, child.args)
         manifests = [json.loads(l) for l in open(out / "manifests.jsonl")]
         totals = {k: sum(m["totals"][k] for m in manifests) for k in ("packets", "bytes", "workunits", "flows")}
         return {
             "wall_s": wall,
-            "user_s": after.ru_utime - before.ru_utime,
-            "sys_s": after.ru_stime - before.ru_stime,
-            "max_rss_mib": after.ru_maxrss / 1024,
+            "user_s": usage.ru_utime,
+            "sys_s": usage.ru_stime,
+            "max_rss_mib": usage.ru_maxrss / 1024,
             "windows": len(manifests),
             **totals,
         }
@@ -68,7 +72,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="+", type=Path)
     ap.add_argument("--runs", type=int, default=2)
-    ap.add_argument("--out-dir", type=Path, help="where runs write (default: a temp dir)")
+    ap.add_argument("--out-dir", type=Path,
+                    help="where runs write (default: a temp dir); use a real disk, fsync on tmpfs costs nothing")
     ap.add_argument("--config", choices=list(CONFIGS), action="append")
     args = ap.parse_args()
     subprocess.run(["cargo", "build", "--release", "-q"], check=True, cwd=BIN.parent.parent.parent)
@@ -80,6 +85,7 @@ def main():
     for name in args.config or list(CONFIGS):
         runs = [run_once(args.files, CONFIGS[name], out_root) for _ in range(args.runs)]
         best = min(runs, key=lambda r: r["user_s"] + r["sys_s"])
+        best["max_rss_mib"] = max(r["max_rss_mib"] for r in runs)
         cpu = best["user_s"] + best["sys_s"]
         best.update({
             "cpu_s": cpu,

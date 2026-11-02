@@ -51,7 +51,8 @@ struct Cli {
     /// Without it, manifests stay in <out>/manifests.jsonl for `collector ship`.
     #[arg(long, global = true)]
     ingest: Option<String>,
-    /// Seconds to keep retrying the ingest at the end of a run.
+    /// Seconds the shipper has, in all, to ship what is left at the end of
+    /// a run; lines it does not get to stay in the log.
     #[arg(long, global = true, default_value_t = 30)]
     ship_wait_s: u64,
     /// The `{site}` part of object keys.
@@ -264,7 +265,7 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&out)?;
     let store_dir = cli.store.clone().unwrap_or_else(|| out.join("store"));
     std::fs::create_dir_all(&store_dir)?;
-    let object_store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&store_dir)?);
+    let object_store = Arc::new(collector::store::local(&store_dir)?);
     let registry = Registry::new();
     if let Some(addr) = &cli.metrics_addr {
         let bound = serve_metrics(addr.as_str(), registry.clone())

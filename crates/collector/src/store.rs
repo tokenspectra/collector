@@ -19,14 +19,21 @@
 //! Packets still unknown then are kept in full. Every decision depends on
 //! the capture only, so the store's contents are deterministic.
 //!
+//! The CLI's local store ([`local`]) syncs each object, and the directories
+//! it creates, before the put returns. A window's manifest is committed
+//! only after every object it names is on disk, so a machine crash cannot
+//! keep a manifest and lose what it points at.
+//!
 //! Every put is `PutMode::Create`. An object that already exists with the
 //! same bytes (a re-run over the same capture) is left alone; with other
 //! bytes, the run fails.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_executor::block_on;
+use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::Serialize;
@@ -734,6 +741,13 @@ impl RecordSink for StoreSink<'_> {
     }
 }
 
+/// The local object store under `dir`. Each put syncs the object and the
+/// directories it creates before it returns, so a manifest committed after
+/// it never names an object a crash can lose.
+pub fn local(dir: &Path) -> Result<LocalFileSystem, StoreError> {
+    Ok(LocalFileSystem::new_with_prefix(dir)?.with_fsync(true))
+}
+
 /// Looks up a blob's bytes by hash through the `blobs` rows, and checks
 /// them against the hash (spec §11: every read is verified).
 pub fn fetch_blob(
@@ -972,5 +986,12 @@ mod tests {
         assert_eq!(safe(".."), "_");
         assert_eq!(safe(""), "_");
         assert_eq!(date_path(1_793_619_416_000_000_000), "2026/11/02");
+    }
+
+    #[test]
+    fn the_local_store_syncs_puts() {
+        // `LocalFileSystem` exposes the setting only through `Debug`.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(format!("{:?}", local(dir.path()).unwrap()).contains("fsync: true"));
     }
 }
