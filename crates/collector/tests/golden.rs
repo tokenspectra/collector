@@ -13,10 +13,21 @@ use std::io::Cursor;
 use std::path::Path;
 
 use collector::assembler::EventKind;
+use collector::decode::{Bucket, Buckets, HttpVersion, Verdict};
 use collector::flow::Dir;
 use collector::{FileSource, RingSource};
 
 use collect::{collect_files, fixture_dir, fixture_paths, tables};
+
+/// Real traffic from `fixtures/capture/capture.py`: the OpenAI SDK against
+/// the mock server, captured with dumpcap on `lo`.
+const CAPTURED: &[&str] = &[
+    "openai_h1_json",
+    "openai_h1_sse",
+    "openai_h2c_json",
+    "openai_h2c_sse",
+    "http_other_h1",
+];
 
 const DUMPCAP_KEEPALIVE: &[&str] = &[
     "dumpcap_keepalive-1.pcapng",
@@ -41,6 +52,9 @@ fn cases() -> Vec<(String, Vec<String>)> {
         "dumpcap_keepalive".into(),
         DUMPCAP_KEEPALIVE.iter().map(|s| s.to_string()).collect(),
     ));
+    for name in CAPTURED {
+        cases.push((name.to_string(), vec![format!("{name}.pcapng")]));
+    }
     cases
 }
 
@@ -312,4 +326,296 @@ fn dumpcap_keepalive_flow_spans_ring_files() {
     let responses = c.stream(flow, Dir::Resp);
     assert_eq!(requests.matches("GET /health.json HTTP/1.1\r\n").count(), 6);
     assert_eq!(responses.matches("HTTP/1.1 200 OK\r\n").count(), 6);
+}
+
+/// Every stream byte of every Flow, direction and Slice is in exactly one
+/// bucket: the buckets sum to the Slice's stream range (TCP) or payload
+/// (UDP), and the `gap` bucket matches the gaps Flow assembly counted.
+#[test]
+fn buckets_sum_to_flow_bytes_in_every_fixture() {
+    for (case, files) in cases() {
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        let c = collect_files(&names);
+        assert!(!c.flows.is_empty(), "{case}");
+        for f in &c.flows {
+            for (stats, bytes) in [
+                (&f.slice.orig_stats, &f.orig_bytes),
+                (&f.slice.resp_stats, &f.resp_bytes),
+            ] {
+                let total = match (stats.stream_start, stats.stream_end) {
+                    (Some(s), Some(e)) => e - s,
+                    _ => stats.payload_bytes,
+                };
+                assert_eq!(bytes.total(), total, "{case} {} {bytes:?}", f.slice.flow);
+                assert_eq!(bytes.gap, stats.gap_bytes, "{case} {}", f.slice.flow);
+            }
+        }
+        // Rows stay in window order per Flow, one per Slice.
+        assert_eq!(c.flows.len(), c.slices.len());
+    }
+}
+
+fn bytes_where(c: &collect::Collected, pick: impl Fn(&Buckets) -> u64) -> u64 {
+    c.flows
+        .iter()
+        .map(|f| pick(&f.orig_bytes) + pick(&f.resp_bytes))
+        .sum()
+}
+
+#[test]
+fn openai_json_over_http1_and_h2c() {
+    for (name, http) in [
+        ("openai_h1_json", HttpVersion::Http1),
+        ("openai_h2c_json", HttpVersion::Http2),
+    ] {
+        let c = collect_files(&[&format!("{name}.pcapng")]);
+        let verdict = if http == HttpVersion::Http1 {
+            Verdict::Http1
+        } else {
+            Verdict::Http2
+        };
+        assert!(c.flows.iter().all(|f| f.verdict == Some(verdict)), "{name}");
+        assert_eq!(
+            bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),
+            0,
+            "{name}"
+        );
+        let eps: Vec<&str> = c.workunits.iter().map(|w| w.endpoint).collect();
+        assert_eq!(eps, ["/v1/chat/completions", "/v1/completions"], "{name}");
+        for w in &c.workunits {
+            assert_eq!(w.http, http);
+            assert!(w.complete && !w.stream && w.status == 200, "{name}");
+            assert_eq!(w.model.as_deref(), Some("mock-model"));
+            assert!(w.sse_events.is_none() && w.usage.is_some());
+            assert!(w.completed_ts_ns.unwrap() > w.received_ts_ns);
+        }
+        assert_eq!(c.workunits[0].seed, Some(serde_json::json!(7)));
+        assert_eq!(c.workunits[0].response_id.as_deref(), Some("chatcmpl-mock-0001"));
+        assert_eq!(c.workunits[0].finish_reason[0].finish_reason, "stop");
+        assert_eq!(c.workunits[1].finish_reason[0].finish_reason, "length");
+    }
+}
+
+#[test]
+fn openai_sse_over_http1_chunked_and_h2c() {
+    for name in ["openai_h1_sse", "openai_h2c_sse"] {
+        let c = collect_files(&[&format!("{name}.pcapng")]);
+        assert_eq!(c.workunits.len(), 2, "{name}");
+        let chat = &c.workunits[0];
+        assert!(
+            chat.stream && chat.complete && chat.sse_done == Some(true),
+            "{name}"
+        );
+        // Role, four tokens, finish, usage, [DONE].
+        let events = chat.sse_events.as_ref().unwrap();
+        assert_eq!(events.len(), 8, "{name}");
+        assert_eq!(events.iter().map(|e| e.len).sum::<u64>(), chat.response_body_len);
+        assert!(
+            events.windows(2).all(|w| w[0].ts_ns < w[1].ts_ns),
+            "events arrive over time"
+        );
+        assert_eq!(chat.usage.as_ref().unwrap()["completion_tokens"], 4);
+        assert_eq!(chat.finish_reason[0].finish_reason, "stop");
+        assert_eq!(c.workunits[1].sse_events.as_ref().unwrap().len(), 5);
+        assert_eq!(
+            bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),
+            0,
+            "{name}"
+        );
+        // Chunk-size lines (HTTP/1.1) or frame headers (h2c) are framing.
+        assert!(bytes_where(&c, |b| b.framing) > 0);
+    }
+}
+
+/// The same bodies sent over HTTP/1.1 and h2c hash the same: body hashes
+/// cover the bytes, not the framing around them.
+#[test]
+fn body_hashes_do_not_depend_on_framing() {
+    let hashes = |name: &str| -> Vec<(Option<String>, Option<String>)> {
+        collect_files(&[&format!("{name}.pcapng")])
+            .workunits
+            .iter()
+            .map(|w| (w.request_body_b3.clone(), w.response_body_b3.clone()))
+            .collect()
+    };
+    assert_eq!(hashes("openai_h1_json"), hashes("openai_h2c_json"));
+    assert_eq!(hashes("openai_h1_sse"), hashes("openai_h2c_sse"));
+    let h = hashes("openai_h1_json");
+    assert!(h
+        .iter()
+        .all(|(a, b)| a.as_ref().unwrap().starts_with("b3:") && b.is_some()));
+}
+
+#[test]
+fn health_models_and_bad_json_are_http_other() {
+    let c = collect_files(&["http_other_h1.pcapng"]);
+    assert!(c.workunits.is_empty());
+    let got: Vec<(&str, u16, Bucket)> = c
+        .exchanges
+        .iter()
+        .map(|e| {
+            let req = e.request.as_ref().unwrap();
+            (
+                req.target.as_deref().unwrap(),
+                e.response.as_ref().unwrap().status.unwrap(),
+                e.bucket,
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("/health", 200, Bucket::HttpOther),
+            ("/v1/models", 200, Bucket::HttpOther),
+            ("/v1/chat/completions", 400, Bucket::HttpOther),
+        ]
+    );
+    assert_eq!(bytes_where(&c, |b| b.http_other), bytes_where(&c, Buckets::total));
+}
+
+#[test]
+fn http1_edge_cases() {
+    let c = collect_files(&["http1_edge.pcapng"]);
+    // Window 0 holds only the streaming request; it waits for the JSON error
+    // response in window 1 and is then a Workunit.
+    assert_eq!(c.flows.len(), 2);
+    assert_eq!(c.flows[0].orig_bytes.workunit, fixtures::EDGE_A_REQ.len() as u64);
+    assert_eq!(c.workunits.len(), 1);
+    let w = &c.workunits[0];
+    assert!(w.stream && w.status == 400 && w.response_content_type.as_deref() == Some("application/json"));
+    let buckets: Vec<Bucket> = c.exchanges.iter().map(|e| e.bucket).collect();
+    assert_eq!(buckets, [Bucket::Workunit, Bucket::HttpOther, Bucket::HttpOther]);
+    // The pipelined pair is matched in order.
+    let targets: Vec<&str> = c
+        .exchanges
+        .iter()
+        .map(|e| e.request.as_ref().unwrap().target.as_deref().unwrap())
+        .collect();
+    assert_eq!(targets, ["/v1/chat/completions", "/v1/completions", "/metrics"]);
+    // The lost segment inside chunk data is a gap; parsing stays in sync.
+    let metrics = c.exchanges[2].response.as_ref().unwrap();
+    assert_eq!(
+        (
+            metrics.body_len,
+            metrics.body_gap_bytes,
+            metrics.body_b3.as_deref()
+        ),
+        (20, 10, None)
+    );
+    let r = &c.flows[1].resp_bytes;
+    assert_eq!((r.gap, r.framing, r.unexplained), (10, 4 + 2 + 3 + 2, 0));
+    assert!(c
+        .flows
+        .iter()
+        .all(|f| f.orig_desync.is_none() && f.resp_desync.is_none()));
+}
+
+#[test]
+fn tls_and_grpc_flows_are_unexplained() {
+    let c = collect_files(&["tls_plaintext.pcapng"]);
+    assert_eq!(c.flows[0].verdict, Some(Verdict::Tls));
+    assert_eq!(
+        bytes_where(&c, |b| b.unexplained),
+        (fixtures::TLS_CLIENT_HELLO.len() + fixtures::TLS_SERVER_HELLO.len() + fixtures::TLS_APP_DATA.len())
+            as u64
+    );
+    assert!(c.exchanges.is_empty());
+
+    let c = collect_files(&["grpc_h2c.pcapng"]);
+    assert_eq!(c.flows[0].verdict, Some(Verdict::Grpc));
+    assert_eq!(
+        bytes_where(&c, |b| b.unexplained),
+        bytes_where(&c, Buckets::total)
+    );
+    assert_eq!(c.exchanges.len(), 1);
+    assert_eq!(c.exchanges[0].bucket, Bucket::Unexplained);
+}
+
+#[test]
+fn stage_one_fixtures_get_verdicts() {
+    let verdicts = |names: &[&str]| -> Vec<Option<Verdict>> {
+        collect_files(names).flows.iter().map(|f| f.verdict).collect()
+    };
+    assert_eq!(verdicts(&["udp.pcapng"]), [Some(Verdict::Opaque); 2]);
+    assert_eq!(verdicts(&["non_http_tcp.pcapng"]), [Some(Verdict::Opaque); 2]);
+    // An SSE response caught mid-stream does not start with a status line.
+    assert_eq!(verdicts(&["mid_stream.pcapng"]), [Some(Verdict::Opaque)]);
+    // A keep-alive Flow caught mid-stream that starts on a request line.
+    assert!(verdicts(DUMPCAP_KEEPALIVE)
+        .iter()
+        .all(|v| *v == Some(Verdict::Http1)));
+    // The lost segment is in the request head: the rest of it is unexplained.
+    let c = collect_files(&["lost_segment.pcapng"]);
+    assert_eq!(c.flows[0].orig_desync, Some("gap"));
+    assert_eq!(
+        c.flows[0].orig_bytes.unexplained,
+        (fixtures::LOST_A.len() + fixtures::LOST_C.len()) as u64
+    );
+}
+
+/// Packets held in memory.
+struct Packets(std::vec::IntoIter<collector::CapturedPacket>);
+
+impl collector::PacketSource for Packets {
+    fn next(&mut self) -> Option<Result<collector::CapturedPacket, collector::SourceError>> {
+        self.0.next().map(Ok)
+    }
+}
+
+/// The parsers read adversarial bytes. Corrupt payload bytes of every
+/// fixture (seeded, so failures reproduce) and check that decoding never
+/// panics and still puts every byte in exactly one bucket.
+#[test]
+fn corrupted_payloads_never_break_accounting() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for (case, files) in cases() {
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        let mut src = FileSource::new(fixture_paths(&names));
+        let mut clean = Vec::new();
+        while let Some(p) = collector::PacketSource::next(&mut src) {
+            clean.push(p.unwrap());
+        }
+        for round in 0..40 {
+            let mut pkts = clean.clone();
+            for p in &mut pkts {
+                // Leave Ethernet, IPv4 and TCP headers alone so Flows still form.
+                if p.data.len() > 66 && rand() % 3 == 0 {
+                    for _ in 0..1 + rand() % 4 {
+                        let i = 66 + (rand() as usize) % (p.data.len() - 66);
+                        p.data[i] = match round % 3 {
+                            0 => rand() as u8,
+                            1 => p.data[i] ^ 0x20,
+                            _ => b"\r\n:0 \x00\xff"[(rand() % 7) as usize],
+                        };
+                    }
+                }
+            }
+            let mut sink = collect::Collected::default();
+            collector::run::run(
+                &mut Packets(pkts.into_iter()),
+                collect::WINDOW_NS,
+                collector::AssemblerConfig::default(),
+                &mut sink,
+            )
+            .unwrap();
+            for f in &sink.flows {
+                for (stats, bytes) in [
+                    (&f.slice.orig_stats, &f.orig_bytes),
+                    (&f.slice.resp_stats, &f.resp_bytes),
+                ] {
+                    let total = match (stats.stream_start, stats.stream_end) {
+                        (Some(s), Some(e)) => e - s,
+                        _ => stats.payload_bytes,
+                    };
+                    assert_eq!(bytes.total(), total, "{case} round {round}");
+                }
+            }
+        }
+    }
 }

@@ -91,6 +91,8 @@ pub struct SegmentRecord {
     pub window_start_ns: u64,
     pub index: u32,
     pub pkt_off: u32,
+    /// Capture time of that packet.
+    pub ts_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -191,6 +193,9 @@ pub trait FlowSink {
     fn segment(&mut self, rec: &SegmentRecord, data: &[u8]);
     fn event(&mut self, rec: &EventRecord);
     fn slice(&mut self, rec: &SliceRecord);
+    /// The Flow ended: no more bytes will come for it. `slice_pending` says
+    /// whether one last Slice of it will still be emitted.
+    fn flow_end(&mut self, _flow: &FlowId, _slice_pending: bool) {}
 }
 
 struct FlowState {
@@ -257,6 +262,7 @@ impl FlowState {
             }
         }
         self.ended = true;
+        sink.flow_end(&self.id, self.active);
     }
 
     fn take_slice(&mut self, window_start_ns: u64) -> SliceRecord {
@@ -434,7 +440,7 @@ impl Assembler {
         match (kind, tcp) {
             (FlowKind::Tcp, Some(t)) => {
                 rec.tcp_flags = Some(t.flag_letters());
-                rec.stream_off = Some(tcp_packet(flow, dir, &t, &d, at, sink));
+                rec.stream_off = Some(tcp_packet(flow, dir, &t, &d, at, pkt.ts_ns, sink));
             }
             (FlowKind::Udp, _) => {
                 let s = &mut flow.stats[dir.idx()];
@@ -494,14 +500,15 @@ impl Assembler {
     }
 }
 
-/// Handles one TCP segment; returns the stream offset of its first payload
-/// byte.
+/// Handles one TCP segment captured at `ts_ns`; returns the stream offset of
+/// its first payload byte.
 fn tcp_packet(
     flow: &mut FlowState,
     dir: Dir,
     t: &net::TcpHeader,
     d: &Decoded,
     at: PacketRef,
+    ts_ns: u64,
     sink: &mut dyn FlowSink,
 ) -> i64 {
     let FlowState {
@@ -568,10 +575,18 @@ fn tcp_packet(
         }
         let cap = captured.len() as u64;
         if cap > 0 {
-            me.insert(off, cap, Some(captured), at, pkt_off, &mut e);
+            me.insert(off, cap, Some(captured), at, ts_ns, pkt_off, &mut e);
         }
         if total > cap {
-            me.insert(off + cap, total - cap, None, at, pkt_off + cap as u32, &mut e);
+            me.insert(
+                off + cap,
+                total - cap,
+                None,
+                at,
+                ts_ns,
+                pkt_off + cap as u32,
+                &mut e,
+            );
         }
     }
     if t.has(TCP_FIN) {

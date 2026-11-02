@@ -44,6 +44,7 @@ struct Pending {
     len: u64,
     data: Option<Vec<u8>>,
     at: PacketRef,
+    ts_ns: u64,
     pkt_off: u32,
 }
 
@@ -92,14 +93,17 @@ impl TcpDir {
         Some(self.delivered as i64 + i64::from(seq.wrapping_sub(edge) as i32))
     }
 
-    /// Adds `len` stream bytes starting at `off`, carried by packet `at` from
-    /// byte `pkt_off`. `data` is `None` for bytes cut off by the snap length.
+    /// Adds `len` stream bytes starting at `off`, carried by packet `at`
+    /// (captured at `ts_ns`) from byte `pkt_off`. `data` is `None` for bytes
+    /// cut off by the snap length.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
         off: u64,
         len: u64,
         data: Option<&[u8]>,
         at: PacketRef,
+        ts_ns: u64,
         pkt_off: u32,
         e: &mut Emit,
     ) {
@@ -132,7 +136,14 @@ impl TcpDir {
             };
             if cursor < k {
                 let t = k.min(end);
-                self.put(cursor, t, piece(cursor, t), at, pkt_off + (cursor - off) as u32);
+                self.put(
+                    cursor,
+                    t,
+                    piece(cursor, t),
+                    at,
+                    ts_ns,
+                    pkt_off + (cursor - off) as u32,
+                );
             }
             let (s, t) = (cursor.max(k), end.min(k_end));
             if s < t {
@@ -152,6 +163,7 @@ impl TcpDir {
                 end,
                 piece(cursor, end),
                 at,
+                ts_ns,
                 pkt_off + (cursor - off) as u32,
             );
         }
@@ -165,7 +177,7 @@ impl TcpDir {
         }
     }
 
-    fn put(&mut self, s: u64, t: u64, data: Option<&[u8]>, at: PacketRef, pkt_off: u32) {
+    fn put(&mut self, s: u64, t: u64, data: Option<&[u8]>, at: PacketRef, ts_ns: u64, pkt_off: u32) {
         self.pending_bytes += t - s;
         self.pending.insert(
             s,
@@ -173,6 +185,7 @@ impl TcpDir {
                 len: t - s,
                 data: data.map(<[u8]>::to_vec),
                 at,
+                ts_ns,
                 pkt_off,
             },
         );
@@ -243,6 +256,7 @@ impl TcpDir {
                             window_start_ns: p.at.window_start_ns,
                             index: p.at.index,
                             pkt_off: p.pkt_off,
+                            ts_ns: p.ts_ns,
                         },
                         &data,
                     );

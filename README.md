@@ -21,7 +21,10 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 
 ## Status
 
-Stage 1 (TS-24): packet input and Flow assembly. Protocol identification, hashing, the Capture Rate cut and the object store come next. Implementation is tracked in Multica.
+- Stage 1 (TS-24): packet input and Flow assembly.
+- Stage 2 (TS-25): protocol identification, byte accounting, HTTP/1.1, h2c, SSE and OpenAI Request Workunits.
+
+Hashing of chunks and Slices, the Capture Rate cut and the object store come next. Implementation is tracked in Multica.
 
 ## Layout
 
@@ -34,7 +37,58 @@ Stage 1 (TS-24): packet input and Flow assembly. Protocol identification, hashin
 | `window` | §3 | Cuts packets into windows by capture time; a packet's L0 address is (Link, window, index) |
 | `net` | | Bounds-checked Ethernet/SLL/raw, IPv4/IPv6, TCP/UDP decoding |
 | `assembler`, `tcp` | §4 | Flows and Slices: TCP reassembly per direction, gaps, retransmits, `mid_stream_start`, UDP datagrams, other IP protocols |
-| `output` | | JSON Lines tables: `packets`, `segments` (stream offset → packet), `events` (gaps, anomalies), `flows` (one row per Flow per Slice) |
+| `decode` | §5 | Protocol verdicts, request/response pairing, Workunit decisions, byte accounting per Flow, direction and Slice |
+| `http1`, `http2`, `hpack`, `sse` | §5 | Hand-written, bounds-checked parsers: HTTP/1.1 (chunked included), h2c frames, HPACK, server-sent events |
+| `openai` | §5 | The OpenAI Wire Protocol: which exchanges are Request Workunits, and the record fields read from their bodies |
+| `output` | | JSON Lines tables (below) |
+
+### Tables
+
+| Table | One row per | Notes |
+|---|---|---|
+| `packets` | captured packet | L0 address, Flow, direction, stream offset |
+| `segments` | in-order run of stream bytes | stream offset → (window, packet, offset in packet), capture time |
+| `events` | gap or anomaly | `gap_lost`, `gap_truncated`, `retransmit_differs`, … |
+| `flows` | Flow per Slice | Flow metadata, `verdict`, and `orig_bytes`/`resp_bytes` buckets |
+| `http` | HTTP request/response pair | method, target, status, content type, body length, `body_b3`, bucket, `workunit_id` |
+| `workunits` | Request Workunit | the record below |
+
+### Verdicts and byte accounting (spec §5)
+
+- **Verdict** from the first bytes of each direction, never ports: the HTTP/2 preface → `http2`; an HTTP/1 request or status line → `http1`; a TLS record header → `tls`; `content-type: application/grpc` on an h2c request → `grpc`; anything else → `opaque`. UDP and other IP protocols are `opaque`. A Flow with no payload yet has `verdict: null`.
+- **Buckets.** Every stream byte of a Flow, direction and Slice is in exactly one of `workunit`, `http_other`, `framing`, `unexplained`, `gap`. They sum to `stream_end - stream_start` (TCP) or the payload bytes (UDP, other IP).
+  - `framing`: chunk-size lines and the CRLF after each chunk, blank lines between HTTP/1 messages, the h2 preface, frame headers, padding, priority fields and the SETTINGS, PING, GOAWAY, WINDOW_UPDATE, PRIORITY and RST_STREAM frames.
+  - `unexplained`: every byte of `tls`, `opaque` and `grpc` Flows, unknown h2 frame types, and everything after a parser loses sync (`orig_desync`/`resp_desync` say why).
+  - `gap`: bytes counted by sequence numbers but never captured. A gap inside a body of known length (Content-Length, chunk data, a DATA frame) keeps the parser in sync; a gap in a head, a chunk-size line or a frame header does not.
+- **Rows wait for their bytes.** A request is a Workunit only once its response head says so, so a Slice row is written when every byte in it has a bucket, which can be a window later. Rows stay in window order per Flow.
+- The Collector reports verdicts and buckets; it never assigns a status.
+
+### Request Workunits
+
+A request/response pair is a Request Workunit when the request is `POST /v1/chat/completions` or `POST /v1/completions` with a body that parses as JSON, and the response is `application/json`, or `text/event-stream` when the request set `"stream": true` (spec §5). Everything else is `http_other`.
+
+The record follows the TS-15 capture record where the Link shows the field:
+
+| TS-15 field | `workunits` column | Notes |
+|---|---|---|
+| `workunit_id` | `workunit_id` | `b3:` BLAKE3 of (Flow id, `0x00`, request direction, request start offset as u64 big-endian): the spec §6 proposal. Unique and stable across re-runs; not a content hash |
+| received / completed timestamps | `received_ts_ns`, `completed_ts_ns` | capture time of the first request byte and the last response byte |
+| `model`, `stream` | `model`, `stream` | from the request body; also `seed`, `n` |
+| client request as received | `request_body_b3`, `request_body_len` | BLAKE3 of the body as on the wire (chunked encoding removed, content coding kept): the cross-check key with the API Tap (spec §11) |
+| `finish_reason` | `finish_reason` | per choice index, from the JSON body or the SSE chunks |
+| `usage` | `usage` | as sent |
+| | `response_body_b3`, `response_id`, `response_model`, `status` | |
+| | `sse_events`, `sse_done` | each event's body offset, length and capture time; whether `data: [DONE]` arrived. One hash covers the whole SSE body (spec §6) |
+| | `complete` | both messages reached their end with no gap |
+| `manifest_id`, `upstream`, forwarded request, token ids, logprobs, `scorable` | | not on the Link: the API Tap's side. The bodies themselves are stored by hash in the next stage |
+
+A body with a gap has `body_b3: null`. A request body that is incomplete, has a gap, uses a content coding or exceeds `DecoderConfig::max_body` (16 MiB) cannot be checked as JSON, so its pair is `http_other`.
+
+### Not in v1
+
+- No resynchronisation after a parser loses sync: a Flow first seen in the middle of an HTTP message is `opaque`, or `unexplained` from the lost point on. A keep-alive Flow seen mid-stream between messages parses normally.
+- HTTP/1.1 `Upgrade` (including h2c via Upgrade) and CONNECT tunnels: the bytes after the switch are `unexplained`. h2c works with prior knowledge.
+- gRPC payloads, TLS, content-coded bodies: identified, not decoded.
 
 ## Running
 
@@ -57,7 +111,19 @@ sg wireshark -c "cargo run -- ring -i lo -w 10 -t 60"
 cargo test --workspace
 ```
 
-- **Golden files:** `crates/collector/tests/fixtures/*.pcapng`, with expected tables in `tests/golden/<case>/`. The synthetic fixtures are generated by `cargo run -p collector --example gen_fixtures`; `dumpcap_keepalive-*` are real dumpcap ring files of a keep-alive Flow whose SYN predates the capture. After an intended output change: `UPDATE_GOLDEN=1 cargo test -p collector --test golden`, then review the diff.
+- **Golden files:** `crates/collector/tests/fixtures/*.pcapng`, with expected tables in `tests/golden/<case>/`. After an intended output change: `UPDATE_GOLDEN=1 cargo test -p collector --test golden`, then review the diff. Three kinds of fixture:
+  - **Captured OpenAI traffic** (`openai_h1_json`, `openai_h1_sse`, `openai_h2c_json`, `openai_h2c_sse`, `http_other_h1`): the official OpenAI Python SDK (and httpx for `/health`, `/v1/models` and a malformed body) against a mock OpenAI-compatible server, over HTTP/1.1 and h2c, captured with dumpcap. See below.
+  - **Synthetic** fixtures, built packet by packet in `tests/support/fixtures.rs` and written by `cargo run -p collector --example gen_fixtures`: edge cases a live run can't produce on demand (lost segment, retransmit with different bytes, mid-stream start, Flows spanning windows, UDP, non-HTTP TCP, a TLS Flow on the plaintext Link, gRPC over h2c, HTTP/1.1 pipelining and a request whose response lands in the next window).
+  - `dumpcap_keepalive-*`: real dumpcap ring files of a keep-alive Flow whose SYN predates the capture.
+- Besides the expected tables, the tests check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
+- **Capturing the OpenAI fixtures again** (only when the mock or the scenarios change; CI never captures). Needs [uv](https://docs.astral.sh/uv/) and dumpcap; Python dependencies are pinned in the scripts:
+
+  ```sh
+  sg wireshark -c "uv run fixtures/capture/capture.py"                  # every scenario
+  sg wireshark -c "uv run fixtures/capture/capture.py openai_h2c_sse"   # one scenario
+  ```
+
+  `fixtures/capture/mock_openai.py` serves fixed bodies on loopback, so only client headers and timing vary between captures. A small vLLM model would add realism, but the mock needs no GPU and keeps bodies fixed.
 - **Live equals offline:** needs capture rights, so it is skipped unless enabled:
 
   ```sh

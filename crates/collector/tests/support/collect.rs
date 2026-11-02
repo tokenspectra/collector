@@ -6,10 +6,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord, SliceRecord};
+use collector::decode::{ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
 use collector::flow::Dir;
 use collector::output::{JsonlSink, TABLES};
 use collector::run::run;
-use collector::{AssemblerConfig, FileSource, FlowSink, PacketSource};
+use collector::{AssemblerConfig, FileSource, PacketSource};
 
 pub const WINDOW_NS: u64 = 1_000_000_000;
 
@@ -21,6 +22,9 @@ pub struct Collected {
     pub segments: Vec<SegmentRecord>,
     pub events: Vec<EventRecord>,
     pub slices: Vec<SliceRecord>,
+    pub flows: Vec<FlowRecord>,
+    pub exchanges: Vec<ExchangeRecord>,
+    pub workunits: Vec<WorkunitRecord>,
     pub streams: BTreeMap<(String, Dir), Vec<u8>>,
 }
 
@@ -41,7 +45,7 @@ impl Collected {
     }
 }
 
-impl FlowSink for Collected {
+impl RecordSink for Collected {
     fn packet(&mut self, rec: &PacketRecord) {
         self.packets.push(rec.clone());
     }
@@ -62,8 +66,17 @@ impl FlowSink for Collected {
         self.events.push(rec.clone());
     }
 
-    fn slice(&mut self, rec: &SliceRecord) {
-        self.slices.push(rec.clone());
+    fn flow(&mut self, rec: &FlowRecord) {
+        self.slices.push(rec.slice.clone());
+        self.flows.push(rec.clone());
+    }
+
+    fn exchange(&mut self, rec: &ExchangeRecord) {
+        self.exchanges.push(rec.clone());
+    }
+
+    fn workunit(&mut self, rec: &WorkunitRecord) {
+        self.workunits.push(rec.clone());
     }
 }
 
