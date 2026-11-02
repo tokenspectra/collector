@@ -320,6 +320,8 @@ pub trait RecordSink {
     fn chunk(&mut self, _rec: &crate::store::ChunkRecord) {}
     /// A pack item was written (spec §8).
     fn blob(&mut self, _rec: &crate::store::BlobRecord) {}
+    /// A window was sealed: every object it names is written (spec §11).
+    fn manifest(&mut self, _rec: &crate::manifest::WindowManifest) {}
 }
 
 pub struct Decoder<'a> {

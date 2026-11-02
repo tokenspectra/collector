@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord, SliceRecord};
 use collector::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
 use collector::flow::Dir;
+use collector::manifest::LOG;
 use collector::observe::StatsSink;
 use collector::output::{JsonlSink, BODIES, TABLES};
 use collector::run::run;
@@ -143,7 +144,8 @@ pub fn collect_files(names: &[&str]) -> Collected {
 /// (file name, bytes) per output file.
 pub type Files = Vec<(String, Vec<u8>)>;
 
-/// Runs `source` and returns each JSONL table's bytes, in [`TABLES`] order.
+/// Runs `source` and returns each JSONL table's bytes, in [`TABLES`] order,
+/// then the manifest log's.
 pub fn tables(source: &mut dyn PacketSource) -> Files {
     tables_and_bodies(source, true).0
 }
@@ -188,8 +190,9 @@ pub fn tables_and_bodies_with(
     bodies.sort();
     let tables = TABLES
         .iter()
-        .map(|t| {
-            let name = format!("{t}.jsonl");
+        .map(|t| format!("{t}.jsonl"))
+        .chain([LOG.to_string()])
+        .map(|name| {
             let bytes = std::fs::read(dir.path().join(&name)).expect("read table");
             (name, bytes)
         })
