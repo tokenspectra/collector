@@ -52,7 +52,8 @@ struct Cli {
     #[arg(long, global = true)]
     ingest: Option<String>,
     /// Seconds the shipper has, in all, to ship what is left at the end of
-    /// a run; lines it does not get to stay in the log.
+    /// a run, including a request in flight (lookup, connect, upload or
+    /// response); lines it does not get to stay in the log.
     #[arg(long, global = true, default_value_t = 30)]
     ship_wait_s: u64,
     /// The `{site}` part of object keys.
