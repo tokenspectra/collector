@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TokenSpectra capture viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="assets/tokenspectra-favicon.svg">
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #fff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e2e1db; --hover: #efeee9;
+    --link: #2f62a8; --ok: #2f8f6b; --bad: #c0392b; --warn: #b8691d;
+    --c-green: #2f8f6b; --c-blue: #3d6fb6; --c-red: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --panel: #1f1f1e; --ink: #ecebe6; --muted: #9a9993; --line: #34342f; --hover: #2a2a27;
+      --link: #79a6e8; --ok: #5cc49a; --bad: #ef7b6c; --warn: #e3a35c;
+      --c-green: #3fa77c; --c-blue: #5f8fd6; --c-red: #dd5f50; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: grid; grid-template-rows: auto 1fr; }
+  code, .mono, pre, td.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+  a { color: var(--link); text-decoration: none; cursor: pointer; }
+  a:hover { text-decoration: underline; }
+
+  #top { display: flex; align-items: center; gap: 14px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  #top h1 { font-size: 15px; margin: 0; white-space: nowrap; display: flex; align-items: center; gap: 10px; font-weight: 500; }
+  #top h1 img { height: 22px; display: block; }
+  #drop img { height: 40px; margin-bottom: 18px; }
+  #crumbs { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  #crumbs a { color: var(--ink); }
+  #crumbs .sep { margin: 0 6px; color: var(--muted); }
+  button, label.btn { font: inherit; font-size: 13px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--panel); color: var(--ink); cursor: pointer; }
+  button:hover, label.btn:hover { background: var(--hover); }
+
+  #main { display: grid; grid-template-columns: 340px 1fr; min-height: 0; }
+  #tree { overflow: auto; border-right: 1px solid var(--line); background: var(--panel); padding: 6px 0 24px; }
+  #view { overflow: auto; padding: 18px 24px 48px; }
+
+  .node > .row { display: flex; align-items: center; gap: 4px; padding: 2px 8px 2px calc(8px + var(--d) * 14px);
+    cursor: pointer; white-space: nowrap; }
+  .node > .row:hover { background: var(--hover); }
+  .node > .row.sel { background: color-mix(in srgb, var(--link) 18%, transparent); }
+  .node .tw { width: 14px; flex: none; color: var(--muted); font-size: 10px; text-align: center; }
+  .node .lbl { overflow: hidden; text-overflow: ellipsis; }
+  .node .cnt { color: var(--muted); font-size: 12px; margin-left: auto; padding-left: 8px; }
+  .node .kind { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); flex: none; width: 34px; }
+
+  #drop { max-width: 640px; margin: 10vh auto; padding: 36px; border: 2px dashed var(--line); border-radius: 12px; text-align: center; }
+  #drop.over { border-color: var(--link); background: color-mix(in srgb, var(--link) 8%, transparent); }
+  #drop p { color: var(--muted); }
+
+  h2 { font-size: 18px; margin: 0 0 2px; word-break: break-all; }
+  h3 { font-size: 14px; margin: 22px 0 8px; }
+  .sub { color: var(--muted); margin-bottom: 14px; }
+  .tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; min-width: 120px; }
+  .tile b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .tile span { color: var(--muted); font-size: 12px; }
+
+  table { border-collapse: collapse; background: var(--panel); width: 100%; }
+  th, td { border-bottom: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; position: sticky; top: -18px; background: var(--panel); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.click { cursor: pointer; }
+  tr.click:hover td { background: var(--hover); }
+  table.kv { width: auto; min-width: 520px; }
+  table.kv th { position: static; width: 200px; font-weight: 500; }
+
+  .pill { display: inline-block; padding: 0 6px; border-radius: 9px; font-size: 11px; border: 1px solid var(--line); white-space: nowrap; }
+  .pill.ok { color: var(--ok); border-color: currentColor; }
+  .pill.bad { color: var(--bad); border-color: currentColor; }
+  .pill.warn { color: var(--warn); border-color: currentColor; }
+  .hash { cursor: copy; white-space: nowrap; }
+  .hash .mono { word-break: break-all; white-space: normal; }
+  .pill.mh { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 10px; color: var(--link); border-color: currentColor; }
+  .muted { color: var(--muted); }
+
+  .bar { display: flex; height: 12px; border-radius: 3px; overflow: hidden; background: var(--line); min-width: 160px; }
+  .bar i { display: block; height: 100%; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin: 6px 0; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+
+  .stack { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 8px; margin: 12px 0; max-width: 900px; }
+  .stack-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .stack-head .tabs { margin: 0; }
+  .stack-head .tabs button { font-size: 11px; padding: 1px 8px; }
+  .stack svg { display: block; width: 100%; height: auto; cursor: crosshair; }
+  .stack svg text { font: 10px system-ui, sans-serif; fill: var(--muted); }
+  .stack svg g text { fill: #fff; }
+  .stack-tip { position: absolute; top: 40px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 9px; font-size: 12px; pointer-events: none; box-shadow: 0 2px 8px rgba(0,0,0,.12); min-width: 190px; }
+  .stack-tip i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; }
+  .stack-tip .num { font-variant-numeric: tabular-nums; margin-left: 6px; }
+  .stacks { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
+  .stacks .stack { margin: 0; }
+  pre.body { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
+    max-height: 60vh; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .tabs { display: flex; gap: 4px; margin: 8px 0; }
+  .tabs button.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .msg { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; margin: 6px 0; }
+  .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 4px; }
+  .msg.user { border-left: 3px solid var(--link); }
+  .msg.asst { border-left: 3px solid var(--ok); }
+  details.msg summary { cursor: pointer; }
+  .msg pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; font-size: 13px; }
+  .note { color: var(--muted); font-size: 12px; margin: 6px 0; }
+</style>
+</head>
+<body>
+<div id="top">
+  <h1><img src="assets/tokenspectra-logo.svg" alt="TokenSpectra"><span>capture viewer</span></h1>
+  <div id="crumbs"></div>
+  <label class="btn">Open capture folder…<input id="pick" type="file" webkitdirectory directory multiple hidden></label>
+</div>
+<div id="main">
+  <div id="tree"></div>
+  <div id="view">
+    <div id="drop">
+      <img src="assets/tokenspectra-logo.svg" alt="TokenSpectra">
+      <h2>Open a Collector output folder</h2>
+      <p>Pick or drop a folder such as <code>ts-captures-ollama/</code>. It needs the JSONL tables
+        (<code>flows.jsonl</code>, <code>packets.jsonl</code>, …) and, for body contents, <code>bodies/</code>.
+        Nothing leaves this page: files are read locally.</p>
+      <label class="btn">Choose folder…<input type="file" webkitdirectory directory multiple hidden onchange="loadFileList(this.files)"></label>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ===================== BLAKE3 (hash mode, 32-byte output) ===================== */
+const B3 = (() => {
+  const IV = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+  const PERM = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+  const CHUNK_START = 1, CHUNK_END = 2, PARENT = 4, ROOT = 8;
+  const s = new Uint32Array(16), m = new Uint32Array(16), t = new Uint32Array(16);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  function g(a, b, c, d, x, y) {
+    s[a] = s[a] + s[b] + x; s[d] = rotr(s[d] ^ s[a], 16);
+    s[c] = s[c] + s[d];     s[b] = rotr(s[b] ^ s[c], 12);
+    s[a] = s[a] + s[b] + y; s[d] = rotr(s[d] ^ s[a], 8);
+    s[c] = s[c] + s[d];     s[b] = rotr(s[b] ^ s[c], 7);
+  }
+  // Returns the 8-word output of compressing `block` (16 words) under `cv`.
+  function compress(cv, block, counter, len, flags) {
+    for (let i = 0; i < 8; i++) s[i] = cv[i];
+    s[8] = IV[0]; s[9] = IV[1]; s[10] = IV[2]; s[11] = IV[3];
+    s[12] = counter >>> 0; s[13] = Math.floor(counter / 0x100000000) >>> 0; s[14] = len; s[15] = flags;
+    m.set(block);
+    for (let r = 0; r < 7; r++) {
+      g(0, 4, 8, 12, m[0], m[1]); g(1, 5, 9, 13, m[2], m[3]); g(2, 6, 10, 14, m[4], m[5]); g(3, 7, 11, 15, m[6], m[7]);
+      g(0, 5, 10, 15, m[8], m[9]); g(1, 6, 11, 12, m[10], m[11]); g(2, 7, 8, 13, m[12], m[13]); g(3, 4, 9, 14, m[14], m[15]);
+      if (r < 6) { for (let i = 0; i < 16; i++) t[i] = m[PERM[i]]; m.set(t); }
+    }
+    const out = new Uint32Array(8);
+    for (let i = 0; i < 8; i++) out[i] = s[i] ^ s[i + 8];
+    return out;
+  }
+  function words(bytes, off, len) {
+    const w = new Uint32Array(16);
+    for (let i = 0; i < len; i++) w[i >> 2] |= bytes[off + i] << ((i & 3) * 8);
+    return w;
+  }
+  // Process one chunk; returns the last block's compression inputs (the "output").
+  function chunkOutput(bytes, off, len, counter) {
+    let cv = IV, flags = CHUNK_START;
+    const blocks = Math.max(1, Math.ceil(len / 64));
+    for (let b = 0; b < blocks - 1; b++) {
+      cv = compress(cv, words(bytes, off + b * 64, 64), counter, 64, flags);
+      flags = 0;
+    }
+    const lastLen = len - (blocks - 1) * 64;
+    return { cv, block: words(bytes, off + (blocks - 1) * 64, lastLen), counter, len: lastLen, flags: flags | CHUNK_END };
+  }
+  const outCv = o => compress(o.cv, o.block, o.counter, o.len, o.flags);
+  function parentOutput(l, r) {
+    const block = new Uint32Array(16); block.set(l, 0); block.set(r, 8);
+    return { cv: IV, block, counter: 0, len: 64, flags: PARENT };
+  }
+  function hash(bytes) {
+    const n = Math.max(1, Math.ceil(bytes.length / 1024));
+    const stack = [];
+    for (let i = 0; i < n - 1; i++) {
+      let cv = outCv(chunkOutput(bytes, i * 1024, 1024, i));
+      let total = i + 1;
+      while ((total & 1) === 0) { cv = outCv(parentOutput(stack.pop(), cv)); total >>= 1; }
+      stack.push(cv);
+    }
+    let o = chunkOutput(bytes, (n - 1) * 1024, bytes.length - (n - 1) * 1024, n - 1);
+    while (stack.length) o = parentOutput(stack.pop(), outCv(o));
+    const w = compress(o.cv, o.block, o.counter, o.len, o.flags | ROOT);
+    const out = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) out[i] = (w[i >> 2] >>> ((i & 3) * 8)) & 255;
+    return out;
+  }
+  const hex = b => Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
+  const unhex = h => Uint8Array.from(h.match(/../g), x => parseInt(x, 16));
+  // Multihash text form (spec §6): "f1e20" + 64 hex digits.
+  const mh = bytes => "f1e20" + hex(hash(bytes));
+  const digest = name => unhex(name.slice(5));
+  return { hash, hex, mh, digest };
+})();
+
+// Merkle root over packet hashes (spec §6): leaf blake3(0x00‖h), node blake3(0x01‖l‖r), odd node moves up.
+function merkleRoot(hashNames) {
+  if (!hashNames.length) return null;
+  let level = hashNames.map(n => { const b = new Uint8Array(33); b.set(B3.digest(n), 1); return B3.hash(b); });
+  while (level.length > 1) {
+    const next = [];
+    for (let i = 0; i < level.length; i += 2) {
+      if (i + 1 === level.length) { next.push(level[i]); continue; }
+      const b = new Uint8Array(65); b[0] = 1; b.set(level[i], 1); b.set(level[i + 1], 33);
+      next.push(B3.hash(b));
+    }
+    level = next;
+  }
+  return "f1e20" + B3.hex(level[0]);
+}
+
+/* ===================== Loading ===================== */
+const TABLES = ["chunks", "packets", "segments", "flows", "events", "http", "workunits", "blobs"];
+let D = null;         // the loaded capture
+let FILES = new Map(); // relative path -> File
+
+// Integers of 16+ digits (ns timestamps) exceed 2^53: keep them as strings.
+const BIG = /([:\[,]\s*)(-?\d{16,})(?=\s*[,\]}])/g;
+function parseJsonl(text) {
+  const rows = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    const r = JSON.parse(line.replace(BIG, '$1"$2"'));
+    Object.defineProperty(r, "_raw", { value: line, enumerable: false });
+    rows.push(r);
+  }
+  return rows;
+}
+
+async function loadFileList(list) {
+  const files = new Map();
+  let root = null;
+  for (const f of list) {
+    const p = f.webkitRelativePath || f._path || f.name;
+    const parts = p.split("/");
+    if (root === null) root = parts.length > 1 ? parts[0] : "";
+    files.set(parts.length > 1 ? parts.slice(1).join("/") : p, f);
+  }
+  await loadFiles(files, root || "capture");
+}
+
+async function readDropped(entry, prefix, out) {
+  if (entry.isFile) {
+    const f = await new Promise((res, rej) => entry.file(res, rej));
+    out.set(prefix + entry.name, f);
+  } else if (entry.isDirectory) {
+    // Skip the views folder and the Parquet index: the viewer reads JSONL and bodies/.
+    if (prefix === "" && (entry.name === "by-exchange" || entry.name === "store")) return;
+    const reader = entry.createReader();
+    let batch;
+    do {
+      batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+      for (const e of batch) await readDropped(e, prefix + entry.name + "/", out);
+    } while (batch.length);
+  }
+}
+
+async function loadFiles(files, name) {
+  FILES = files;
+  const t = {};
+  const missing = [];
+  for (const tb of TABLES) {
+    const f = files.get(tb + ".jsonl");
+    if (!f) { missing.push(tb + ".jsonl"); t[tb] = []; continue; }
+    t[tb] = parseJsonl(await f.text());
+  }
+  if (missing.length === TABLES.length) {
+    alert("No Collector JSONL tables found in this folder.");
+    return;
+  }
+  D = index(t, name, missing);
+  buildTree();
+  if (location.hash && location.hash !== "#/") route(); else go("#/");
+}
+
+/* ===================== Indexing ===================== */
+function index(t, name, missing) {
+  const by = (rows, keyf) => {
+    const m = new Map();
+    for (const r of rows) { const k = keyf(r); if (!m.has(k)) m.set(k, []); m.get(k).push(r); }
+    return m;
+  };
+  const d = { name, missing, ...t };
+  const allWs = [...new Set([...t.flows, ...t.chunks, ...t.packets].map(r => r.window_start_ns))]
+    .sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+  d.windows = allWs;
+  d.base = allWs.length ? BigInt(allWs[0]) : 0n;
+  d.links = [...new Set([...t.flows, ...t.chunks, ...t.packets].map(r => r.link))].sort();
+
+  d.flowsById = new Map();     // flow id -> {id, link, kind, orig, resp, generation, slices[], exchanges[]}
+  for (const s of t.flows) {
+    let f = d.flowsById.get(s.flow);
+    if (!f) {
+      f = { id: s.flow, link: s.link, kind: s.kind, orig: s.orig, resp: s.resp, generation: s.generation,
+            first_ts_ns: s.first_ts_ns, slices: [], exchanges: [] };
+      d.flowsById.set(s.flow, f);
+    }
+    f.slices.push(s);
+  }
+  for (const h of t.http) {
+    let f = d.flowsById.get(h.flow);
+    if (!f) { // an exchange whose Flow has no Slice row yet
+      const [link, kind, orig, resp, gen] = h.flow.split("|");
+      f = { id: h.flow, link, kind, orig, resp, generation: gen, slices: [], exchanges: [] };
+      d.flowsById.set(h.flow, f);
+    }
+    f.exchanges.push(h);
+  }
+  for (const f of d.flowsById.values()) {
+    f.slices.sort((a, b) => (BigInt(a.window_start_ns) < BigInt(b.window_start_ns) ? -1 : 1));
+    f.exchanges.sort((a, b) => a.exchange - b.exchange);
+    const tot = { workunit: 0, http_other: 0, framing: 0, unexplained: 0, gap: 0 };
+    let pk = 0, wire = 0;
+    for (const s of f.slices) {
+      for (const k in tot) tot[k] += (s.orig_bytes?.[k] || 0) + (s.resp_bytes?.[k] || 0);
+      pk += s.orig_stats.packets + s.resp_stats.packets;
+      wire += s.orig_stats.wire_bytes + s.resp_stats.wire_bytes;
+    }
+    f.buckets = tot; f.packets = pk; f.wire = wire;
+    f.verdict = [...new Set(f.slices.map(s => s.verdict).filter(Boolean))].join(", ") || "—";
+    f.workunits = f.exchanges.filter(e => e.workunit_id).length;
+  }
+  d.slicesByWs = by(t.flows, r => r.window_start_ns);
+  d.chunkByLw = new Map(t.chunks.map(c => [c.link + "@" + c.window_start_ns, c]));
+  d.packetsByLw = by(t.packets, r => r.link + "@" + r.window_start_ns);
+  d.packetsBySlice = by(t.packets, r => r.flow + "@" + r.window_start_ns);
+  d.packetByKey = new Map(t.packets.map(p => [p.link + "@" + p.window_start_ns + "#" + p.index, p]));
+  d.segmentsByFlow = by(t.segments, r => r.flow);
+  d.eventsByFlow = by(t.events, r => r.flow);
+  d.wuById = new Map(t.workunits.map(w => [w.workunit_id, w]));
+  d.httpByKey = new Map(t.http.map(h => [h.flow + "#" + h.exchange, h]));
+  d.blobByHash = new Map(t.blobs.map(b => [b.hash, b]));
+  d.blobByWu = new Map(t.blobs.filter(b => b.workunit_id).map(b => [b.workunit_id, b]));
+  // Every place a body hash is referenced.
+  d.bodyRefs = new Map();
+  const ref = (h, what) => { if (!h) return; if (!d.bodyRefs.has(h)) d.bodyRefs.set(h, []); d.bodyRefs.get(h).push(what); };
+  for (const h of t.http) {
+    ref(h.request?.body_hash, { http: h, dir: "request" });
+    ref(h.response?.body_hash, { http: h, dir: "response" });
+  }
+  d.bodyHashes = [...new Set([...d.bodyRefs.keys(), ...t.blobs.filter(b => b.kind === "body").map(b => b.hash),
+    ...[...FILES.keys()].filter(p => p.startsWith("bodies/")).map(p => p.slice(7))])];
+  return d;
+}
+
+/* ===================== Formatting ===================== */
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const num = n => n == null ? "—" : Number(n).toLocaleString("en-US");
+function bytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KiB";
+  return (n / 1048576).toFixed(2) + " MiB";
+}
+function rel(ns) { // seconds since the first window
+  if (ns == null) return "—";
+  const d = BigInt(ns) - D.base;
+  return "+" + (Number(d) / 1e9).toFixed(6) + "s";
+}
+function iso(ns) {
+  if (ns == null) return "";
+  const b = BigInt(ns);
+  return new Date(Number(b / 1000000n)).toISOString().replace("Z", "") + String(b % 1000000n).padStart(6, "0") + "Z";
+}
+const time = ns => ns == null ? "—" : `<span title="${iso(ns)} (${ns})">${rel(ns)}</span>`;
+const wsLabel = ws => `${rel(ws).replace(/\.0+s$/, "s")}`;
+// Multihash text form: multibase prefix ("f" = base16 lower), then <code varint><length varint><digest>.
+const MH_CODES = { 0x1e: "blake3", 0x12: "sha2-256", 0x13: "sha2-512", 0x16: "sha3-256", 0x14: "sha3-512",
+  0x11: "sha1", 0xb220: "blake2b-256", 0xb240: "blake2b-512", 0xb260: "blake2s-256", 0x00: "identity" };
+function parseMh(s) {
+  if (typeof s !== "string" || s[0] !== "f" || !/^[0-9a-f]+$/.test(s.slice(1)) || s.length % 2 === 0) return null;
+  const b = s.slice(1).match(/../g).map(x => parseInt(x, 16));
+  let i = 0;
+  const varint = () => {
+    let v = 0, shift = 0;
+    for (; i < b.length && i < 9; shift += 7) { const x = b[i++]; v += (x & 0x7f) * 2 ** shift; if (!(x & 0x80)) return v; }
+    return null;
+  };
+  const code = varint(), len = varint();
+  if (code == null || len == null || b.length - i !== len) return null;
+  return { code, len, name: MH_CODES[code] ?? "0x" + code.toString(16), digest: s.slice(1 + 2 * i) };
+}
+const mhShort = h => { const m = parseMh(h); return m ? `${m.name} ${m.digest.slice(0, 12)}…` : h.slice(0, 16) + "…"; };
+function hash(h, full) {
+  if (!h) return '<span class="muted">null</span>';
+  const m = parseMh(h);
+  const tag = m ? `<span class="pill mh" title="multihash code 0x${m.code.toString(16)}, ${m.len}-byte digest">${esc(m.name)}${m.len !== 32 ? "-" + m.len * 8 : ""}</span>`
+    : '<span class="pill bad" title="not a base16 multihash">?</span>';
+  const v = m ? m.digest : h;
+  const shown = full ? v : v.slice(0, 16) + "…";
+  return `<span class="hash" title="${esc(h)}\nclick to copy the multihash" onclick="navigator.clipboard?.writeText('${esc(h)}')">${tag} <span class="mono">${esc(shown)}</span></span>`;
+}
+const pill = (t, cls = "") => `<span class="pill ${cls}">${esc(t)}</span>`;
+function verdictPill(v) {
+  if (!v) return pill("no payload");
+  return pill(v, { http1: "ok", http2: "ok", tls: "warn", opaque: "bad", grpc: "warn" }[v] || "");
+}
+const BUCKETS = ["workunit", "http_other", "framing", "unexplained", "gap"];
+// Three traffic classes over the five byte buckets, bottom of the stack first. These are the
+// Collector's buckets grouped for reading, not Slice statuses: the Collector never assigns a status.
+const CLASSES = [
+  { key: "green", label: "Workunit", parts: ["workunit"] },
+  { key: "blue", label: "Other HTTP", parts: ["http_other", "framing"] },
+  { key: "red", label: "Unexplained", parts: ["unexplained", "gap"] },
+];
+const classify = b => Object.fromEntries(CLASSES.map(c => [c.key, c.parts.reduce((s, k) => s + (b?.[k] || 0), 0)]));
+const bucketTitle = b => BUCKETS.map(k => `${k}: ${num(b?.[k] || 0)}`).join("\n");
+function bucketBar(b) {
+  const c = classify(b), total = c.green + c.blue + c.red;
+  if (!total) return '<div class="bar" title="no stream bytes"></div>';
+  return `<div class="bar" title="${bucketTitle(b)}">` +
+    CLASSES.map(k => c[k.key] ? `<i style="width:${(100 * c[k.key] / total).toFixed(2)}%;background:var(--c-${k.key})"></i>` : "").join("") + "</div>";
+}
+const bucketLegend = () => `<div class="legend">${CLASSES.map(c =>
+  `<span title="${c.parts.join(" + ")}"><i style="background:var(--c-${c.key})"></i>${c.label} <span class="mono">(${c.parts.join(" + ")})</span></span>`).join("")}</div>`;
+
+/* ---------- 100% stacked traffic graph, in the pitch deck's TrafficStack style ---------- */
+const CHARTS = {};
+let chartMode = "share"; // "share" (100%) or "bytes"
+// points: [{ws, b (5 buckets), href, alert}] over D.windows, so every graph shares the same time axis.
+function stackChart(title, points) {
+  const id = "ch" + Math.random().toString(36).slice(2);
+  CHARTS[id] = { title, points };
+  return `<div class="stack" id="${id}"><div class="stack-head"><b>${esc(title)}</b>
+      <span class="tabs"><button data-act="mode" data-m="share" class="${chartMode === "share" ? "on" : ""}">share</button><button data-act="mode" data-m="bytes" class="${chartMode === "bytes" ? "on" : ""}">bytes</button></span></div>
+    <div class="stack-plot">${chartSvg(id)}</div><div class="stack-tip" hidden></div>${bucketLegend()}</div>`;
+}
+const CW = 760, CH = 210, PAD = { l: 52, r: 10, t: 20, b: 22 };
+function chartGeom(pts) {
+  const vals = pts.map(p => classify(p.b));
+  const tot = vals.map(v => v.green + v.blue + v.red);
+  const max = Math.max(1, ...tot);
+  const n = pts.length, w = CW - PAD.l - PAD.r, h = CH - PAD.t - PAD.b;
+  const x = i => PAD.l + (n === 1 ? w / 2 : (i / (n - 1)) * w);
+  const y = v => PAD.t + h - v * h;
+  const frac = (i, v) => chartMode === "share" ? (tot[i] ? v / tot[i] : 0) : v / max;
+  return { vals, tot, max, n, w, h, x, y, frac };
+}
+function chartSvg(id) {
+  const { points: pts } = CHARTS[id];
+  const g = chartGeom(pts);
+  const { vals, n, x, y, frac } = g;
+  let shapes = "";
+  const base = new Array(n).fill(0);
+  if (n >= 3) {
+    for (const c of CLASSES) {
+      const lo = [...base], hi = base.map((b, i) => b + frac(i, vals[i][c.key]));
+      hi.forEach((v, i) => (base[i] = v));
+      const top = hi.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" L");
+      const bot = lo.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).reverse().join(" L");
+      shapes += `<path d="M${top} L${bot} Z" fill="var(--c-${c.key})" stroke="var(--panel)" stroke-width="1"/>`;
+    }
+  } else { // too few windows for an area: stacked columns
+    const bw = Math.min(60, g.w / (n * 2));
+    for (let i = 0; i < n; i++) {
+      let acc = 0;
+      for (const c of CLASSES) {
+        const f = frac(i, vals[i][c.key]); if (!f) continue;
+        shapes += `<rect x="${x(i) - bw / 2}" y="${y(acc + f)}" width="${bw}" height="${(f * g.h).toFixed(1)}" fill="var(--c-${c.key})" stroke="var(--panel)" stroke-width="1"/>`;
+        acc += f;
+      }
+    }
+  }
+  const yl = chartMode === "share" ? [[1, "100%"], [0.5, "50%"], [0, "0%"]] : [[1, bytes(g.max)], [0.5, bytes(Math.round(g.max / 2))], [0, "0"]];
+  const axis = yl.map(([v, t]) => `<text x="${PAD.l - 6}" y="${y(v) + 3}" text-anchor="end">${t}</text>`).join("") +
+    `<line x1="${PAD.l}" x2="${CW - PAD.r}" y1="${y(0)}" y2="${y(0)}" stroke="var(--line)"/>`;
+  const step = Math.max(1, Math.ceil(n / 8));
+  const xl = pts.map((p, i) => i % step === 0 || i === n - 1 ? `<text x="${x(i)}" y="${CH - 6}" text-anchor="middle">${wsLabel(p.ws)}</text>` : "").join("");
+  const alerts = pts.map((p, i) => !p.alert ? "" : `<line x1="${x(i)}" x2="${x(i)}" y1="${PAD.t - 2}" y2="${y(0)}" stroke="var(--c-red)" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <g transform="translate(${x(i)} ${PAD.t - 9})"><path d="M0 -8 L8 6 L-8 6 Z" fill="var(--c-red)" stroke="var(--panel)" stroke-linejoin="round"/>
+    <text y="4.5" text-anchor="middle" fill="#fff" font-weight="700">!</text></g>`).join("");
+  return `<svg viewBox="0 0 ${CW} ${CH}" role="img" aria-label="${esc(CHARTS[id].title)}: traffic by class over windows">
+    ${shapes}${axis}${xl}${alerts}<line class="xh" y1="${PAD.t}" y2="${y(0)}" stroke="var(--ink)" stroke-width="1" visibility="hidden"/>
+    <rect class="hit" x="${PAD.l - 8}" y="0" width="${CW - PAD.l - PAD.r + 16}" height="${CH}" fill="transparent"/></svg>`;
+}
+function chartHover(e) {
+  const box = e.target.closest(".stack"); if (!box || !CHARTS[box.id]) return;
+  const svg = box.querySelector("svg"), tip = box.querySelector(".stack-tip"), xh = svg.querySelector(".xh");
+  const { points } = CHARTS[box.id];
+  if (e.type === "mouseleave") { tip.hidden = true; xh.setAttribute("visibility", "hidden"); box._i = null; return; }
+  const g = chartGeom(points);
+  const r = svg.getBoundingClientRect();
+  const px = ((e.clientX - r.left) / r.width) * CW;
+  const i = g.n === 1 ? 0 : Math.max(0, Math.min(g.n - 1, Math.round(((px - PAD.l) / g.w) * (g.n - 1))));
+  box._i = i;
+  xh.setAttribute("x1", g.x(i)); xh.setAttribute("x2", g.x(i)); xh.setAttribute("visibility", "visible");
+  const p = points[i], v = g.vals[i], t = g.tot[i];
+  tip.innerHTML = `<div><b>Window ${wsLabel(p.ws)}</b> <span class="muted">${bytes(t)}</span></div>` +
+    [...CLASSES].reverse().map(c => `<div title="${c.parts.join(" + ")}"><i style="background:var(--c-${c.key})"></i>${c.label}
+      <span class="num">${t ? (100 * v[c.key] / t).toFixed(1) : "0.0"}%</span> <span class="muted">${bytes(v[c.key])}</span></div>`).join("") +
+    (p.alert ? `<div style="color:var(--c-red)">! ${esc(p.alert)}</div>` : "") + (p.href ? `<div class="muted">click to open</div>` : "");
+  tip.hidden = false;
+  const left = (g.x(i) / CW) * r.width + svg.offsetLeft;
+  tip.style.left = Math.min(left + 12, box.clientWidth - tip.offsetWidth - 4) + "px";
+}
+document.addEventListener("mousemove", e => { if (e.target.closest?.(".stack svg")) chartHover(e); });
+document.addEventListener("mouseout", e => {
+  const box = e.target.closest?.(".stack svg"); if (box && !box.contains(e.relatedTarget)) chartHover({ type: "mouseleave", target: box });
+});
+document.addEventListener("click", e => {
+  const box = e.target.closest?.(".stack svg") && e.target.closest(".stack");
+  if (box && box._i != null) { const p = CHARTS[box.id].points[box._i]; if (p.href) go(p.href); }
+});
+
+// Series over every window of the capture: one Link, or one Flow.
+// Evenly spaced from the first to the last window, so windows with no rows still take their place in time.
+function axisWindows() {
+  const ws = D.windows.map(BigInt);
+  if (ws.length < 2) return D.windows;
+  let step = 0n;
+  for (let i = 1; i < ws.length; i++) { const d = ws[i] - ws[i - 1]; if (d > 0n && (!step || d < step)) step = d; }
+  if (!step || (ws[ws.length - 1] - ws[0]) / step > 2000n) return D.windows;
+  const out = [];
+  for (let w = ws[0]; w <= ws[ws.length - 1]; w += step) out.push(w.toString());
+  return out;
+}
+function linkPoints(l) {
+  return axisWindows().map(ws => {
+    const sl = (D.slicesByWs.get(ws) || []).filter(s => s.link === l);
+    const b = sl.reduce((acc, s) => sumB(acc, sumB(s.orig_bytes, s.resp_bytes)), {});
+    const ev = D.events.filter(e => e.window_start_ns === ws && D.flowsById.get(e.flow)?.link === l).length;
+    const ds = sl.filter(s => s.orig_desync || s.resp_desync).length;
+    return { ws, b, href: R.window(l, ws), alert: [ev && `${ev} events`, ds && `${ds} Slices lost parser sync`].filter(Boolean).join(", ") };
+  });
+}
+function flowPoints(f) {
+  const ev = D.eventsByFlow.get(f.id) || [];
+  return axisWindows().map(ws => {
+    const s = f.slices.find(x => x.window_start_ns === ws);
+    const n = ev.filter(e => e.window_start_ns === ws).length;
+    return { ws, b: s ? sumB(s.orig_bytes, s.resp_bytes) : {}, href: s ? R.slice(f.id, ws) : null,
+      alert: [n && `${n} events`, s && (s.orig_desync || s.resp_desync) && "lost parser sync"].filter(Boolean).join(", ") };
+  });
+}
+const sumB = (a, b) => Object.fromEntries(BUCKETS.map(k => [k, (a?.[k] || 0) + (b?.[k] || 0)]));
+function kv(rows) {
+  return `<table class="kv">${rows.filter(Boolean).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${v}</td></tr>`).join("")}</table>`;
+}
+const tiles = items => `<div class="tiles">${items.map(([v, l]) => `<div class="tile"><b>${v}</b><span>${esc(l)}</span></div>`).join("")}</div>`;
+
+/* ===================== Routes ===================== */
+const enc = encodeURIComponent;
+const R = {
+  home: () => "#/",
+  link: l => `#/link/${enc(l)}`,
+  window: (l, ws) => `#/window/${enc(l)}/${ws}`,
+  flows: l => `#/flows/${enc(l)}`,
+  flow: f => `#/flow/${enc(f)}`,
+  slice: (f, ws) => `#/slice/${enc(f)}/${ws}`,
+  exchange: (f, n) => `#/exchange/${enc(f)}/${n}`,
+  workunits: () => "#/workunits",
+  workunit: id => `#/workunit/${id}`,
+  bodies: () => "#/bodies",
+  body: h => `#/body/${h}`,
+  packet: (l, ws, i) => `#/packet/${enc(l)}/${ws}/${i}`,
+  events: () => "#/events",
+  convo: (f, n) => `#/convo/${enc(f)}/${n}`,
+};
+const a = (href, text) => `<a href="${href}">${text}</a>`;
+function go(h) { if (location.hash === h) route(); else location.hash = h; }
+
+function flowLabel(f) {
+  const fl = typeof f === "string" ? D.flowsById.get(f) : f;
+  if (!fl) return esc(f);
+  return `${esc(fl.kind)} ${esc(fl.orig)} → ${esc(fl.resp)}${fl.generation && fl.generation !== "0" && fl.generation !== 0 ? " g" + fl.generation : ""}`;
+}
+function exLabel(h) {
+  const q = h.request, r = h.response;
+  return `${esc(q?.method || "?")} ${esc(q?.target || "")} → ${r?.status ?? "…"}`;
+}
+
+// Hierarchy for breadcrumbs: Capture › Link › Flow › (Slice | Exchange › Workunit › Body)
+function crumbsFor(parts) {
+  const c = [[R.home(), esc(D.name)]];
+  const [kind, ...rest] = parts;
+  const dec = decodeURIComponent;
+  const flowCrumbs = id => {
+    const f = D.flowsById.get(id);
+    if (f) c.push([R.link(f.link), "Link " + esc(f.link)], [R.flows(f.link), "Flows"], [R.flow(id), flowLabel(f)]);
+  };
+  const exCrumbs = h => { flowCrumbs(h.flow); c.push([R.exchange(h.flow, h.exchange), `Exchange ${h.exchange}`]); };
+  const wuCrumbs = w => { const h = D.httpByKey.get(w.flow + "#" + w.exchange); if (h) exCrumbs(h); c.push([R.workunit(w.workunit_id), "Workunit"]); };
+  switch (kind) {
+    case "link": c.push([R.link(dec(rest[0])), "Link " + esc(dec(rest[0]))]); break;
+    case "flows": c.push([R.link(dec(rest[0])), "Link " + esc(dec(rest[0]))], [R.flows(dec(rest[0])), "Flows"]); break;
+    case "window": c.push([R.link(dec(rest[0])), "Link " + esc(dec(rest[0]))], [R.window(dec(rest[0]), rest[1]), "Window " + wsLabel(rest[1])]); break;
+    case "flow": flowCrumbs(dec(rest[0])); break;
+    case "slice": flowCrumbs(dec(rest[0])); c.push([R.slice(dec(rest[0]), rest[1]), "Slice " + wsLabel(rest[1])]); break;
+    case "exchange": { const h = D.httpByKey.get(dec(rest[0]) + "#" + rest[1]); if (h) exCrumbs(h); break; }
+    case "workunits": c.push([R.workunits(), "Workunits"]); break;
+    case "workunit": { const w = D.wuById.get(rest[0]); if (w) wuCrumbs(w); else c.push([R.workunits(), "Workunits"]); break; }
+    case "bodies": c.push([R.bodies(), "Bodies"]); break;
+    case "body": {
+      const refs = D.bodyRefs.get(rest[0]) || [];
+      const h = refs[0]?.http;
+      if (h && h.workunit_id && D.wuById.get(h.workunit_id)) wuCrumbs(D.wuById.get(h.workunit_id));
+      else if (h) exCrumbs(h);
+      else c.push([R.bodies(), "Bodies"]);
+      c.push([R.body(rest[0]), (refs[0]?.dir || "body")]);
+      break;
+    }
+    case "packet": c.push([R.link(dec(rest[0])), "Link " + esc(dec(rest[0]))], [R.window(dec(rest[0]), rest[1]), "Window " + wsLabel(rest[1])],
+      [R.packet(dec(rest[0]), rest[1], rest[2]), "Packet " + rest[2]]); break;
+    case "events": c.push([R.events(), "Events"]); break;
+    case "convo": {
+      const h = D.httpByKey.get(dec(rest[0]) + "#" + rest[1]);
+      if (h && h.workunit_id && D.wuById.get(h.workunit_id)) wuCrumbs(D.wuById.get(h.workunit_id)); else if (h) exCrumbs(h);
+      c.push([R.convo(dec(rest[0]), rest[1]), "Conversation"]);
+      break;
+    }
+  }
+  return c;
+}
+
+let current = "";
+function route() {
+  if (!D) return;
+  const h = location.hash || "#/";
+  current = h;
+  const parts = h.replace(/^#\/?/, "").split("/").filter(Boolean);
+  const view = document.getElementById("view");
+  const dec = decodeURIComponent;
+  let html;
+  try {
+    switch (parts[0]) {
+      case undefined: html = vHome(); break;
+      case "link": html = vLink(dec(parts[1])); break;
+      case "flows": html = vFlows(dec(parts[1])); break;
+      case "window": html = vWindow(dec(parts[1]), parts[2]); break;
+      case "flow": html = vFlow(dec(parts[1])); break;
+      case "slice": html = vSlice(dec(parts[1]), parts[2]); break;
+      case "exchange": html = vExchange(dec(parts[1]), +parts[2]); break;
+      case "workunits": html = vWorkunits(); break;
+      case "workunit": html = vWorkunit(parts[1]); break;
+      case "bodies": html = vBodies(); break;
+      case "body": html = vBody(parts[1]); break;
+      case "packet": html = vPacket(dec(parts[1]), parts[2], +parts[3]); break;
+      case "events": html = vEvents(); break;
+      case "convo": html = vConvo(dec(parts[1]), +parts[2]); break;
+      default: html = "<p>Unknown view.</p>";
+    }
+  } catch (e) {
+    console.error(e);
+    html = `<p class="pill bad">Error: ${esc(e.message)}</p>`;
+  }
+  view.innerHTML = html;
+  view.scrollTop = 0;
+  document.getElementById("crumbs").innerHTML =
+    crumbsFor(parts).map(([href, t]) => a(href, t)).join('<span class="sep">›</span>');
+  hydrate(view);
+  syncTree(h);
+}
+window.addEventListener("hashchange", route);
+
+/* ===================== Views ===================== */
+function vHome() {
+  const t = D;
+  const wus = t.workunits.length;
+  let out = `<h2>${esc(D.name)}</h2><div class="sub">Collector output · ${D.windows.length} windows from ${esc(iso(D.windows[0]))}</div>`;
+  if (D.missing.length) out += `<p class="note">Missing tables: ${D.missing.map(esc).join(", ")}</p>`;
+  out += tiles([
+    [D.links.length, "Links"], [D.flowsById.size, "Flows"], [num(t.flows.length), "Slices"],
+    [num(t.http.length), "HTTP exchanges"], [wus, "Request Workunits"], [num(t.packets.length), "packets"],
+    [num(t.events.length), "events"], [D.bodyHashes.length, "bodies"],
+  ]);
+  out += `<div class="stacks">${D.links.map(l => stackChart("Link " + l, linkPoints(l))).join("")}</div>`;
+  out += `<h3>Links</h3><table><tr><th>Link</th><th class="num">Flows</th><th class="num">windows</th><th class="num">packets</th></tr>`;
+  for (const l of D.links) {
+    const flows = [...D.flowsById.values()].filter(f => f.link === l);
+    const pk = t.packets.filter(p => p.link === l).length;
+    const ws = t.chunks.filter(c => c.link === l).length;
+    out += `<tr class="click" data-href="${R.link(l)}"><td>${esc(l)}</td><td class="num">${flows.length}</td><td class="num">${ws}</td><td class="num">${num(pk)}</td></tr>`;
+  }
+  out += `</table>`;
+  out += `<h3>Request Workunits</h3>` + wuTable(t.workunits);
+  return out;
+}
+
+function vLink(l) {
+  const flows = [...D.flowsById.values()].filter(f => f.link === l);
+  const chunks = D.chunks.filter(c => c.link === l);
+  let out = `<h2>Link ${esc(l)}</h2><div class="sub">${flows.length} Flows over ${chunks.length} windows</div>`;
+  out += stackChart("Stream bytes on " + l + " by traffic class", linkPoints(l));
+  out += `<h3>Windows</h3><table><tr><th>window</th><th class="num">Slices</th><th class="num">packets</th><th class="num">truncated</th><th class="num">stored</th><th>chunk</th></tr>`;
+  for (const ws of D.windows) {
+    const c = D.chunkByLw.get(l + "@" + ws);
+    const sl = (D.slicesByWs.get(ws) || []).filter(s => s.link === l);
+    if (!c && !sl.length) continue;
+    out += `<tr class="click" data-href="${R.window(l, ws)}"><td title="${iso(ws)}">${wsLabel(ws)}</td><td class="num">${sl.length}</td>
+      <td class="num">${num(c?.packets)}</td><td class="num">${num(c?.truncated_packets)}</td>
+      <td class="num">${c ? bytes(c.stored_len) : "—"}</td><td>${hash(c?.chunk_hash)}</td></tr>`;
+  }
+  out += `</table>`;
+  out += `<h3>${a(R.flows(l), "Flows")}</h3>` + flowTable(flows);
+  return out;
+}
+
+function vFlows(l) {
+  const flows = [...D.flowsById.values()].filter(f => f.link === l);
+  return `<h2>Flows on ${esc(l)}</h2><div class="sub">${flows.length} Flows</div>` + flowTable(flows);
+}
+
+function flowTable(flows) {
+  flows = [...flows].sort((x, y) => y.wire - x.wire);
+  return bucketLegend() + `<table><tr><th>Flow</th><th>verdict</th><th class="num">Slices</th><th class="num">exchanges</th><th class="num">Workunits</th><th class="num">packets</th><th class="num">wire</th><th>stream bytes</th></tr>` +
+    flows.map(f => `<tr class="click" data-href="${R.flow(f.id)}"><td class="mono">${flowLabel(f)}</td><td>${f.verdict.split(", ").map(verdictPill).join(" ")}</td>
+      <td class="num">${f.slices.length}</td><td class="num">${f.exchanges.length}</td><td class="num">${f.workunits || ""}</td>
+      <td class="num">${num(f.packets)}</td><td class="num">${bytes(f.wire)}</td><td>${bucketBar(f.buckets)}</td></tr>`).join("") + `</table>`;
+}
+
+function vWindow(l, ws) {
+  const c = D.chunkByLw.get(l + "@" + ws);
+  const sl = (D.slicesByWs.get(ws) || []).filter(s => s.link === l);
+  const pk = D.packetsByLw.get(l + "@" + ws) || [];
+  let out = `<h2>Window ${wsLabel(ws)} on ${esc(l)}</h2><div class="sub">${esc(iso(ws))} · window_start_ns ${esc(ws)}</div>`;
+  if (c) {
+    out += `<h3>L0 chunk</h3>` + kv([
+      ["key", `<span class="mono">store/${esc(c.key)}</span>`],
+      ["chunk_hash", hash(c.chunk_hash, true)],
+      ["merkle_root", hash(c.merkle_root, true) + ` <button data-act="merkle" data-lw="${esc(l + "@" + ws)}">Recompute from packets</button> <span id="merkle-out"></span>`],
+      ["packets", `${num(c.packets)} (${num(c.truncated_packets)} truncated)`],
+      ["kept / truncated bytes", `${bytes(c.kept_bytes)} / ${bytes(c.truncated_bytes)}`],
+      ["pcapng / stored", `${bytes(c.pcapng_len)} / ${bytes(c.stored_len)} zstd`],
+    ]);
+  }
+  out += `<h3>Slices (${sl.length})</h3>` + sliceTable(sl, true);
+  out += `<h3>Packets (${num(pk.length)})</h3>` + packetTable(pk, true);
+  return out;
+}
+
+function sliceTable(slices, showFlow) {
+  return bucketLegend() + `<table><tr>${showFlow ? "<th>Flow</th>" : "<th>window</th>"}<th>verdict</th><th class="num">pkts o/r</th><th class="num">payload o/r</th><th>orig bytes</th><th>resp bytes</th><th>flags</th></tr>` +
+    slices.map(s => `<tr class="click" data-href="${R.slice(s.flow, s.window_start_ns)}">
+      <td class="${showFlow ? "mono" : ""}">${showFlow ? flowLabel(s.flow) : wsLabel(s.window_start_ns)}</td><td>${verdictPill(s.verdict)}</td>
+      <td class="num">${s.orig_stats.packets}/${s.resp_stats.packets}</td>
+      <td class="num">${bytes(s.orig_stats.payload_bytes)} / ${bytes(s.resp_stats.payload_bytes)}</td>
+      <td>${bucketBar(s.orig_bytes)}</td><td>${bucketBar(s.resp_bytes)}</td><td>${sliceFlags(s)}</td></tr>`).join("") + `</table>`;
+}
+function sliceFlags(s) {
+  const f = [];
+  if (s.mid_stream_start) f.push(pill("mid-stream", "warn"));
+  if (s.syn) f.push(pill("SYN")); if (s.syn_ack) f.push(pill("SYN-ACK"));
+  if (s.fin_orig) f.push(pill("FIN o")); if (s.fin_resp) f.push(pill("FIN r"));
+  if (s.rst) f.push(pill("RST", "warn")); if (s.ended) f.push(pill("ended"));
+  if (s.orig_desync || s.resp_desync) f.push(pill("desync", "bad"));
+  if (s.orig_stats.gap_bytes || s.resp_stats.gap_bytes) f.push(pill("gap", "warn"));
+  if (s.orig_stats.retransmit_diff_bytes || s.resp_stats.retransmit_diff_bytes) f.push(pill("retransmit differs", "bad"));
+  return f.join(" ");
+}
+
+function vFlow(id) {
+  const f = D.flowsById.get(id);
+  if (!f) return `<p>No Flow ${esc(id)}.</p>`;
+  const ev = D.eventsByFlow.get(id) || [];
+  let out = `<h2 class="mono">${flowLabel(f)}</h2><div class="sub mono">${esc(id)}</div>`;
+  out += tiles([[f.slices.length, "Slices"], [f.exchanges.length, "exchanges"], [f.workunits, "Workunits"],
+    [num(f.packets), "packets"], [bytes(f.wire), "on the wire"], [ev.length, "events"]]);
+  out += kv([["Link", a(R.link(f.link), esc(f.link))], ["kind", esc(f.kind)], ["orig", esc(f.orig)], ["resp", esc(f.resp)],
+    ["generation", esc(f.generation)], ["first seen", time(f.first_ts_ns)], ["verdict", f.verdict.split(", ").map(verdictPill).join(" ")],
+    ["stream bytes", bucketBar(f.buckets)]]);
+  out += stackChart("This Flow's stream bytes by traffic class", flowPoints(f));
+  if (f.exchanges.length) out += `<h3>HTTP exchanges</h3>` + exchangeTable(f.exchanges, false);
+  out += `<h3>Slices</h3>` + sliceTable(f.slices, false);
+  if (ev.length) out += `<h3>Events</h3>` + eventTable(ev);
+  return out;
+}
+
+function exchangeTable(list, showFlow) {
+  return `<table><tr>${showFlow ? "<th>Flow</th>" : ""}<th>#</th><th>request</th><th>bucket</th><th>received</th><th class="num">req body</th><th class="num">resp body</th><th>type</th></tr>` +
+    list.map(h => `<tr class="click" data-href="${R.exchange(h.flow, h.exchange)}">${showFlow ? `<td class="mono">${flowLabel(h.flow)}</td>` : ""}
+      <td>${h.exchange}</td><td class="mono">${exLabel(h)}</td><td>${pill(h.bucket, h.bucket === "workunit" ? "ok" : "")}</td>
+      <td>${time(h.request?.first_ts_ns ?? h.response?.first_ts_ns)}</td>
+      <td class="num">${bytes(h.request?.body_len)}</td><td class="num">${bytes(h.response?.body_len)}</td>
+      <td class="mono">${esc(h.response?.content_type || "")}</td></tr>`).join("") + `</table>`;
+}
+
+function vSlice(id, ws) {
+  const s = (D.flowsById.get(id)?.slices || []).find(x => x.window_start_ns === ws);
+  if (!s) return `<p>No Slice for ${esc(id)} at ${esc(ws)}.</p>`;
+  const pk = D.packetsBySlice.get(id + "@" + ws) || [];
+  const dirTable = (st, b, desync) => kv([
+    ["packets", num(st.packets)], ["wire / payload", `${bytes(st.wire_bytes)} / ${bytes(st.payload_bytes)}`],
+    st.datagrams ? ["datagrams", num(st.datagrams)] : ["stream range", `[${num(st.stream_start)}, ${num(st.stream_end)})`],
+    ["gap / retransmit / differs", `${num(st.gap_bytes)} / ${num(st.retransmit_bytes)} / ${num(st.retransmit_diff_bytes)}`],
+    ["slice_hash", hash(st.slice_hash)],
+    ["buckets", bucketBar(b) + `<div class="note">${BUCKETS.map(k => `${k} ${num(b?.[k] || 0)}`).join(" · ")}</div>`],
+    desync ? ["desync", `<span class="pill bad">${esc(JSON.stringify(desync))}</span>`] : null,
+  ]);
+  let out = `<h2>Slice ${wsLabel(ws)}</h2><div class="sub">${a(R.flow(id), flowLabel(id))} in ${a(R.window(s.link, ws), "window " + wsLabel(ws))}</div>`;
+  out += kv([["verdict", verdictPill(s.verdict)], ["Slice span", `${time(s.slice_first_ts_ns)} … ${time(s.slice_last_ts_ns)}`], ["flags", sliceFlags(s) || "—"]]);
+  out += `<div style="display:flex;gap:24px;flex-wrap:wrap"><div><h3>orig → resp</h3>${dirTable(s.orig_stats, s.orig_bytes, s.orig_desync)}</div>
+    <div><h3>resp → orig</h3>${dirTable(s.resp_stats, s.resp_bytes, s.resp_desync)}</div></div>`;
+  out += `<h3>Packets (${num(pk.length)})</h3>` + packetTable(pk, false);
+  return out;
+}
+
+function packetTable(pk, showFlow, limit = 300) {
+  const id = "pt" + Math.random().toString(36).slice(2);
+  PAGES[id] = { pk, showFlow, shown: 0 };
+  return `<table id="${id}"><tr><th class="num">#</th><th>time</th>${showFlow ? "<th>Flow</th>" : ""}<th>dir</th><th>flags</th><th class="num">stream_off</th><th class="num">payload</th><th class="num">cap/orig</th><th>hash</th><th>note</th></tr></table>
+    <div><button data-act="more" data-t="${id}">Show more</button> <span class="note" id="${id}-n"></span></div>`;
+}
+const PAGES = {};
+function morePackets(id, n = 300) {
+  const pg = PAGES[id]; const tbl = document.getElementById(id); if (!pg || !tbl) return;
+  const rows = pg.pk.slice(pg.shown, pg.shown + n);
+  tbl.insertAdjacentHTML("beforeend", rows.map(p => `<tr class="click" data-href="${R.packet(p.link, p.window_start_ns, p.index)}">
+    <td class="num">${p.index}</td><td>${time(p.ts_ns)}</td>${pg.showFlow ? `<td class="mono">${p.flow ? flowLabel(p.flow) : "—"}</td>` : ""}
+    <td>${esc(p.dir || "")}</td><td class="mono">${esc(p.tcp_flags || "")}</td><td class="num">${num(p.stream_off)}</td>
+    <td class="num">${num(p.payload_len)}</td><td class="num">${p.cap_len < p.orig_len ? `<span class="pill warn">${p.cap_len}/${p.orig_len}</span>` : p.cap_len}</td>
+    <td>${hash(p.hash)}</td><td>${esc(p.note || "")}</td></tr>`).join(""));
+  pg.shown += rows.length;
+  const btn = tbl.nextElementSibling.querySelector("button");
+  btn.hidden = pg.shown >= pg.pk.length;
+  document.getElementById(id + "-n").textContent = `${num(pg.shown)} of ${num(pg.pk.length)}`;
+}
+
+function vPacket(l, ws, i) {
+  const p = D.packetByKey.get(l + "@" + ws + "#" + i);
+  if (!p) return `<p>No packet.</p>`;
+  const segs = (D.segmentsByFlow.get(p.flow) || []).filter(s => s.window_start_ns === ws && s.index === i);
+  const c = D.chunkByLw.get(l + "@" + ws);
+  let out = `<h2>Packet ${i}</h2><div class="sub">in ${a(R.window(l, ws), "window " + wsLabel(ws))} on ${esc(l)}</div>`;
+  out += kv([
+    ["captured", time(p.ts_ns)], ["Flow", p.flow ? a(R.flow(p.flow), flowLabel(p.flow)) : "—"],
+    p.flow ? ["Slice", a(R.slice(p.flow, ws), "Slice " + wsLabel(ws))] : null,
+    ["dir", esc(p.dir || "—")], ["tcp_flags", esc(p.tcp_flags || "—")],
+    ["stream_off / payload_len", `${num(p.stream_off)} / ${num(p.payload_len)}`],
+    ["cap_len / orig_len", `${p.cap_len} / ${p.orig_len}${p.cap_len < p.orig_len ? " " + pill("truncated by Capture Rate", "warn") : ""}`],
+    ["hash", hash(p.hash, true)], ["note", esc(p.note || "—")],
+    c ? ["in chunk", `<span class="mono">store/${esc(c.key)}</span>, packet[${i}]`] : null,
+  ]);
+  if (segs.length) {
+    out += `<h3>Stream bytes carried (segments)</h3><table><tr><th>dir</th><th class="num">stream_off</th><th class="num">len</th><th class="num">pkt_off</th></tr>` +
+      segs.map(s => `<tr><td>${esc(s.dir)}</td><td class="num">${num(s.stream_off)}</td><td class="num">${num(s.len)}</td><td class="num">${s.pkt_off}</td></tr>`).join("") + `</table>`;
+  }
+  const ex = p.flow ? (D.flowsById.get(p.flow)?.exchanges || []).filter(h => {
+    const m = p.dir === "orig" ? h.request : h.response;
+    return m && p.payload_len && p.stream_off < m.stream_end && p.stream_off + p.payload_len > m.stream_start;
+  }) : [];
+  if (ex.length) out += `<h3>Part of</h3>` + exchangeTable(ex, false);
+  return out;
+}
+
+function vExchange(flow, n) {
+  const h = D.httpByKey.get(flow + "#" + n);
+  if (!h) return `<p>No exchange.</p>`;
+  const msg = (m, label) => !m ? `<p class="muted">No ${label}.</p>` : kv([
+    ["stream range", `[${num(m.stream_start)}, ${num(m.stream_end)}) ${m.dir}`],
+    ["time", `${time(m.first_ts_ns)} … ${time(m.last_ts_ns)}`],
+    m.method ? ["method / target", `<span class="mono">${esc(m.method)} ${esc(m.target)}</span>`] : ["status", esc(m.status)],
+    ["content_type", esc(m.content_type || "—")], ["content_encoding", esc(m.content_encoding || "—")],
+    ["body", `${bytes(m.body_len)}${m.body_gap_bytes ? " " + pill(num(m.body_gap_bytes) + " gap bytes", "warn") : ""}`],
+    ["body_hash", m.body_hash ? a(R.body(m.body_hash), hash(m.body_hash)) : hash(null)],
+    ["complete", m.complete ? pill("yes", "ok") : pill("no", "warn")],
+    ["carried by", packetsFor(flow, m)],
+  ]);
+  let out = `<h2 class="mono">${exLabel(h)}</h2><div class="sub">Exchange ${n} on ${a(R.flow(flow), flowLabel(flow))} · ${esc(h.http)}${h.h2_stream != null ? " stream " + h.h2_stream : ""}</div>`;
+  out += kv([["bucket", pill(h.bucket, h.bucket === "workunit" ? "ok" : "")],
+    ["Workunit", h.workunit_id ? a(R.workunit(h.workunit_id), hash(h.workunit_id)) : "—"],
+    ["interim responses", h.interim_responses], ["reset", h.reset ? pill("yes", "warn") : "no"]]);
+  out += `<div style="display:flex;gap:24px;flex-wrap:wrap"><div><h3>Request</h3>${msg(h.request, "request")}</div><div><h3>Response</h3>${msg(h.response, "response")}</div></div>`;
+  if (isChat(h)) out += `<h3>Conversation</h3><div class="convo" data-req="${h.request.body_hash}" data-resp="${h.response?.body_len ? h.response.body_hash || "" : ""}"
+      data-sse="${(h.response?.content_type || "").includes("event-stream") ? 1 : 0}"><p class="muted">Reading bodies…</p></div>`;
+  if (h.request?.body_hash && h.request.body_len) out += `<h3>Request body</h3>` + bodySlot(h.request.body_hash, h.request.content_type);
+  if (h.response?.body_hash && h.response.body_len) out += `<h3>Response body</h3>` + bodySlot(h.response.body_hash, h.response.content_type);
+  return out;
+}
+// An exchange that likely carries a chat: a JSON POST to a completion-style endpoint.
+function isChat(h) {
+  const q = h.request;
+  return !!(q?.body_hash && q.body_len && q.method === "POST" && (q.content_type || "").includes("json") &&
+    /complet|chat|generate|messages|responses/.test(q.target || ""));
+}
+function packetsFor(flow, m) {
+  const segs = (D.segmentsByFlow.get(flow) || []).filter(s => s.dir === m.dir && s.stream_off < m.stream_end && s.stream_off + s.len > m.stream_start);
+  if (!segs.length) return "—";
+  const first = segs[0], link = D.flowsById.get(flow)?.link;
+  const links = segs.slice(0, 12).map(s => a(R.packet(link, s.window_start_ns, s.index), `#${s.index}`)).join(" ");
+  return `${segs.length} packet${segs.length > 1 ? "s" : ""}: ${links}${segs.length > 12 ? " …" : ""} <span class="note">(window ${wsLabel(first.window_start_ns)})</span>`;
+}
+
+function wuTable(list) {
+  return `<table><tr><th>workunit_id</th><th>endpoint</th><th>model</th><th>stream</th><th>received</th><th class="num">duration</th><th class="num">tokens in/out</th><th>finish</th><th>complete</th></tr>` +
+    list.map(w => `<tr class="click" data-href="${R.workunit(w.workunit_id)}"><td>${hash(w.workunit_id)}</td><td class="mono">${esc(w.endpoint)}</td>
+      <td>${esc(w.model)}</td><td>${w.stream ? "SSE" : "JSON"}</td><td>${time(w.received_ts_ns)}</td>
+      <td class="num">${w.completed_ts_ns ? (Number(BigInt(w.completed_ts_ns) - BigInt(w.received_ts_ns)) / 1e9).toFixed(2) + "s" : "—"}</td>
+      <td class="num">${num(w.usage?.prompt_tokens)} / ${num(w.usage?.completion_tokens)}</td>
+      <td>${esc((w.finish_reason || []).map(f => f.finish_reason).join(", "))}</td><td>${w.complete ? pill("yes", "ok") : pill("no", "warn")}</td></tr>`).join("") + `</table>`;
+}
+function vWorkunits() { return `<h2>Request Workunits</h2><div class="sub">${D.workunits.length} on the Link</div>` + wuTable(D.workunits); }
+
+function vWorkunit(id) {
+  const w = D.wuById.get(id);
+  if (!w) return `<p>No Workunit ${esc(id)}.</p>`;
+  const rec = D.blobByWu.get(id);
+  let out = `<h2>Request Workunit</h2><div class="sub">${hash(id, true)}</div>`;
+  out += kv([
+    ["exchange", a(R.exchange(w.flow, w.exchange), `Exchange ${w.exchange}`) + " on " + a(R.flow(w.flow), flowLabel(w.flow))],
+    ["endpoint", `<span class="mono">${esc(w.endpoint)}</span> · ${esc(w.http)}`],
+    ["model / response_model", `${esc(w.model)} / ${esc(w.response_model)}`],
+    ["stream, seed, n", `${w.stream} · ${esc(w.seed ?? "null")} · ${esc(w.n ?? "null")}`],
+    ["received → completed", `${time(w.received_ts_ns)} → ${time(w.completed_ts_ns)}`],
+    ["status", `${esc(w.status)} ${esc(w.response_content_type)}`],
+    ["response_id", `<span class="mono">${esc(w.response_id)}</span>`],
+    ["finish_reason", esc(JSON.stringify(w.finish_reason))],
+    ["usage", `<span class="mono">${esc(JSON.stringify(w.usage))}</span>`],
+    ["request body", `${a(R.body(w.request_body_hash), hash(w.request_body_hash))} ${bytes(w.request_body_len)}`],
+    ["response body", `${a(R.body(w.response_body_hash), hash(w.response_body_hash))} ${bytes(w.response_body_len)}`],
+    w.sse_events ? ["SSE events", `${w.sse_events.length}, [DONE] ${w.sse_done ? "seen" : "missing"}`] : null,
+    ["complete", w.complete ? pill("yes", "ok") : pill("no", "warn")],
+    ["L3 record blob", rec ? `${hash(rec.hash)} in <span class="mono">${esc(rec.pack)}</span> @${rec.offset}+${rec.len}
+       <button data-act="record" data-wu="${id}">Verify record hash</button> <span id="rec-out"></span>` : '<span class="muted">not in blobs yet</span>'],
+  ]);
+  out += `<h3>Conversation</h3><div class="convo" data-req="${w.request_body_hash}" data-resp="${w.response_body_hash}" data-sse="${w.stream ? 1 : 0}"><p class="muted">Reading bodies…</p></div>`;
+  out += `<h3>Request body</h3>` + bodySlot(w.request_body_hash, "application/json");
+  out += `<h3>Response body</h3>` + bodySlot(w.response_body_hash, w.response_content_type);
+  return out;
+}
+
+function vBodies() {
+  const rows = D.bodyHashes.map(h => {
+    const refs = D.bodyRefs.get(h) || [], b = D.blobByHash.get(h), r = refs[0];
+    return `<tr class="click" data-href="${R.body(h)}"><td>${hash(h)}</td><td class="num">${bytes(r ? r.http[r.dir]?.body_len : b?.raw_len)}</td>
+      <td>${r ? esc(r.dir) + " of " + `<span class="mono">${exLabel(r.http)}</span>` : "—"}</td><td class="num">${refs.length}</td>
+      <td>${FILES.has("bodies/" + h) ? pill("bodies/", "ok") : pill("not local")}</td><td>${b ? `<span class="mono">${esc(b.pack.split("/").pop())}</span>` : "—"}</td></tr>`;
+  });
+  return `<h2>Bodies</h2><div class="sub">${D.bodyHashes.length} distinct, named by BLAKE3 multihash</div>
+    <table><tr><th>hash</th><th class="num">size</th><th>first seen as</th><th class="num">refs</th><th>file</th><th>pack</th></tr>${rows.join("")}</table>`;
+}
+
+function vBody(h) {
+  const refs = D.bodyRefs.get(h) || [], b = D.blobByHash.get(h);
+  const ct = refs[0]?.http[refs[0].dir]?.content_type;
+  let out = `<h2>Body</h2><div class="sub">${hash(h, true)}</div>`;
+  out += kv([
+    ["referenced by", refs.map(r => `${esc(r.dir)} of ${a(R.exchange(r.http.flow, r.http.exchange), exLabel(r.http))}` +
+      (r.http.workunit_id ? " · " + a(R.workunit(r.http.workunit_id), "Workunit") : "")).join("<br>") || "—"],
+    ["local file", FILES.has("bodies/" + h) ? `<span class="mono">bodies/${esc(h)}</span>` : '<span class="muted">not in folder</span>'],
+    b ? ["pack", `<span class="mono">store/${esc(b.pack)}</span> @${b.offset}+${b.len} (decoded ${bytes(b.raw_len)})`] : null,
+  ]);
+  out += `<h3>Contents</h3>` + bodySlot(h, ct);
+  return out;
+}
+
+function eventTable(ev) {
+  return `<table><tr><th>kind</th><th>Flow</th><th>dir</th><th class="num">stream_off</th><th class="num">len</th><th>packet</th></tr>` +
+    ev.map(e => `<tr><td>${pill(e.kind, e.kind.startsWith("gap") ? "warn" : "bad")}</td><td>${a(R.flow(e.flow), flowLabel(e.flow))}</td><td>${esc(e.dir || "—")}</td>
+      <td class="num">${num(e.stream_off)}</td><td class="num">${num(e.len)}</td>
+      <td>${e.window_start_ns ? a(R.packet(D.flowsById.get(e.flow)?.link, e.window_start_ns, e.index), `#${e.index} @ ${wsLabel(e.window_start_ns)}`) : "—"}</td></tr>`).join("") + `</table>`;
+}
+function vConvo(flow, n) {
+  const h = D.httpByKey.get(flow + "#" + n);
+  if (!h || !isChat(h)) return `<p>No conversation in this exchange.</p>`;
+  const w = h.workunit_id && D.wuById.get(h.workunit_id);
+  return `<h2>Conversation</h2><div class="sub">${a(R.exchange(flow, n), exLabel(h))}${w ? " · " + a(R.workunit(w.workunit_id), "Request Workunit") + " · " + esc(w.model) : " · " + pill(h.bucket)}</div>
+    <p class="note">Rebuilt from the bodies as captured on the Link. Turns from a templated prompt and merged SSE text are derived views; the raw bodies are the evidence.</p>
+    <div class="convo" data-req="${h.request.body_hash}" data-resp="${h.response?.body_len ? h.response.body_hash || "" : ""}"
+      data-sse="${(h.response?.content_type || "").includes("event-stream") ? 1 : 0}"><p class="muted">Reading bodies…</p></div>`;
+}
+function vEvents() {
+  return `<h2>Events</h2><div class="sub">Gaps and anomalies the reassembler saw</div>` +
+    (D.events.length ? eventTable(D.events) : `<p class="muted">No events in this capture.</p>`);
+}
+
+/* ===================== Bodies: lazy read, verify, render ===================== */
+function bodySlot(h, ct) {
+  return `<div class="bodyslot" data-hash="${h}" data-ct="${esc(ct || "")}"><p class="muted">Reading…</p></div>`;
+}
+async function readBody(h) {
+  const f = FILES.get("bodies/" + h);
+  if (!f) return null;
+  return new Uint8Array(await f.arrayBuffer());
+}
+const utf8 = new TextDecoder("utf-8", { fatal: false });
+
+function sseEvents(text) {
+  return text.split(/\r?\n\r?\n/).filter(e => e.trim()).map(e => {
+    const data = e.split(/\r?\n/).filter(l => l.startsWith("data:")).map(l => l.slice(5).replace(/^ /, "")).join("\n");
+    let json = null; try { json = JSON.parse(data); } catch {}
+    return { raw: e, data, json };
+  });
+}
+// Joined text of a streamed response: OpenAI chunks (choices[].delta) or llama.cpp /completion (content).
+function sseMerged(evs) {
+  let content = "", reasoning = "";
+  for (const e of evs) {
+    const j = e.json; if (!j) continue;
+    if (Array.isArray(j.choices)) for (const c of j.choices) {
+      content += c.delta?.content ?? c.text ?? "";
+      reasoning += c.delta?.reasoning ?? c.delta?.reasoning_content ?? "";
+    } else if (typeof j.content === "string") content += j.content;
+  }
+  return { content, reasoning };
+}
+
+async function fillBody(slot) {
+  const h = slot.dataset.hash, ct = slot.dataset.ct;
+  const bytesArr = await readBody(h);
+  if (!bytesArr) { slot.innerHTML = `<p class="muted">Not in the folder (bodies/ missing, or run with --no-bodies).</p>`; return; }
+  const text = utf8.decode(bytesArr);
+  const isSse = ct.includes("event-stream") || /^data:/.test(text);
+  let pretty = null;
+  if (!isSse) { try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {} }
+  const binary = /[\x00-\x08\x0e-\x1f]/.test(text.slice(0, 4096));
+  const tabs = [];
+  if (isSse) {
+    const evs = sseEvents(text), m = sseMerged(evs);
+    tabs.push(["merged", `<p class="note">Derived view: the joined content of ${evs.length} events. Not evidence; the raw body is.</p>` +
+      (m.reasoning ? `<div class="msg"><div class="role">reasoning</div><pre>${esc(m.reasoning)}</pre></div>` : "") +
+      `<div class="msg"><div class="role">content</div><pre>${esc(m.content)}</pre></div>`]);
+    tabs.push(["events", `<table><tr><th class="num">#</th><th>data</th></tr>${evs.slice(0, 2000).map((e, i) =>
+      `<tr><td class="num">${i}</td><td class="mono">${esc(e.data.length > 300 ? e.data.slice(0, 300) + "…" : e.data)}</td></tr>`).join("")}</table>`]);
+  }
+  if (pretty) tabs.push(["json", `<pre class="body">${esc(pretty)}</pre>`]);
+  tabs.push([binary ? "hex" : "raw", `<pre class="body">${binary ? hexdump(bytesArr) : esc(text)}</pre>`]);
+  const id = "b" + Math.random().toString(36).slice(2);
+  slot.innerHTML = `<div class="tabs">${tabs.map(([n], i) => `<button class="${i ? "" : "on"}" data-act="tab" data-g="${id}" data-i="${i}">${n}</button>`).join("")}
+      <span style="flex:1"></span><button data-act="verify" data-hash="${h}">Verify BLAKE3</button> <span class="vout"></span></div>` +
+    tabs.map(([, body], i) => `<div class="tabp" data-g="${id}" data-i="${i}" ${i ? "hidden" : ""}>${body}</div>`).join("") +
+    `<p class="note">${bytes(bytesArr.length)} · bodies/${esc(h)}</p>`;
+}
+function hexdump(b) {
+  let out = "";
+  for (let i = 0; i < Math.min(b.length, 16384); i += 16) {
+    const row = b.slice(i, i + 16);
+    out += i.toString(16).padStart(8, "0") + "  " + Array.from(row, x => x.toString(16).padStart(2, "0")).join(" ").padEnd(48) +
+      "  " + Array.from(row, x => x >= 32 && x < 127 ? String.fromCharCode(x) : ".").join("") + "\n";
+  }
+  return esc(out);
+}
+
+// Turns of a raw templated prompt (e.g. llama.cpp /completion): Gemma-style <|turn>role ... <turn|>,
+// ChatML <|im_start|>role ... <|im_end|>, Llama-3 <|start_header_id|>role<|end_header_id|> ... <|eot_id|>.
+function promptTurns(p) {
+  const pats = [
+    /<\|turn>(\w+)\n([\s\S]*?)(?:<turn\|>|$)/g,
+    /<\|im_start\|>(\w+)\n([\s\S]*?)(?:<\|im_end\|>|$)/g,
+    /<\|start_header_id\|>(\w+)<\|end_header_id\|>\n*([\s\S]*?)(?:<\|eot_id\|>|$)/g,
+  ];
+  for (const re of pats) {
+    const turns = [...p.matchAll(re)].map(m => ({ role: m[1], content: m[2].trim() })).filter(t => t.content);
+    if (turns.length) return turns;
+  }
+  return [{ role: "prompt", content: p }];
+}
+// Split model "thinking" channels out of generated text.
+function splitThought(text) {
+  let reasoning = "";
+  const content = text.replace(/<\|channel>(?:thought|analysis)?\n?([\s\S]*?)(?:<channel\|>|$)/g, (_, r) => { reasoning += r; return ""; })
+    .replace(/<think>([\s\S]*?)(?:<\/think>|$)/g, (_, r) => { reasoning += r; return ""; });
+  return { content: content.trim(), reasoning: reasoning.trim() };
+}
+const bubble = (role, text, extra = "") =>
+  `<div class="msg ${role === "user" ? "user" : role === "assistant" || role === "model" ? "asst" : ""}"><div class="role">${esc(role)}${extra}</div><pre>${esc(text)}</pre></div>`;
+
+async function fillConvo(el) {
+  const [req, resp] = await Promise.all([readBody(el.dataset.req), el.dataset.resp ? readBody(el.dataset.resp) : null]);
+  if (!req) { el.innerHTML = `<p class="muted">Request body not in the folder.</p>`; return; }
+  let html = "";
+  try {
+    const q = JSON.parse(utf8.decode(req));
+    for (const m of q.messages || []) {
+      const c = typeof m.content === "string" ? m.content
+        : Array.isArray(m.content) ? m.content.map(p => p.text ?? JSON.stringify(p)).join("\n") : JSON.stringify(m.content, null, 2);
+      html += bubble(m.role, c);
+    }
+    if (typeof q.prompt === "string") for (const t of promptTurns(q.prompt)) html += bubble(t.role, t.content);
+  } catch { html += `<p class="muted">Request body is not JSON.</p>`; }
+  if (!resp) { el.innerHTML = html + `<p class="muted">No response body.</p>`; return; }
+  try {
+    const text = utf8.decode(resp);
+    const show = (role, content, reasoning, extra) => {
+      const s = splitThought(content || "");
+      const r = [reasoning, s.reasoning].filter(Boolean).join("\n");
+      if (r) html += `<details class="msg"><summary class="role">${esc(role)} · reasoning (${num(r.length)} chars)</summary><pre>${esc(r)}</pre></details>`;
+      html += bubble(role, s.content, extra);
+    };
+    if (el.dataset.sse === "1" || /^data:/.test(text)) {
+      const evs = sseEvents(text), m = sseMerged(evs);
+      show("assistant", m.content, m.reasoning, ` · merged from ${evs.length} SSE events`);
+    } else {
+      const r = JSON.parse(text);
+      if (Array.isArray(r.choices)) for (const c of r.choices) {
+        const msg = c.message || {};
+        show(msg.role || "assistant", msg.content ?? c.text ?? "", msg.reasoning || msg.reasoning_content, ` · choice ${c.index} · ${esc(c.finish_reason)}`);
+      } else if (typeof r.content === "string") show("assistant", r.content, "", "");
+      else html += `<p class="muted">Response is not a completion.</p>`;
+    }
+  } catch { html += `<p class="muted">Response body did not parse.</p>`; }
+  el.innerHTML = html;
+}
+
+function hydrate(root) {
+  root.querySelectorAll(".bodyslot").forEach(fillBody);
+  root.querySelectorAll(".convo").forEach(fillConvo);
+  for (const id in CHARTS) if (!document.getElementById(id)) delete CHARTS[id];
+  for (const id in PAGES) if (document.getElementById(id)) { if (!PAGES[id].shown) morePackets(id); } else delete PAGES[id];
+}
+
+document.addEventListener("click", async e => {
+  const act = e.target.closest("[data-act]");
+  if (act) {
+    const d = act.dataset;
+    if (d.act === "more") morePackets(d.t);
+    if (d.act === "mode") {
+      chartMode = d.m;
+      document.querySelectorAll(".stack").forEach(box => {
+        if (!CHARTS[box.id]) return;
+        box.querySelector(".stack-plot").innerHTML = chartSvg(box.id);
+        box.querySelectorAll('[data-act="mode"]').forEach(b => b.classList.toggle("on", b.dataset.m === chartMode));
+      });
+    }
+    if (d.act === "tab") {
+      document.querySelectorAll(`[data-g="${d.g}"]`).forEach(x => {
+        if (x.classList.contains("tabp")) x.hidden = x.dataset.i !== d.i; else x.classList.toggle("on", x.dataset.i === d.i);
+      });
+    }
+    if (d.act === "verify") {
+      const out = act.nextElementSibling;
+      const b = await readBody(d.hash);
+      const got = B3.mh(b);
+      out.innerHTML = got === d.hash ? pill("matches its name", "ok") : pill("mismatch", "bad") + " got " + hash(got, true);
+    }
+    if (d.act === "merkle") {
+      const pk = (D.packetsByLw.get(d.lw) || []).slice().sort((x, y) => x.index - y.index);
+      const c = D.chunkByLw.get(d.lw);
+      const got = merkleRoot(pk.map(p => p.hash));
+      document.getElementById("merkle-out").innerHTML = got === c.merkle_root
+        ? pill(`matches (${pk.length} packet hashes)`, "ok") : pill("mismatch", "bad") + " got " + hash(got, true);
+    }
+    if (d.act === "record") {
+      const w = D.wuById.get(d.wu), rec = D.blobByWu.get(d.wu);
+      const got = B3.mh(new TextEncoder().encode(w._raw));
+      document.getElementById("rec-out").innerHTML = got === rec.hash ? pill("row JSON matches blob hash", "ok") : pill("mismatch", "bad") + " got " + hash(got, true);
+    }
+    return;
+  }
+  if (e.target.closest("a, .hash")) return;
+  const tr = e.target.closest("[data-href]");
+  if (tr) go(tr.dataset.href);
+});
+
+/* ===================== Tree ===================== */
+// Lazily built: each node has {label, href, kind, count, kids: () => [...]}
+function treeRoot() {
+  return {
+    label: D.name, href: R.home(), kind: "cap", open: true,
+    kids: () => [
+      ...D.links.map(l => ({
+        label: l, href: R.link(l), kind: "link", open: true,
+        kids: () => [
+          { label: "Flows", href: R.flows(l), kind: "", count: [...D.flowsById.values()].filter(f => f.link === l).length,
+            kids: () => [...D.flowsById.values()].filter(f => f.link === l).sort((x, y) => y.wire - x.wire).map(flowNode) },
+          { label: "Windows", href: R.link(l), kind: "", count: D.windows.length,
+            kids: () => D.windows.filter(ws => D.chunkByLw.has(l + "@" + ws) || (D.slicesByWs.get(ws) || []).some(s => s.link === l)).map(ws => ({
+              label: wsLabel(ws), href: R.window(l, ws), kind: "win", count: (D.slicesByWs.get(ws) || []).filter(s => s.link === l).length,
+              kids: () => (D.slicesByWs.get(ws) || []).filter(s => s.link === l).map(s => ({
+                label: flowLabel(s.flow), href: R.slice(s.flow, ws), kind: "slice" })) })) },
+        ],
+      })),
+      { label: "Request Workunits", href: R.workunits(), kind: "", count: D.workunits.length,
+        kids: () => D.workunits.map(w => wuNode(w)) },
+      { label: "Bodies", href: R.bodies(), kind: "", count: D.bodyHashes.length,
+        kids: () => D.bodyHashes.map(h => ({ label: mhShort(h), href: R.body(h), kind: "body" })) },
+      { label: "Events", href: R.events(), kind: "", count: D.events.length },
+    ],
+  };
+}
+function flowNode(f) {
+  return {
+    label: flowLabel(f), href: R.flow(f.id), kind: "flow", count: f.workunits ? `${f.workunits} WU` : "",
+    kids: () => [
+      ...f.exchanges.map(h => ({
+        label: exLabel(h), href: R.exchange(h.flow, h.exchange), kind: "http",
+        kids: h.workunit_id && D.wuById.has(h.workunit_id) ? () => [wuNode(D.wuById.get(h.workunit_id))] : bodyKids(h),
+        count: isChat(h) ? "chat" : "",
+      })),
+      ...f.slices.map(s => ({ label: "Slice " + wsLabel(s.window_start_ns), href: R.slice(f.id, s.window_start_ns), kind: "slice",
+        count: s.orig_stats.packets + s.resp_stats.packets })),
+    ],
+  };
+}
+function bodyKids(h) {
+  const k = [];
+  if (isChat(h)) k.push({ label: "conversation", href: R.convo(h.flow, h.exchange), kind: "chat" });
+  if (h.request?.body_hash && h.request.body_len) k.push({ label: "request body", href: R.body(h.request.body_hash), kind: "body" });
+  if (h.response?.body_hash && h.response.body_len) k.push({ label: "response body", href: R.body(h.response.body_hash), kind: "body" });
+  return k.length ? () => k : null;
+}
+function wuNode(w) {
+  return {
+    label: `${w.model} ${w.endpoint}`, href: R.workunit(w.workunit_id), kind: "wu",
+    kids: () => [
+      { label: "conversation", href: R.convo(w.flow, w.exchange), kind: "chat" },
+      { label: "request body", href: R.body(w.request_body_hash), kind: "body" },
+      { label: "response body", href: R.body(w.response_body_hash), kind: "body" },
+    ],
+  };
+}
+
+function renderNode(n, depth) {
+  const el = document.createElement("div");
+  el.className = "node";
+  el.innerHTML = `<div class="row" style="--d:${depth}" data-node-href="${n.href}"><span class="tw">${n.kids ? (n.open ? "▾" : "▸") : ""}</span>
+    ${n.kind ? `<span class="kind">${esc(n.kind)}</span>` : ""}<span class="lbl" title="${esc(n.label.replace(/<[^>]+>/g, ""))}">${n.label}</span>
+    ${n.count !== undefined && n.count !== "" ? `<span class="cnt">${n.count}</span>` : ""}</div><div class="kids"></div>`;
+  const row = el.firstElementChild, kidsEl = el.lastElementChild, tw = row.querySelector(".tw");
+  let built = false;
+  const toggle = open => {
+    n.open = open;
+    tw.textContent = n.kids ? (open ? "▾" : "▸") : "";
+    if (open && !built && n.kids) { for (const k of n.kids()) kidsEl.appendChild(renderNode(k, depth + 1)); built = true; }
+    kidsEl.hidden = !open;
+  };
+  row.addEventListener("click", e => {
+    if (e.target === tw) { toggle(!n.open); return; }
+    if (n.kids && !n.open) toggle(true);
+    go(n.href);
+  });
+  el._toggle = toggle;
+  el._node = n;
+  toggle(!!n.open);
+  return el;
+}
+function buildTree() {
+  const t = document.getElementById("tree");
+  t.innerHTML = "";
+  t.appendChild(renderNode(treeRoot(), 0));
+}
+function syncTree(h) {
+  const rows = document.querySelectorAll("#tree .row");
+  let hit = null;
+  rows.forEach(r => { const on = r.dataset.nodeHref === h; r.classList.toggle("sel", on); if (on && !hit) hit = r; });
+  if (hit) hit.scrollIntoView({ block: "nearest" });
+}
+
+/* ===================== Wiring ===================== */
+document.getElementById("pick").addEventListener("change", e => loadFileList(e.target.files));
+const drop = document.getElementById("drop");
+document.addEventListener("dragover", e => { e.preventDefault(); drop?.classList.add("over"); });
+document.addEventListener("dragleave", () => drop?.classList.remove("over"));
+document.addEventListener("drop", async e => {
+  e.preventDefault();
+  drop?.classList.remove("over");
+  const items = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry?.()).filter(Boolean);
+  const dir = items.find(i => i.isDirectory);
+  if (!dir) return alert("Drop a folder.");
+  const out = new Map();
+  const reader = dir.createReader();
+  let batch;
+  do {
+    batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+    for (const ent of batch) await readDropped(ent, "", out);
+  } while (batch.length);
+  await loadFiles(out, dir.name);
+});
+</script>
+</body>
+</html>

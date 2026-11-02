@@ -187,6 +187,15 @@ sg wireshark -c "target/debug/collector -v --metrics-addr 127.0.0.1:9464 ring -i
 
 Offline, without dumpcap: `target/debug/collector -v files -w 1 -o /tmp/ts crates/collector/tests/fixtures/openai_h1_sse.pcapng` logs two `workunit` lines, matching `crates/collector/tests/golden/openai_h1_sse/workunits.jsonl`.
 
+### Viewer
+
+`viewer/index.html` browses an output folder in the browser: open the file, then pick or drop the folder. It is plain HTML and JS with no build step, and reads files locally.
+
+- Navigate Link › Flow › Slice or Exchange › Request Workunit › conversation, with packets, windows, bodies and events linked both ways.
+- Hashes show their multihash type and digest. BLAKE3 in the page checks a body against its name, a chunk's `merkle_root` against its packet hashes, and a Workunit record against its blob.
+- Stacked graphs per Link and Flow over windows: Workunit (`workunit`), Other HTTP (`http_other` + `framing`), Unexplained (`unexplained` + `gap`). These group buckets; they are not statuses.
+- Reads the JSONL tables and `bodies/`, not the Parquet index or the stored chunks.
+
 ## Tests
 
 ```sh
