@@ -32,7 +32,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -109,17 +109,30 @@ impl Ingest {
         })
     }
 
-    /// POSTs one manifest line; returns the HTTP status.
-    fn post(&self, key: &str, body: &[u8], timeout: Duration) -> Result<(u16, String), ShipError> {
+    /// POSTs one manifest line; returns the HTTP status. Gives up once
+    /// `until()` has passed; it is asked again while the response is awaited,
+    /// so a deadline that moves closer cuts the request short.
+    fn post(
+        &self,
+        key: &str,
+        body: &[u8],
+        until: &mut dyn FnMut() -> Instant,
+    ) -> Result<(u16, String), ShipError> {
         let unavailable = |e: io::Error| ShipError::Unavailable(format!("{}:{}: {e}", self.host, self.port));
+        let mut left = || match until().checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => Ok(d),
+            _ => Err(ShipError::Unavailable(format!(
+                "{}:{}: timed out",
+                self.host, self.port
+            ))),
+        };
         let addr = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .map_err(unavailable)?
             .next()
             .ok_or_else(|| ShipError::Unavailable(format!("{}: no address", self.host)))?;
-        let mut conn = TcpStream::connect_timeout(&addr, timeout).map_err(unavailable)?;
-        conn.set_read_timeout(Some(timeout)).map_err(unavailable)?;
-        conn.set_write_timeout(Some(timeout)).map_err(unavailable)?;
+        let mut conn = TcpStream::connect_timeout(&addr, left()?).map_err(unavailable)?;
+        conn.set_write_timeout(Some(left()?)).map_err(unavailable)?;
         let host = if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
         } else {
@@ -133,7 +146,18 @@ impl Ingest {
         conn.write_all(head.as_bytes()).map_err(unavailable)?;
         conn.write_all(body).map_err(unavailable)?;
         let mut resp = Vec::new();
-        conn.take(64 << 10).read_to_end(&mut resp).map_err(unavailable)?;
+        let mut buf = [0u8; 4096];
+        while resp.len() < 64 << 10 {
+            conn.set_read_timeout(Some(left()?.min(SLICE)))
+                .map_err(unavailable)?;
+            match conn.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => resp.extend_from_slice(&buf[..n]),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(unavailable(e)),
+            }
+        }
         let text = String::from_utf8_lossy(&resp);
         let status = text
             .lines()
@@ -183,6 +207,18 @@ fn dedup_key(line: &[u8]) -> Option<String> {
 /// and stops at the first failure. The cursor advances past each line the
 /// ingest accepts.
 pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Shipped, ShipError> {
+    ship_within(out, ingest, timeout, &mut || None)
+}
+
+/// [`ship_pending`], stopping at the deadline `shutdown()` returns once it
+/// has one. It is asked before each line and during each request, and
+/// bounds each request's timeout. Lines left when it passes stay pending.
+fn ship_within(
+    out: &Path,
+    ingest: &Ingest,
+    timeout: Duration,
+    shutdown: &mut dyn FnMut() -> Option<Instant>,
+) -> Result<Shipped, ShipError> {
     let mut shipped = Shipped::default();
     let file = match File::open(out.join(LOG)) {
         Ok(f) => f,
@@ -203,21 +239,24 @@ pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Sh
     reader.seek(SeekFrom::Start(offset))?;
     let mut line = Vec::new();
     let mut result = Ok(());
+    let mut out_of_time = false;
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line)?;
         if n == 0 || line.last() != Some(&b'\n') {
             break; // the end, or a line still being written
         }
-        if result.is_err() {
+        if result.is_err() || out_of_time || shutdown().is_some_and(|d| Instant::now() >= d) {
+            out_of_time |= result.is_ok();
             shipped.pending += 1;
             continue;
         }
         let body = &line[..line.len() - 1];
+        let request = Instant::now() + timeout;
         let sent = match dedup_key(body) {
             None => Err(ShipError::BadLine(offset)),
             Some(key) => ingest
-                .post(&key, body, timeout)
+                .post(&key, body, &mut || shutdown().map_or(request, |d| d.min(request)))
                 .and_then(|(status, text)| match status {
                     200..=299 => {
                         debug!(window = %key, status, "manifest shipped");
@@ -262,8 +301,10 @@ impl Shipper {
         Ok(Shipper { stop, thread })
     }
 
-    /// Ships what is left, retrying for up to `wait` while the ingest is
-    /// unavailable, and returns the totals. Lines still pending stay in the log for later.
+    /// Ships what is left within `wait`, retrying while the ingest is
+    /// unavailable, and returns the totals. Returns within `wait` (plus
+    /// [`SLICE`]) however slow the ingest is; lines still pending stay in
+    /// the log for later.
     pub fn finish(self, wait: Duration) -> Result<Shipped, ShipError> {
         let _ = self.stop.send(Instant::now() + wait);
         self.thread
@@ -274,6 +315,9 @@ impl Shipper {
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest a request waits on the socket before the shutdown deadline
+/// is checked again.
+const SLICE: Duration = Duration::from_millis(50);
 
 fn run(
     out: &Path,
@@ -285,7 +329,18 @@ fn run(
     let mut backoff = poll;
     let mut deadline: Option<Instant> = None;
     loop {
-        let pass = ship_pending(out, ingest, TIMEOUT);
+        // A shutdown request is taken up between lines and mid-request, not
+        // only between passes.
+        let pass = ship_within(out, ingest, TIMEOUT, &mut || {
+            if deadline.is_none() {
+                match stopped.try_recv() {
+                    Ok(d) => deadline = Some(d),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => deadline = Some(Instant::now()),
+                }
+            }
+            deadline
+        });
         let wait = match pass {
             Ok(s) => {
                 total.sent += s.sent;
@@ -405,5 +460,103 @@ mod tests {
         assert!(err.retryable(), "{err}");
         assert_eq!(pending_lines(dir.path()).unwrap(), 2);
         assert_eq!(read_cursor(dir.path()).unwrap(), 0);
+    }
+
+    /// A log of `n` manifest lines in a fresh directory.
+    fn log_of(n: u64) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let text: String = (0..n)
+            .map(|w| format!("{{\"collector\":\"c\",\"window_start_ns\":{w}}}\n"))
+            .collect();
+        std::fs::write(dir.path().join(LOG), text).unwrap();
+        dir
+    }
+
+    /// An ingest that reads each request, waits `delay`, then accepts it
+    /// with 200. `None` never answers.
+    fn slow_ingest(delay: Option<Duration>) -> Ingest {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Head, then a body of Content-Length bytes.
+                while !String::from_utf8_lossy(&req)
+                    .split_once("\r\n\r\n")
+                    .is_some_and(|(head, body)| {
+                        head.lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .is_some_and(|n| body.len() >= n.parse().unwrap())
+                    })
+                {
+                    let n = conn.read(&mut buf).unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                }
+                match delay {
+                    Some(d) => {
+                        std::thread::sleep(d);
+                        let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    None => held.push(conn),
+                }
+            }
+        });
+        Ingest::parse(&format!("http://127.0.0.1:{port}/")).unwrap()
+    }
+
+    #[test]
+    fn a_hung_ingest_does_not_hold_shutdown() {
+        let dir = log_of(3);
+        let shipper =
+            Shipper::spawn(dir.path().to_owned(), slow_ingest(None), Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(100)); // the first POST is waiting
+        let t0 = Instant::now();
+        let res = shipper.finish(Duration::from_millis(300));
+        let took = t0.elapsed();
+        // Bounded by the budget, not by the 10 s request timeout.
+        assert!(took < Duration::from_secs(1), "finish took {took:?}");
+        assert!(res.unwrap_err().retryable());
+        assert_eq!(pending_lines(dir.path()).unwrap(), 3);
+        assert_eq!(read_cursor(dir.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_slow_ingest_stops_at_the_budget_and_keeps_the_rest() {
+        let dir = log_of(20);
+        let shipper = Shipper::spawn(
+            dir.path().to_owned(),
+            slow_ingest(Some(Duration::from_millis(100))),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        let res = shipper.finish(Duration::from_millis(450));
+        let took = t0.elapsed();
+        assert!(took < Duration::from_millis(1200), "finish took {took:?}");
+        // Some lines went, the rest are still pending past the cursor.
+        let pending = pending_lines(dir.path()).unwrap();
+        assert!((1..20).contains(&pending), "{pending} pending");
+        if let Ok(s) = res {
+            assert_eq!((s.sent, s.pending), (20 - pending, pending));
+        }
+
+        // A later pass ships exactly what was left.
+        let ingest = slow_ingest(Some(Duration::ZERO));
+        let s = ship_pending(dir.path(), &ingest, Duration::from_secs(5)).unwrap();
+        assert_eq!((s.sent, s.pending), (pending, 0));
+    }
+
+    #[test]
+    fn a_zero_budget_starts_no_request() {
+        let dir = log_of(2);
+        let shipper =
+            Shipper::spawn(dir.path().to_owned(), slow_ingest(None), Duration::from_secs(1)).unwrap();
+        let s = shipper.finish(Duration::ZERO);
+        // The first POST may have begun before the stop; it is cut short.
+        assert!(s.map_or_else(|e| e.retryable(), |s| s.pending == 2));
+        assert_eq!(pending_lines(dir.path()).unwrap(), 2);
     }
 }
