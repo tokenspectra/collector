@@ -133,6 +133,10 @@ enum Cmd {
         /// Capture filter (dumpcap `-f`).
         #[arg(short, long)]
         filter: Option<String>,
+        /// Kernel capture buffer in MiB (dumpcap `-B`); raise it if dumpcap
+        /// reports drops on bursty traffic.
+        #[arg(short = 'B', long)]
+        buffer_mib: Option<u32>,
         #[arg(long, default_value = "dumpcap")]
         dumpcap: PathBuf,
         /// Output directory for the JSONL tables.
@@ -221,6 +225,7 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ring_dir,
             duration_s,
             filter,
+            buffer_mib,
             dumpcap,
             out,
         } => {
@@ -231,7 +236,10 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             cfg.autostop_s = duration_s;
             cfg.dumpcap = dumpcap;
             if let Some(f) = filter {
-                cfg.extra_args = vec!["-f".into(), f];
+                cfg.extra_args.extend(["-f".into(), f]);
+            }
+            if let Some(b) = buffer_mib {
+                cfg.extra_args.extend(["-B".into(), b.to_string()]);
             }
             (Box::new(RingSource::spawn(&cfg)?), window_s, out)
         }
