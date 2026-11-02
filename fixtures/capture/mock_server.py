@@ -24,10 +24,11 @@ import h2.connection
 import h2.events
 
 import mock_openai
+import mock_openai_responses
 from mock_common import Reply
 
 # One line per Wire Protocol. Earlier modules win a (method, path) clash.
-PROTOCOLS = [mock_openai]
+PROTOCOLS = [mock_openai, mock_openai_responses]
 
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # Delay between stream frames, so each one leaves in its own TCP segment.

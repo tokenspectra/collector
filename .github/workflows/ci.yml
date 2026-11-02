@@ -21,3 +21,49 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+
+  # Reports how much production code the PR touches: files under `src/`,
+  # source extensions only, test files and inline `#[cfg(test)]` modules
+  # stripped out (scripts/pr-diff-stats.py, from overfolder/overslash).
+  # `git diff --shortstat` is useless here: one captured fixture brings its
+  # golden tables along and dwarfs a real change.
+  #
+  # Informational only: a reporter must never block a merge. If the script
+  # breaks, the job still shows a red X in the PR's checks.
+  diff-stats:
+    name: PR diff size
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # The sticky comment needs write; scoped to this job.
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The script diffs against the merge-base, so it needs real history.
+          fetch-depth: 0
+      # A PR that touches no `src/` file exercises only the empty path; this
+      # runs the whole pipeline over a synthetic repo with known counts.
+      - name: Self-test
+        run: ./scripts/pr-diff-stats.py --self-test
+      - name: Measure code diff
+        id: stats
+        run: |
+          ./scripts/pr-diff-stats.py \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            --out pr-diff-stats.md
+          cat pr-diff-stats.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo 'markdown<<PR_DIFF_STATS_EOF'
+            cat pr-diff-stats.md
+            echo 'PR_DIFF_STATS_EOF'
+          } >> "$GITHUB_OUTPUT"
+      # The step summary already carries the number, so a fork PR (read-only
+      # token, this step fails) still reports it.
+      - name: Comment on PR
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: diff-stats
+          message: ${{ steps.stats.outputs.markdown }}

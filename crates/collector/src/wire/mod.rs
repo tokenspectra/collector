@@ -14,6 +14,7 @@
 
 pub mod framing;
 pub mod openai;
+pub mod openai_responses;
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -25,7 +26,7 @@ pub use framing::{Frame, Framing};
 
 /// Every Wire Protocol the Collector decodes, in precedence order (see
 /// [`Protocols::claims`]). A new protocol adds one line here.
-pub const BUILTIN: &[&dyn WireProtocol] = &[&openai::OpenAi];
+pub const BUILTIN: &[&dyn WireProtocol] = &[&openai::OpenAi, &openai_responses::OpenAiResponses];
 
 /// A route a protocol serves: an HTTP method and a path pattern.
 ///
@@ -419,7 +420,10 @@ mod tests {
 
     #[test]
     fn builtin_ids_are_unique() {
-        assert_eq!(Protocols::default().ids().collect::<Vec<_>>(), ["openai"]);
+        assert_eq!(
+            Protocols::default().ids().collect::<Vec<_>>(),
+            ["openai", "openai_responses"]
+        );
     }
 
     #[test]
