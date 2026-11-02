@@ -206,7 +206,8 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - Bodies hold plaintext prompts and outputs (§10). The option is for runs that should keep hashes only.
 - **Two views of the same bodies (proposal).** Keep both:
   - `bodies/` is the store: named by hash, checked by name, each body stored once, bytes exactly as hashed.
-  - `by-exchange/` is for people: named by Flow and exchange, rebuilt from the `http` table and `bodies/`, safe to delete.
+  - `by-exchange/` is for people: named by Flow and exchange, derived from the `http` table and `bodies/`, safe to delete.
+  - A live run adds each window's exchanges as the window closes, right after the tables are flushed (§11), so the view keeps up with the run. The end of a run (or `collector views`) rebuilds it from scratch; a new run into the same directory removes the old one first.
 
   ```
   bodies/{multihash}                                       # the store
@@ -303,7 +304,7 @@ Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in 
 - **Keyed-hash key management** (rotation, disclosure for audits), for the Payload privacy work.
 - **Anthropic Messages** (`/v1/messages`) as the second Wire Protocol. It needs its own research.
 - **Keyed BLAKE3 in multihash.** The multicodec table has no code for keyed BLAKE3. Written under `0x1e`, a keyed hash would look like a plain one. The Payload privacy work (§10) needs its own code, from the private-use range or registered.
-- **Who writes `by-exchange/`.** The Collector at the end of a run, or a separate tool over its output. The merge is more parsing of Operator bytes, and the Collector is the component that must stay small.
+- **Who writes `by-exchange/`.** The Collector writes it now, as each window closes (TS-28). It could move to a separate tool over the Collector's output: the merge is more parsing of Operator bytes, and the Collector is the component that must stay small.
 - **Bodies and the Capture Rate.** Bodies are kept by default (§8). Whether the Capture Rate also drops bodies of Workunits it doesn't keep, as it truncates their packets in L0 (§7), is open. So is a size cap per body, and the window a body belongs to when its message spans two.
 
 ## 14. Observability

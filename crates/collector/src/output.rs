@@ -12,7 +12,8 @@
 //!
 //! The tables are flushed when each window closes, so a live run's files are
 //! readable up to the last closed window, and an abrupt stop loses at most
-//! the rows since then.
+//! the rows since then. The window's exchanges are added to `by-exchange/`
+//! at the same point (`views`).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -23,7 +24,7 @@ use serde::Serialize;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord};
-use crate::mh;
+use crate::{mh, views};
 
 pub const TABLES: [&str; 6] = ["packets", "segments", "events", "flows", "http", "workunits"];
 
@@ -37,7 +38,11 @@ pub struct JsonlSink {
     flows: BufWriter<File>,
     http: BufWriter<File>,
     workunits: BufWriter<File>,
+    out: PathBuf,
     bodies: PathBuf,
+    /// `http` rows not yet in `by-exchange/`; linked when the window closes,
+    /// once their bodies are kept.
+    unlinked: Vec<serde_json::Value>,
     /// Bodies being written, each to a temporary file until its hash is known.
     open: HashMap<BodyKey, (PathBuf, BufWriter<File>)>,
     next_tmp: u64,
@@ -45,8 +50,13 @@ pub struct JsonlSink {
 }
 
 impl JsonlSink {
-    /// Creates the table files in `dir`, which must exist.
+    /// Creates the table files in `dir`, which must exist, and removes a
+    /// `by-exchange/` left there by an earlier run.
     pub fn create(dir: &Path) -> io::Result<Self> {
+        let stale = dir.join(views::BY_EXCHANGE);
+        if stale.exists() {
+            std::fs::remove_dir_all(stale)?;
+        }
         let open = |name: &str| File::create(dir.join(format!("{name}.jsonl"))).map(BufWriter::new);
         Ok(JsonlSink {
             packets: open("packets")?,
@@ -55,7 +65,9 @@ impl JsonlSink {
             flows: open("flows")?,
             http: open("http")?,
             workunits: open("workunits")?,
+            out: dir.to_owned(),
             bodies: dir.join(BODIES),
+            unlinked: Vec::new(),
             open: HashMap::new(),
             next_tmp: 0,
             error: None,
@@ -160,6 +172,12 @@ impl RecordSink for JsonlSink {
 
     fn exchange(&mut self, rec: &ExchangeRecord) {
         write_row(&mut self.http, &mut self.error, rec);
+        match serde_json::to_value(rec) {
+            Ok(row) => self.unlinked.push(row),
+            Err(e) => {
+                self.error.get_or_insert(e.into());
+            }
+        }
     }
 
     fn workunit(&mut self, rec: &WorkunitRecord) {
@@ -186,6 +204,12 @@ impl RecordSink for JsonlSink {
             return;
         }
         let res = self.tables().into_iter().try_for_each(|w| w.flush());
+        let res = res.and_then(|()| {
+            for row in std::mem::take(&mut self.unlinked) {
+                views::link_exchange(&self.out, &row)?;
+            }
+            Ok(())
+        });
         if let Err(e) = res {
             self.error = Some(e);
         }

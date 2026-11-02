@@ -64,7 +64,7 @@ Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: re
 - The bytes are the bytes that were hashed: chunked encoding removed, content coding kept, one file per SSE response.
 - A body with a gap has no `body_hash` and is not kept; its packets are still in L0.
 - `--no-bodies` turns this off. Hashes, lengths and every table stay the same; only `bodies/` and `by-exchange/` are missing.
-- **`by-exchange/`** is a view for people, written after each run and rebuilt with `collector views <out>`:
+- **`by-exchange/`** is a view for people. A live run adds each window's exchanges as the window closes; the end of a run, or `collector views <out>`, rebuilds it from scratch:
   - `by-exchange/<flow>/<exchange>.request.<ext>` and `.response.<ext>` are symlinks to `../../bodies/<hash>`. `<flow>` is the Flow id with every character outside `[A-Za-z0-9._-]` replaced by `_`. `<ext>` is `json`, `sse` or `bin`, from the parsed media type. Empty bodies get no link.
   - `<exchange>.response.merged.json`, for SSE Workunits only, joins the streamed chunks into one `chat.completion` (or `text_completion`) object: per choice, `role`, `content` and `reasoning` joined and the last `finish_reason`; `id`, `created` and `model` from the first event; the last `usage`. `incomplete: true` means `[DONE]` never arrived or an event didn't parse (`unparsed_events`).
   - The merged file is derived and lossy. It is not evidence: it is never hashed, stored or compared with the API Tap. The raw body in `bodies/` is the source.

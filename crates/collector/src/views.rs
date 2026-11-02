@@ -5,7 +5,8 @@
 //! `bodies/{multihash}`, and SSE Workunits also get
 //! `{exchange}.response.merged.json`: the streamed chunks joined into one
 //! completion object. Everything here is derived from `http.jsonl` and
-//! `bodies/`, rebuilt from scratch on each call, and safe to delete. The
+//! `bodies/` and safe to delete. A live run adds each window's exchanges as
+//! the window closes ([`link_exchange`]); [`write`] rebuilds it from scratch. The
 //! merged file is not evidence: it is never hashed, stored or compared.
 //!
 //! Nothing from the Operator goes into a name unchecked: the Flow id is
@@ -62,37 +63,47 @@ pub fn write(out: &Path) -> io::Result<Summary> {
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
     }
-    let bodies = out.join(BODIES);
     let mut summary = Summary::default();
     let http = std::fs::File::open(out.join("http.jsonl"))?;
     for line in io::BufReader::new(http).lines() {
         let row: Value = serde_json::from_str(&line?)?;
-        let (Some(flow), Some(exchange)) = (row["flow"].as_str(), row["exchange"].as_u64()) else {
+        let s = link_exchange(out, &row)?;
+        summary.links += s.links;
+        summary.merged += s.merged;
+    }
+    Ok(summary)
+}
+
+/// Adds the links (and merged file) for one `http` row to `by-exchange/` in
+/// `out`. Its bodies must already be kept; a missing body gets no link.
+pub fn link_exchange(out: &Path, row: &Value) -> io::Result<Summary> {
+    let mut summary = Summary::default();
+    let (Some(flow), Some(exchange)) = (row["flow"].as_str(), row["exchange"].as_u64()) else {
+        return Ok(summary);
+    };
+    let bodies = out.join(BODIES);
+    let dir = out.join(BY_EXCHANGE).join(flow_dir(flow));
+    for role in ["request", "response"] {
+        let m = &row[role];
+        // Only names that parse as a multihash, for bodies that exist and
+        // are not empty.
+        let Some(hash) = m["body_hash"].as_str().filter(|h| mh::parse(h).is_some()) else {
             continue;
         };
-        let dir = root.join(flow_dir(flow));
-        for role in ["request", "response"] {
-            let m = &row[role];
-            // Only names that parse as a multihash, for bodies that exist
-            // and are not empty.
-            let Some(hash) = m["body_hash"].as_str().filter(|h| mh::parse(h).is_some()) else {
-                continue;
-            };
-            if m["body_len"].as_u64().unwrap_or(0) == 0 || !bodies.join(hash).is_file() {
-                continue;
-            }
-            std::fs::create_dir_all(&dir)?;
-            let ext = ext(m["content_type"].as_str());
-            let link = dir.join(format!("{exchange}.{role}.{ext}"));
-            std::os::unix::fs::symlink(Path::new("../..").join(BODIES).join(hash), link)?;
-            summary.links += 1;
-            if role == "response" && row["bucket"] == "workunit" && ext == "sse" {
-                let body = std::fs::read(bodies.join(hash))?;
-                let mut merged = serde_json::to_vec_pretty(&merge_sse(&body))?;
-                merged.push(b'\n');
-                std::fs::write(dir.join(format!("{exchange}.response.merged.json")), merged)?;
-                summary.merged += 1;
-            }
+        if m["body_len"].as_u64().unwrap_or(0) == 0 || !bodies.join(hash).is_file() {
+            continue;
+        }
+        std::fs::create_dir_all(&dir)?;
+        let ext = ext(m["content_type"].as_str());
+        let link = dir.join(format!("{exchange}.{role}.{ext}"));
+        std::os::unix::fs::symlink(Path::new("../..").join(BODIES).join(hash), link)?;
+        summary.links += 1;
+        if role == "response" && row["bucket"] == "workunit" && ext == "sse" {
+            let body = std::fs::read(bodies.join(hash))?;
+            let mut merged = serde_json::to_vec_pretty(&merge_sse(&body))?;
+            merged.push(b'\n');
+            std::fs::write(dir.join(format!("{exchange}.response.merged.json")), merged)?;
+            summary.merged += 1;
         }
     }
     Ok(summary)

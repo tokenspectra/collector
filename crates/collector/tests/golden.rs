@@ -705,15 +705,19 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Tables are flushed as each window closes, so a live run's rows are on
-/// disk before it ends, and a killed run keeps every closed window.
+/// Tables are flushed and `by-exchange/` is extended as each window closes,
+/// so a live run's rows and views are on disk before it ends, and a killed
+/// run keeps every closed window.
 #[test]
-fn tables_are_on_disk_when_a_window_closes() {
+fn tables_and_views_are_on_disk_when_a_window_closes() {
     use collector::output::JsonlSink;
     use collector::run::run;
     use collector::{AssemblerConfig, DecoderConfig};
 
     let dir = tempfile::tempdir().unwrap();
+    // Left by an earlier run into the same directory.
+    std::fs::create_dir_all(dir.path().join("by-exchange/stale")).unwrap();
+    std::fs::write(dir.path().join("by-exchange/stale/0.request.json"), "{}").unwrap();
     let mut sink = JsonlSink::create(dir.path()).unwrap();
     let mut source = FileSource::new(fixture_paths(&["openai_h1_sse.pcapng"]));
     run(
@@ -724,7 +728,7 @@ fn tables_are_on_disk_when_a_window_closes() {
         &mut sink,
     )
     .unwrap();
-    // No `finish()`: only the window-close flush has run.
+    // No `finish()` and no `views::write`: only the window-close work has run.
     let on_disk = std::fs::read(dir.path().join("workunits.jsonl")).unwrap();
     let golden = std::fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/openai_h1_sse/workunits.jsonl"),
@@ -732,4 +736,41 @@ fn tables_are_on_disk_when_a_window_closes() {
     .unwrap();
     assert!(!golden.is_empty());
     assert_eq!(on_disk, golden, "{}", first_diff(&golden, &on_disk));
+
+    let live = view_tree(dir.path());
+    assert!(
+        live.iter().any(|(p, _)| p.ends_with(".response.merged.json")),
+        "{live:?}"
+    );
+    collector::views::write(dir.path()).unwrap();
+    assert_eq!(live, view_tree(dir.path()));
+}
+
+/// Every file under `by-exchange/`, with its link target or contents.
+fn view_tree(out: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, root: &Path, acc: &mut Vec<(String, Vec<u8>)>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.strip_prefix(root).unwrap().display().to_string();
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            if meta.is_dir() {
+                walk(&p, root, acc);
+            } else if meta.file_type().is_symlink() {
+                acc.push((
+                    name,
+                    std::fs::read_link(&p)
+                        .unwrap()
+                        .into_os_string()
+                        .into_encoded_bytes(),
+                ));
+            } else {
+                acc.push((name, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let root = out.join("by-exchange");
+    let mut acc = Vec::new();
+    walk(&root, &root, &mut acc);
+    acc.sort();
+    acc
 }
