@@ -261,3 +261,9 @@ cargo test --workspace
   ```sh
   sg wireshark -c "TS_LIVE_DUMPCAP=1 cargo test -p collector --test live -- --nocapture"
   ```
+- **PR diff size:** CI's `PR diff size` job posts a sticky comment with the production lines a PR changes: files under `src/`, with test files and inline `#[cfg(test)]` modules stripped from both sides, so fixtures and golden tables don't count. It is informational, never a gate. Locally:
+
+  ```sh
+  scripts/pr-diff-stats.py origin/main HEAD
+  scripts/pr-diff-stats.py --self-test
+  ```
