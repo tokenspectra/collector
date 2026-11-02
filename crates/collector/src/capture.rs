@@ -5,7 +5,7 @@
 //! | Packet carries | Stored |
 //! |---|---|
 //! | no stream bytes (handshakes, ACKs), `http_other`, `framing` only, a kept Request Workunit, an anomaly | in full |
-//! | `unexplained` bytes, or a UDP / other IP datagram (the alarm) | in full up to `alarm_cap_bytes` per Flow per Slice, then truncated |
+//! | otherwise `unexplained` bytes, or a UDP / other IP datagram (the alarm) | in full up to `alarm_cap_bytes` per Flow per Slice, then truncated |
 //! | a Request Workunit not kept, besides `framing` or `gap` | truncated to `truncate_to` bytes |
 //!
 //! Whether a Workunit is kept is a draw keyed by a per-window secret that
@@ -90,12 +90,14 @@ impl CaptureConfig {
                 (Bucket::Framing | Bucket::Gap, _) => {}
             }
         }
-        if alarm {
-            Class::Alarm
-        } else if full || !not_kept {
+        if full {
             Class::Full
-        } else {
+        } else if alarm {
+            Class::Alarm
+        } else if not_kept {
             Class::NotKept
+        } else {
+            Class::Full
         }
     }
 }
@@ -154,6 +156,19 @@ mod tests {
         assert_eq!(
             c(&[(Bucket::Workunit, Some(&t)), (Bucket::Unexplained, None)]),
             Class::Alarm
+        );
+        // `http_other` and kept Workunit bytes stay whole beside `unexplained`.
+        assert_eq!(
+            c(&[(Bucket::Unexplained, None), (Bucket::HttpOther, None)]),
+            Class::Full
+        );
+        let all = CaptureConfig {
+            rate: 1.0,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            all.classify([(Bucket::Unexplained, None), (Bucket::Workunit, Some(&t))], w),
+            Class::Full
         );
     }
 }

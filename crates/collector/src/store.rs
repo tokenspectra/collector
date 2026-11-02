@@ -147,6 +147,9 @@ struct Window {
     rows: BTreeMap<&'static str, Vec<Value>>,
     items: Vec<Item>,
     item_hashes: HashSet<String>,
+    /// Anomalies at (index, Flow) whose packet record has not arrived yet:
+    /// the assembler reports them before the packet itself.
+    pending_flags: HashSet<(u32, FlowId)>,
 }
 
 /// The settled spans of one Flow direction, by start offset.
@@ -216,11 +219,11 @@ impl<'a> StoreSink<'a> {
     }
 
     /// The window a row or item goes in: its own while it is held, else the
-    /// oldest window still held.
+    /// newest window still held (spec §8).
     fn slot(&mut self, window: Option<u64>) -> &mut Window {
         let w = match window {
             Some(w) if self.windows.contains_key(&w) => w,
-            _ => match self.windows.keys().next() {
+            _ => match self.windows.keys().next_back() {
                 Some(&w) => w,
                 None => self.sealed_through.map_or(0, |s| s + self.cfg.window_ns),
             },
@@ -562,13 +565,19 @@ impl RecordSink for StoreSink<'_> {
     }
 
     fn packet(&mut self, rec: &PacketRecord) {
-        if let Some(h) = self
-            .windows
-            .get_mut(&rec.window_start_ns)
-            .and_then(|w| w.chunks.get_mut(&rec.link))
-            .and_then(|c| c.get_mut(rec.index as usize))
-        {
-            h.rec = Some(rec.clone());
+        if let Some(win) = self.windows.get_mut(&rec.window_start_ns) {
+            let flagged = rec
+                .flow
+                .clone()
+                .is_some_and(|f| win.pending_flags.remove(&(rec.index, f)));
+            if let Some(h) = win
+                .chunks
+                .get_mut(&rec.link)
+                .and_then(|c| c.get_mut(rec.index as usize))
+            {
+                h.rec = Some(rec.clone());
+                h.flagged |= flagged;
+            }
         }
         self.row("packets", Some(rec.window_start_ns), rec);
         self.inner.packet(rec);
@@ -582,13 +591,18 @@ impl RecordSink for StoreSink<'_> {
     fn event(&mut self, rec: &EventRecord) {
         if !rec.kind.is_gap() {
             let at = rec.window_start_ns.zip(rec.index);
-            if let Some(h) = at.and_then(|(w, i)| {
-                self.windows.get_mut(&w)?.chunks.values_mut().find_map(|c| {
+            if let Some((win, i)) = at.and_then(|(w, i)| Some((self.windows.get_mut(&w)?, i))) {
+                let held = win.chunks.values_mut().find_map(|c| {
                     c.get_mut(i as usize)
                         .filter(|h| h.rec.as_ref().is_some_and(|r| r.flow.as_ref() == Some(&rec.flow)))
-                })
-            }) {
-                h.flagged = true;
+                });
+                match held {
+                    Some(h) => h.flagged = true,
+                    // The packet's own record comes next: flag it then.
+                    None => {
+                        win.pending_flags.insert((i, rec.flow.clone()));
+                    }
+                }
             }
         }
         let w = rec.window_start_ns.or(self.current());
@@ -711,7 +725,191 @@ fn verify(hash: &str, bytes: &[u8]) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use object_store::memory::InMemory;
+
     use super::*;
+    use crate::assembler::{DirStats, SliceRecord};
+    use crate::capture::CaptureConfig;
+    use crate::decode::{Bucket, Buckets, WorkunitTag};
+    use crate::flow::{Endpoint, FlowKind, Tuple};
+
+    const W: u64 = 1_000_000_000;
+
+    /// Keeps the chunk records; drops everything else.
+    #[derive(Default)]
+    struct Chunks(Vec<ChunkRecord>);
+
+    impl RecordSink for Chunks {
+        fn packet(&mut self, _: &PacketRecord) {}
+        fn segment(&mut self, _: &SegmentRecord, _: &[u8]) {}
+        fn event(&mut self, _: &EventRecord) {}
+        fn flow(&mut self, _: &FlowRecord) {}
+        fn exchange(&mut self, _: &ExchangeRecord) {}
+        fn workunit(&mut self, _: &WorkunitRecord) {}
+        fn chunk(&mut self, rec: &ChunkRecord) {
+            self.0.push(rec.clone());
+        }
+    }
+
+    fn link() -> LinkId {
+        LinkId::new("tap0")
+    }
+
+    fn ends() -> (Endpoint, Endpoint) {
+        let ep = |last, port| Endpoint {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)),
+            port,
+        };
+        (ep(1, 40000), ep(2, 8000))
+    }
+
+    fn flow_id() -> FlowId {
+        let (a, b) = ends();
+        FlowId::new(&Tuple::new(link(), FlowKind::Tcp, a, b), 0)
+    }
+
+    fn captured(len: usize, ts_ns: u64) -> CapturedPacket {
+        CapturedPacket {
+            link_id: link(),
+            link_type: 1,
+            ts_ns,
+            orig_len: len as u32,
+            data: vec![0; len],
+        }
+    }
+
+    /// A TCP packet of [`flow_id`] carrying stream bytes `[off, off + len)`.
+    fn tcp(index: u32, off: i64, len: u32) -> PacketRecord {
+        PacketRecord {
+            link: link(),
+            window_start_ns: 0,
+            index,
+            ts_ns: u64::from(index),
+            cap_len: 54 + len,
+            orig_len: 54 + len,
+            hash: String::new(),
+            flow: Some(flow_id()),
+            dir: Some(Dir::Orig),
+            tcp_flags: None,
+            stream_off: Some(off),
+            payload_len: Some(len),
+            note: None,
+        }
+    }
+
+    fn span(start: u64, len: u64, bucket: Bucket, workunit: Option<&Arc<WorkunitTag>>) -> Span {
+        Span {
+            start,
+            len,
+            bucket,
+            workunit: workunit.cloned(),
+        }
+    }
+
+    /// With the alarm cap used up, a packet mixing `unexplained` bytes with
+    /// `http_other` or kept Workunit bytes still stays whole (spec §7).
+    #[test]
+    fn full_bytes_beat_an_exhausted_alarm_cap() {
+        let mut inner = Chunks::default();
+        let mut cfg = StoreConfig::new(W);
+        cfg.capture = CaptureConfig {
+            alarm_cap_bytes: 0,
+            truncate_to: 54,
+            ..CaptureConfig::default()
+        };
+        let mut sink = StoreSink::new(&mut inner, Arc::new(InMemory::new()), cfg, None);
+        let tag = Arc::new(WorkunitTag {
+            workunit_id: mh::of(b"wu"),
+            received_ts_ns: 0,
+        });
+        // Only `unexplained`; `unexplained` + `http_other`; `unexplained` +
+        // a kept Workunit.
+        for i in 0..3u32 {
+            sink.captured(
+                &captured(54 + 100, u64::from(i)),
+                PacketRef {
+                    window_start_ns: 0,
+                    index: i,
+                },
+            );
+            sink.packet(&tcp(i, i64::from(i) * 100, 100));
+        }
+        sink.spans(
+            &flow_id(),
+            Dir::Orig,
+            &[
+                span(0, 150, Bucket::Unexplained, None),
+                span(150, 50, Bucket::HttpOther, None),
+                span(200, 50, Bucket::Unexplained, None),
+                span(250, 50, Bucket::Workunit, Some(&tag)),
+            ],
+        );
+        sink.window_closed(&WindowClose {
+            window_start_ns: 0,
+            window_ns: W,
+            capture_drops: None,
+        });
+        sink.finish().unwrap();
+        let c = &inner.0[0];
+        assert_eq!((c.packets, c.truncated_packets, c.truncated_bytes), (3, 1, 100));
+    }
+
+    /// A row whose window has been sealed goes in the newest window held
+    /// (spec §8), not the oldest.
+    #[test]
+    fn late_rows_go_in_the_newest_window_held() {
+        let mut inner = Chunks::default();
+        let mut sink = StoreSink::new(&mut inner, Arc::new(InMemory::new()), StoreConfig::new(W), None);
+        for w in 0..3 {
+            sink.captured(
+                &captured(60, w * W),
+                PacketRef {
+                    window_start_ns: w * W,
+                    index: 0,
+                },
+            );
+        }
+        sink.window_closed(&WindowClose {
+            window_start_ns: 0,
+            window_ns: W,
+            capture_drops: None,
+        });
+        assert_eq!(sink.windows.keys().copied().collect::<Vec<_>>(), [W, 2 * W]);
+        let (orig, resp) = ends();
+        let slice = SliceRecord {
+            window_start_ns: 0,
+            flow: flow_id(),
+            link: link(),
+            kind: FlowKind::Tcp,
+            generation: 0,
+            orig,
+            resp,
+            first_ts_ns: 0,
+            slice_first_ts_ns: Some(0),
+            slice_last_ts_ns: Some(0),
+            mid_stream_start: false,
+            syn: true,
+            syn_ack: true,
+            fin_orig: false,
+            fin_resp: false,
+            rst: false,
+            ended: false,
+            orig_stats: DirStats::default(),
+            resp_stats: DirStats::default(),
+        };
+        sink.flow(&FlowRecord {
+            slice,
+            verdict: None,
+            orig_bytes: Buckets::default(),
+            resp_bytes: Buckets::default(),
+            orig_desync: None,
+            resp_desync: None,
+        });
+        let flows = |w: u64| sink.windows[&w].rows.get("flows").map_or(0, Vec::len);
+        assert_eq!((flows(W), flows(2 * W)), (0, 1));
+    }
 
     #[test]
     fn key_parts_are_safe() {

@@ -373,6 +373,49 @@ fn alarm_flows_are_kept_up_to_the_cap() {
     assert_eq!(rows(dir.path(), "chunks")[0]["truncated_packets"], 0);
 }
 
+/// Anomalies arrive before their packet's record; those packets still stay
+/// whole when everything else is cut.
+#[test]
+fn anomaly_packets_are_kept_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = StoreConfig::new(WINDOW_NS);
+    cfg.capture.alarm_cap_bytes = 0;
+    cfg.capture.truncate_to = 54;
+    run_case(&["retransmit_differs.pcapng"], dir.path(), cfg);
+    let packets = rows(dir.path(), "packets");
+    let mut stored = BTreeMap::new();
+    for c in rows(dir.path(), "chunks") {
+        let bytes = fetch_chunk(&local(dir.path()), c["key"].as_str().unwrap()).unwrap();
+        let in_chunk = packets
+            .iter()
+            .filter(|p| p["window_start_ns"] == c["window_start_ns"] && p["link"] == c["link"]);
+        for (p, (data, _)) in in_chunk.zip(pcapng_packets(&bytes)) {
+            stored.insert(
+                (p["window_start_ns"].as_u64(), p["index"].as_u64()),
+                (p.clone(), data),
+            );
+        }
+    }
+    let flagged: Vec<_> = rows(dir.path(), "events")
+        .into_iter()
+        .filter(|e| e["kind"] == "retransmit_differs")
+        .map(|e| (e["window_start_ns"].as_u64(), e["index"].as_u64()))
+        .collect();
+    assert_eq!(flagged.len(), 2);
+    for at in &flagged {
+        let (p, data) = &stored[at];
+        assert!(p["cap_len"].as_u64().unwrap() > 54, "{p}");
+        assert_eq!(mh::of(data), p["hash"], "kept whole: {p}");
+    }
+    assert!(
+        stored
+            .iter()
+            .any(|(at, (p, data))| !flagged.contains(at)
+                && data.len() < p["cap_len"].as_u64().unwrap() as usize),
+        "the other payload packets are cut"
+    );
+}
+
 #[test]
 fn parquet_index_holds_the_same_rows_as_the_tables() {
     for (case, files) in cases() {
