@@ -212,9 +212,8 @@ pub fn run_stored(
 ) {
     let store_dir = out.join("store");
     std::fs::create_dir_all(&store_dir).expect("store dir");
-    let store = std::sync::Arc::new(
-        object_store::local::LocalFileSystem::new_with_prefix(&store_dir).expect("local store"),
-    );
+    // The store the CLI writes through, fsync included.
+    let store = std::sync::Arc::new(collector::store::local(&store_dir).expect("local store"));
     let mut sink = JsonlSink::create(out).expect("sink");
     let mut stored = StoreSink::new(&mut sink, store, store_cfg, reg.clone());
     match reg {
