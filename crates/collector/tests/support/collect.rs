@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord, SliceRecord};
 use collector::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
 use collector::flow::Dir;
+use collector::observe::StatsSink;
 use collector::output::{JsonlSink, BODIES, TABLES};
 use collector::run::run;
+use collector::stats::{Registry, Snapshot};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource};
 
 pub const WINDOW_NS: u64 = 1_000_000_000;
@@ -118,6 +120,21 @@ pub fn collect(source: &mut dyn PacketSource) -> Collected {
     sink
 }
 
+/// Like [`collect`], through a [`StatsSink`]; returns the final counters too.
+pub fn collect_observed(source: &mut dyn PacketSource) -> (Collected, Snapshot) {
+    let mut sink = Collected::default();
+    let reg = Registry::new();
+    run(
+        source,
+        WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut StatsSink::new(&mut sink, reg.clone()),
+    )
+    .expect("run");
+    (sink, reg.snapshot())
+}
+
 pub fn collect_files(names: &[&str]) -> Collected {
     collect(&mut FileSource::new(fixture_paths(names)))
 }
@@ -133,13 +150,28 @@ pub fn tables(source: &mut dyn PacketSource) -> Files {
 /// Like [`tables`], also returning the files in `bodies/` (name, bytes),
 /// sorted by name.
 pub fn tables_and_bodies(source: &mut dyn PacketSource, keep_bodies: bool) -> (Files, Files) {
+    tables_and_bodies_with(source, keep_bodies, false)
+}
+
+/// Like [`tables_and_bodies`]; with `observe`, the sink is wrapped in a
+/// [`StatsSink`] the way the CLI runs it.
+pub fn tables_and_bodies_with(
+    source: &mut dyn PacketSource,
+    keep_bodies: bool,
+    observe: bool,
+) -> (Files, Files) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut sink = JsonlSink::create(dir.path()).expect("sink");
     let cfg = DecoderConfig {
         keep_bodies,
         ..DecoderConfig::default()
     };
-    run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut sink).expect("run");
+    if observe {
+        let mut stats = StatsSink::new(&mut sink, Registry::new());
+        run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut stats).expect("run");
+    } else {
+        run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut sink).expect("run");
+    }
     sink.finish().expect("finish");
     let mut bodies: Files = std::fs::read_dir(dir.path().join(BODIES))
         .map(|rd| {

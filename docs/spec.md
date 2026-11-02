@@ -300,3 +300,43 @@ Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in 
 - **Keyed BLAKE3 in multihash.** The multicodec table has no code for keyed BLAKE3. Written under `0x1e`, a keyed hash would look like a plain one. The Payload privacy work (§10) needs its own code, from the private-use range or registered.
 - **Who writes `by-exchange/`.** The Collector at the end of a run, or a separate tool over its output. The merge is more parsing of Operator bytes, and the Collector is the component that must stay small.
 - **Bodies and the Capture Rate.** Bodies are kept by default (§8). Whether the Capture Rate also drops bodies of Workunits it doesn't keep, as it truncates their packets in L0 (§7), is open. So is a size cap per body, and the window a body belongs to when its message spans two.
+
+## 14. Observability
+
+Console logs and counters for the people running a Collector (TS-28). **They are diagnostics only:** never part of the deterministic outputs (§3), and the only place wall-clock time appears. Turning logging or metrics up or down changes no output file.
+
+**Logs** use `tracing` and go to stdout, as text (default) or JSON lines (`--log-format json`).
+
+- Level: INFO by default; `-v` DEBUG, `-vv` TRACE; `-q` WARN, `-qq` ERROR. `--log-level <error|warn|info|debug|trace>` overrides the short flags, and `RUST_LOG`, when set, overrides both.
+- **ERROR:** dumpcap missing, not permitted or failing; write failures in the output; anything that ends the run.
+- **WARN:** capture drops reported by dumpcap or pcapng; a Flow that hits the reassembly buffer cap (`gap_buffer_limit`); a body over the size cap (`DecoderConfig::max_body`), hashed and counted but not read.
+- **INFO:** one line per closed window and one summary on exit. The window line has packets, bytes, Flows (new, active, closed), Request Workunits (`ok`, `errored`, `incomplete`), the share of accounted bytes in the `workunit` bucket, the share of closed Flows that carried a Workunit, gaps, and packets/s and Mbit/s over the window length.
+- **DEBUG:** one line per Request Workunit as it is emitted: `workunit_id`, Flow, request direction, method, path, model, HTTP status, `stream`, request and response body bytes, outcome. Also each new and closed Flow (with its verdict), gaps and anomalies.
+- **TRACE:** each reassembled segment.
+
+**Counters: one registry, three views.** One in-process registry, updated by the pipeline. The registry sits beside the sink: it sees every record on its way out and forwards it unchanged. It is read by:
+
+- the INFO line per window, above;
+- **an on-demand snapshot:** `s` or Enter when stdin is a terminal (read key by key, echo off), or `SIGUSR1` at any time, prints a table of cumulative totals and last-window rates to stdout (as one JSON line under `--log-format json`);
+- **`/metrics`:** Prometheus text format, served when `--metrics-addr` is given (off by default; e.g. `127.0.0.1:9464`). Raw counters and gauges only; ratios are computed in the snapshot and in PromQL.
+
+Metrics, all prefixed `ts_collector_` (labels in brackets):
+
+| Metric | Meaning |
+|---|---|
+| `packets_total`, `bytes_total` `[verdict]` | Packets and wire bytes. `verdict`: `http1`, `http2`, `tls`, `grpc`, `opaque` for TCP Flows; `udp`; `other` for other IP protocols, packets with no Flow, and Flows with no payload yet |
+| `flows_total` `[verdict]` | Closed Flows, by final verdict |
+| `flows_active` | Flows seen and not yet closed (gauge) |
+| `flows_with_workunit_total` | Closed Flows that carried at least one Request Workunit; over `flows_total`, the share of Flows that carry Workunits |
+| `accounted_bytes_total` `[bucket, direction]` | Stream bytes per bucket (§5) and direction (`orig`, `resp`); `workunit` over the sum is the share of bandwidth that is Workunits |
+| `workunits_total` `[outcome, http_class]` | Request Workunits. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the response could not be read: a body or SSE event that isn't JSON, a content coding, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
+| `gaps_total`, `gap_bytes_total` | Gaps (§4) and their bytes |
+| `retransmit_bytes_total`, `retransmit_differing_bytes_total` | Retransmitted stream bytes, and those that differ from the first copy |
+| `retransmits_differing_total` | `retransmit_differs` anomalies |
+| `mid_stream_starts_total` | Flows first seen without a handshake |
+| `capture_drops_total` | Packets the capture reports dropped: the latest pcapng Interface Statistics `isb_ifdrop` per Link (it counts from the start of the capture), or dumpcap's final report |
+| `windows_closed_total` | Windows closed |
+| `last_window_lag_seconds` | Wall clock at the close of the last window minus that window's end in capture time (gauge). Near `W` live; meaningless offline |
+
+- **Counts follow the tables.** Packets by verdict and bytes by bucket are added as each Flow row (§8) is written, so they can trail by a window: a row waits until every byte in it has a bucket (§5). At the end of a run they equal the tables exactly, and the buckets sum to every Flow's stream bytes.
+- **Later counters join the same registry:** kept and truncated bytes (the Capture Rate, §7) and object-store writes (TS-26).

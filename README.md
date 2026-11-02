@@ -23,6 +23,7 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 
 - Stage 1 (TS-24): packet input and Flow assembly.
 - Stage 2 (TS-25): protocol identification, byte accounting, HTTP/1.1, h2c, SSE and OpenAI Request Workunits.
+- Stage 3 (TS-28): console logging with verbosity levels, and one counter registry read by the window log line, an on-demand snapshot and Prometheus `/metrics` (spec §14).
 
 Hashing of chunks and Slices, the Capture Rate cut and the object store come next. Implementation is tracked in Multica.
 
@@ -41,6 +42,7 @@ Hashing of chunks and Slices, the Capture Rate cut and the object store come nex
 | `http1`, `http2`, `hpack`, `sse` | §5 | Hand-written, bounds-checked parsers: HTTP/1.1 (chunked included), h2c frames, HPACK, server-sent events |
 | `openai` | §5 | The OpenAI Wire Protocol: which exchanges are Request Workunits, and the record fields read from their bodies |
 | `output` | | JSON Lines tables (below) |
+| `stats`, `observe` | §14 | The counter registry, its snapshot table and `/metrics`; `StatsSink`, which counts and logs every record on its way to the real sink and forwards it unchanged |
 
 ### Tables
 
@@ -123,6 +125,33 @@ sg wireshark -c "cargo run -- ring -i lo -w 10 -t 60"
 - `collector views <out>`: rebuild `by-exchange/` from `http.jsonl` and `bodies/`.
 - Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter).
 
+### Logs and stats (spec §14)
+
+Logs go to stdout; they are diagnostics and never change an output file.
+
+- Default INFO: one line per closed window (packets, bytes, Flows new/active/closed, Request Workunits ok/errored/incomplete, Workunit share of bytes and of closed Flows, gaps, packets/s, Mbit/s) and a summary on exit.
+- `-v` DEBUG adds one line per Request Workunit and per new or closed Flow; `-vv` TRACE adds every reassembled segment. `-q` keeps WARN and ERROR, `-qq` ERROR only.
+- `--log-level <error|warn|info|debug|trace>` overrides `-v`/`-q`; `RUST_LOG` overrides both. `--log-format json` writes JSON lines.
+- **Snapshot:** press `s` or Enter (stdin a terminal), or send `SIGUSR1`, for a table of totals and the last window's rates.
+- **Metrics:** `--metrics-addr 127.0.0.1:9464` serves Prometheus text at `/metrics`, `ts_collector_*` counters and gauges. Off by default.
+
+### Smoke test
+
+Live, with a terminal (needs dumpcap and the `wireshark` group):
+
+```sh
+cargo build
+sg wireshark -c "target/debug/collector -v --metrics-addr 127.0.0.1:9464 ring -i lo -w 5 -t 120"
+```
+
+1. Make some traffic on `lo` (e.g. `uv run fixtures/capture/mock_openai.py` and a client, or `curl localhost:<port>`). Every 5 s an INFO `window closed` line appears; with `-v`, a DEBUG `workunit` line per OpenAI request.
+2. Press `s`, then Enter: each prints the snapshot table. The keys are not echoed.
+3. From another shell: `curl -s 127.0.0.1:9464/metrics | grep ts_collector_workunits_total`.
+4. Snapshot without a terminal: `kill -USR1 $(pgrep -x collector)` prints the same table. Or run detached, e.g. `target/debug/collector files -o out/ big.pcapng </dev/null &` then `kill -USR1 %1`.
+5. Ctrl-C (or `-t` running out) ends the run; the terminal is back in its normal mode.
+
+Offline, without dumpcap: `target/debug/collector -v files -w 1 -o /tmp/ts crates/collector/tests/fixtures/openai_h1_sse.pcapng` logs two `workunit` lines, matching `crates/collector/tests/golden/openai_h1_sse/workunits.jsonl`.
+
 ## Tests
 
 ```sh
@@ -133,6 +162,7 @@ cargo test --workspace
   - **Captured OpenAI traffic** (`openai_h1_json`, `openai_h1_sse`, `openai_h2c_json`, `openai_h2c_sse`, `http_other_h1`): the official OpenAI Python SDK (and httpx for `/health`, `/v1/models` and a malformed body) against a mock OpenAI-compatible server, over HTTP/1.1 and h2c, captured with dumpcap. See below.
   - **Synthetic** fixtures, built packet by packet in `tests/support/fixtures.rs` and written by `cargo run -p collector --example gen_fixtures`: edge cases a live run can't produce on demand (lost segment, retransmit with different bytes, mid-stream start, Flows spanning windows, UDP, non-HTTP TCP, a TLS Flow on the plaintext Link, gRPC over h2c, HTTP/1.1 pipelining and a request whose response lands in the next window).
   - `dumpcap_keepalive-*`: real dumpcap ring files of a keep-alive Flow whose SYN predates the capture.
+- **Logs and stats** (`tests/observe.rs`): the registry's final counters equal what the tables say, bytes by bucket sum to every Flow's bytes, `/metrics` is scraped and parsed, a `-v` run over every golden case logs one DEBUG line per expected Workunit, `SIGUSR1` prints the snapshot during a ring run, and runs at `-qq` and at `-vv` with metrics write identical output trees. The keypress snapshot needs a terminal, so it is in the smoke test above.
 - Besides the expected tables, the tests check that every body with a `body_hash` is kept under its hash, that every `by-exchange/` link resolves to a body matching its name, and that `--no-bodies` changes no table. They also check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
 - **Capturing the OpenAI fixtures again** (only when the mock or the scenarios change; CI never captures). Needs [uv](https://docs.astral.sh/uv/) and dumpcap; Python dependencies are pinned in the scripts:
 

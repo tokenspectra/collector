@@ -1,12 +1,17 @@
 //! `collector`: run Flow assembly over capture files or a live dumpcap ring.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
+use collector::observe::{log_summary, StatsSink};
 use collector::output::JsonlSink;
 use collector::run::run;
+use collector::stats::{serve_metrics, Registry};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource, RingConfig, RingSource};
 
 #[derive(Parser)]
@@ -17,6 +22,37 @@ struct Cli {
     /// Don't keep HTTP bodies under <out>/bodies/; hashes and tables stay the same.
     #[arg(long, global = true)]
     no_bodies: bool,
+    /// More log detail: -v for DEBUG (one line per Request Workunit and
+    /// Flow), -vv for TRACE (reassembly).
+    #[arg(short, long, action = ArgAction::Count, global = true)]
+    verbose: u8,
+    /// Less: -q for WARN, -qq for ERROR only.
+    #[arg(short, long, action = ArgAction::Count, global = true, conflicts_with = "verbose")]
+    quiet: u8,
+    /// Log level; overrides -v/-q. RUST_LOG, when set, overrides both.
+    #[arg(long, global = true, value_enum)]
+    log_level: Option<Level>,
+    /// Log line format on stdout.
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+    /// Serve Prometheus metrics at http://<addr>/metrics, e.g. 127.0.0.1:9464.
+    #[arg(long, global = true)]
+    metrics_addr: Option<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Level {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -62,17 +98,48 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    match real_main() {
+    let cli = Cli::parse();
+    init_logging(&cli);
+    match real_main(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("collector: {e}");
+            error!("{e}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn real_main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+/// Logs go to stdout. They are diagnostics, never part of the outputs.
+fn init_logging(cli: &Cli) {
+    let level = cli.log_level.unwrap_or(match (cli.verbose, cli.quiet) {
+        (0, 0) => Level::Info,
+        (1, _) => Level::Debug,
+        (_, 0) => Level::Trace,
+        (_, 1) => Level::Warn,
+        _ => Level::Error,
+    });
+    let level = match level {
+        Level::Error => "error",
+        Level::Warn => "warn",
+        Level::Info => "info",
+        Level::Debug => "debug",
+        Level::Trace => "trace",
+    };
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(v) if !v.trim().is_empty() => EnvFilter::new(v),
+        _ => EnvFilter::new(level),
+    };
+    let fmt = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stdout)
+        .with_target(false);
+    match cli.log_format {
+        LogFormat::Text => fmt.with_ansi(std::io::stdout().is_terminal()).init(),
+        LogFormat::Json => fmt.json().flatten_event(true).init(),
+    }
+}
+
+fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let decoder_cfg = DecoderConfig {
         keep_bodies: !cli.no_bodies,
         ..DecoderConfig::default()
@@ -81,12 +148,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Files { window_s, out, files } => (Box::new(FileSource::new(files)), window_s, out),
         Cmd::Views { out } => {
             let s = collector::views::write(&out)?;
-            eprintln!(
-                "collector: {} body links, {} merged views -> {}",
-                s.links,
-                s.merged,
-                out.display()
-            );
+            info!(links = s.links, merged = s.merged, out = %out.display(), "views written");
             return Ok(());
         }
         Cmd::Ring {
@@ -114,24 +176,40 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("window must be positive".into());
     }
     std::fs::create_dir_all(&out)?;
+    let registry = Registry::new();
+    if let Some(addr) = &cli.metrics_addr {
+        let bound = serve_metrics(addr.as_str(), registry.clone())
+            .map_err(|e| format!("--metrics-addr {addr}: {e}"))?;
+        info!(url = %format_args!("http://{bound}/metrics"), "serving metrics");
+    }
+    #[cfg(unix)]
+    let _triggers =
+        match collector::observe::triggers::spawn(registry.clone(), cli.log_format == LogFormat::Json) {
+            Ok(t) => {
+                tracing::debug!(
+                    keys = t.keys,
+                    "snapshot on SIGUSR1, and on `s` or Enter with keys"
+                );
+                Some(t)
+            }
+            Err(e) => {
+                warn!(error = %e, "no snapshot triggers");
+                None
+            }
+        };
     let mut sink = JsonlSink::create(&out)?;
-    let summary = run(
+    run(
         source.as_mut(),
         u64::from(window_s) * 1_000_000_000,
         AssemblerConfig::default(),
         decoder_cfg,
-        &mut sink,
+        &mut StatsSink::new(&mut sink, registry.clone()),
     )?;
     sink.finish()?;
     // Views for people, derived from the tables and bodies just written.
     if !cli.no_bodies {
         collector::views::write(&out)?;
     }
-    eprintln!(
-        "collector: {} packets, {} windows -> {}",
-        summary.packets,
-        summary.windows,
-        out.display()
-    );
+    log_summary(&registry.snapshot(), &out);
     Ok(())
 }

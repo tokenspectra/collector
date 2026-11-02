@@ -18,45 +18,7 @@ use collector::flow::Dir;
 use collector::{FileSource, RingSource};
 
 use collect::{collect_files, fixture_dir, fixture_paths, run_to_dir, tables, tables_and_bodies};
-
-/// Real traffic from `fixtures/capture/capture.py`: the OpenAI SDK against
-/// the mock server, captured with dumpcap on `lo`.
-const CAPTURED: &[&str] = &[
-    "openai_h1_json",
-    "openai_h1_sse",
-    "openai_h2c_json",
-    "openai_h2c_sse",
-    "http_other_h1",
-];
-
-const DUMPCAP_KEEPALIVE: &[&str] = &[
-    "dumpcap_keepalive-1.pcapng",
-    "dumpcap_keepalive-2.pcapng",
-    "dumpcap_keepalive-3.pcapng",
-    "dumpcap_keepalive-4.pcapng",
-    "dumpcap_keepalive-5.pcapng",
-];
-
-/// (case name, files in read order).
-fn cases() -> Vec<(String, Vec<String>)> {
-    let mut cases: Vec<(String, Vec<String>)> = fixtures::all()
-        .into_iter()
-        .map(|fx| {
-            (
-                fx.name.to_string(),
-                fx.files.iter().map(|(n, _)| n.to_string()).collect(),
-            )
-        })
-        .collect();
-    cases.push((
-        "dumpcap_keepalive".into(),
-        DUMPCAP_KEEPALIVE.iter().map(|s| s.to_string()).collect(),
-    ));
-    for name in CAPTURED {
-        cases.push((name.to_string(), vec![format!("{name}.pcapng")]));
-    }
-    cases
-}
+use fixtures::{cases, DUMPCAP_KEEPALIVE};
 
 fn first_diff(expected: &[u8], actual: &[u8]) -> String {
     let e = String::from_utf8_lossy(expected);
