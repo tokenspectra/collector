@@ -28,6 +28,7 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 - Stage 5 (TS-29): a generic Wire Protocol layer: the `WireProtocol` trait and registry, shared SSE and NDJSON framing, OpenAI Chat Completions and legacy Completions ported onto it (spec §5).
 - Stage 6 (TS-32): the Ollama native Wire Protocol: `/api/chat`, `/api/generate` (NDJSON or JSON) and `/api/embed`.
 - Stage 6 (TS-31): the Anthropic Messages API Wire Protocol (spec §5).
+- Stage 7 (TS-27): outputs to the control plane: a manifest per window, an append-only manifest log and a shipper to the ingest (spec §11); end-to-end acceptance over every Wire Protocol and a live run; the throughput benchmark.
 
 Implementation is tracked in Multica.
 
@@ -54,7 +55,9 @@ Implementation is tracked in Multica.
 | `capture` | §7 | The Capture Rate cut: which packets a chunk keeps in full, the keyed draw per Workunit |
 | `pack` | §8 | Packs: one zstd frame per item, plus a zstd seekable seek table |
 | `index` | §8 | Index tables as Parquet, one fixed schema per table |
-| `store` | §6–8 | `StoreSink`: holds each window, then writes its chunks, pack and index through `object_store`, write-once |
+| `store` | §6–8 | `StoreSink`: holds each window, then writes its chunks, pack and index through `object_store`, write-once, and hands on the window's manifest |
+| `manifest` | §11 | `WindowManifest`, and the append-only manifest log `manifests.jsonl` |
+| `ship` | §11 | The shipper: POSTs each logged manifest to the ingest, resuming from `manifests.shipped` |
 | `stats`, `observe` | §14 | The counter registry, its snapshot table and `/metrics`; `StatsSink`, which counts and logs every record on its way to the real sink and forwards it unchanged |
 
 ### Tables
@@ -87,6 +90,15 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start_ns}/{table}.parquet
 - **Index:** the eight tables above as Parquet, one fixed schema per table.
 - Every put is create-only. Re-running over the same capture into the same store leaves identical objects alone; an object with other bytes fails the run.
 - `--site` and `--collector-id` (default `local`) fill the key prefix.
+
+### Manifests and shipping (spec §11)
+
+When a window is sealed, after its objects are written, its manifest is appended to `<out>/manifests.jsonl` and synced to disk: site, Collector, window, Links, the window's `chunks` rows, its pack key, each index table's key and row count, and totals (packets, wire bytes, kept and truncated bytes, Flow rows, exchanges, Request Workunits, events, blobs). Like every other output it comes from the capture only, so two runs write the same lines.
+
+- **The log is the source of truth** and is only appended to, across runs too. A crash mid-write leaves a partial last line, which the next run cuts off before appending.
+- **`--ingest http://host:port/path`** starts a shipper: it POSTs each new line as the window is sealed, with `Idempotency-Key: <collector>/<window_start_ns>`. Any 2xx is accepted; 408, 429, 5xx and connection errors are retried with backoff, and for up to `--ship-wait-s` (default 30) at the end of the run; any other status (409: the ingest holds that window with other bytes) stops the shipper.
+- **`manifests.shipped`** holds how far the log has shipped, as a byte offset. It is the shipper's state, not an output. Without `--ingest`, or with lines left over, `collector ship --ingest <url> <out>` sends the rest.
+- The ingest deduplicates by Collector and window, so a re-run over the same capture only repeats what it holds. `tools/mock_ingest.py` is a stand-in for it (the control-plane Store is out of scope here).
 
 ### Capture Rate (spec §7)
 
@@ -200,7 +212,8 @@ sg wireshark -c "cargo run -- ring -i lo -w 10 -t 60"
 - If dumpcap is missing, not runnable (not in the `wireshark` group) or fails (e.g. unknown interface), `ring` exits non-zero with a message saying which, and how to fix it. `files` never needs dumpcap.
 - `--no-bodies`: keep hashes only, no `bodies/` or `by-exchange/` directory.
 - `collector views <out>`: rebuild `by-exchange/` from `http.jsonl` and `bodies/`.
-- Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter).
+- Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter), `-B/--buffer-mib` (dumpcap's kernel buffer; raise it if dumpcap reports drops on bursty traffic).
+- `--ingest <url>` ships each window's manifest as it is sealed; `collector ship --ingest <url> <out>` ships what a run left in its log (above).
 
 ### Logs and stats (spec §14)
 
@@ -261,11 +274,23 @@ cargo test --workspace
   sg wireshark -c "uv run fixtures/capture/capture.py openai_h2c_sse"   # one scenario
   ```
 
-  `fixtures/capture/mock_server.py` serves HTTP/1.1 and h2c on loopback; each Wire Protocol adds its routes in its own module (`mock_openai.py`, `mock_anthropic.py`) and its scenarios in another (`capture_openai.py`, `capture_anthropic.py`), plus one line in each script's list. It serves fixed bodies, so only client headers and timing vary between captures. A small vLLM model would add realism, but the mock needs no GPU and keeps bodies fixed.
+  `fixtures/capture/mock_server.py` serves HTTP/1.1 and h2c on loopback; each Wire Protocol adds its routes in its own module (`mock_openai.py`, `mock_anthropic.py`, `mock_ollama.py`, which only the workload uses: the Ollama fixtures come from a real Ollama) and its scenarios in another (`capture_openai.py`, `capture_anthropic.py`), plus one line in each script's list. It serves fixed bodies, so only client headers and timing vary between captures. A small vLLM model would add realism, but the mock needs no GPU and keeps bodies fixed.
+- **Outputs, end to end** (`tests/outputs.rs`), over every golden case, all four Wire Protocols included: each window's manifest names chunks that are fetched and verify, a pack and index tables that exist with the row counts given, and its totals add up to the tables; every window ships to a mock ingest once and a second run only repeats it; a window with other bytes is refused with 409 and stays in the log; shipping resumes from the cursor; two runs give byte-identical output directories (tables, bodies, `by-exchange/`, the object store and the manifest log); and the CLI ships as it runs.
 - **Live equals offline:** needs capture rights, so it is skipped unless enabled:
 
   ```sh
   sg wireshark -c "TS_LIVE_DUMPCAP=1 cargo test -p collector --test live -- --nocapture"
+  ```
+
+  End to end, over the mixed workload: `tools/live_e2e.sh` runs `collector ring` on `lo` while `fixtures/capture/workload.py` drives OpenAI Chat and Completions, OpenAI Responses, Anthropic and Ollama (the mock, plus a trickle to a real local Ollama if one listens), streaming and not, over HTTP/1.1 and h2c, with non-LLM noise (HTTP downloads, opaque TCP, UDP). It then runs `collector files` over the ring files dumpcap closed, and requires identical output directories and a mock ingest that took every offline manifest as a repeat of a live one:
+
+  ```sh
+  sg wireshark -c "tools/live_e2e.sh ../e2e 200"   # 200 s of traffic, about 1.5 GB of capture
+  ```
+- **Throughput:** `tools/bench.py <files>` runs the release binary over a capture and reports bytes, packets and Request Workunits per CPU-second (the pipeline is one thread, so per core), with and without `--no-bodies`. Over the ring files `live_e2e.sh` leaves in `<work>/ring/`:
+
+  ```sh
+  python3 tools/bench.py ../e2e/ring/*.pcapng
   ```
 - **PR diff size:** CI's `PR diff size` job posts a sticky comment with the production lines a PR changes: files under `src/`, with test files and inline `#[cfg(test)]` modules stripped from both sides, so fixtures and golden tables don't count. It is informational, never a gate. Locally:
 

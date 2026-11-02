@@ -330,6 +330,14 @@ Transport follows TS-15:
 - a shipper POSTs to the control plane's ingest, deduplicated by window and Collector;
 - offline runs use the same ingest path.
 
+**As built (TS-27):**
+- **Manifest:** one JSON object per sealed window, written once its chunks, pack and index tables are in the store: `site`, `collector`, `window_start_ns`, `window_ns`, `links`, `chunks` (the window's `chunks` rows: key, chunk hash, Merkle root, counts), `pack` (key, or null), `index` (per table: key and row count), and `totals` (packets, wire bytes, kept and truncated bytes, Flow rows, exchanges, Request Workunits, events, blobs). Object keys, not rows: the control plane reads the tables from the store. Every field comes from the capture, so the manifest is deterministic (§3); capture drops are left out, since live and offline report them differently.
+- **Log:** `<out>/manifests.jsonl`, one manifest per line, each synced to disk before the run goes on. Only ever appended to, across runs too; a partial last line from a crash is cut off by the next run before it appends.
+- **Shipper:** with `--ingest http://host:port/path`, a thread POSTs each complete line past its cursor, one request per window, body as logged, with `Idempotency-Key: {collector}/{window_start_ns}`. The cursor (`<out>/manifests.shipped`, a byte offset) moves only past lines the ingest accepted, so each line is sent at least once.
+  - Any 2xx is accepted: a first copy, or a repeat of the same bytes. 408, 429, 5xx and connection errors are retried with backoff, and at the end of a run for up to `--ship-wait-s`. Any other status stops the shipper: a 409 means the ingest holds that window with other bytes, the same rule as a store put (§8).
+  - Lines left over stay in the log; `collector ship` sends them later.
+  - v1 speaks plain `http://`, like the Tap (Settled 6).
+
 **Cross-check with the API Tap.**
 - The API Tap (TS-15) records "the client request as received". The Collector sees the same request on the Link.
 - The two must have equal request-body hashes. A mismatch is an Observation contradiction for the Classifier.
@@ -347,6 +355,8 @@ Transport follows TS-15:
 Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in Wireshark (Slice pcapng), and later the Flow/Slice drill-down in the Console.
 
 ## 12. Acceptance (proposal)
+
+_As built (TS-27): 1, 2, 4 and 6 run in CI over the whole golden set, all four Wire Protocols included; 2 compares whole output directories, object store and manifest log included. 3 runs end to end with `tools/live_e2e.sh`, which needs capture rights, over a mixed workload from the capture harness. 5 needs a real Tap._
 
 1. **Golden files:** a set of `.pcapng` files with expected index tables and hashes, run in CI. It covers:
    - HTTP/1.1 JSON, HTTP/1.1 SSE with chunked encoding, h2c JSON and SSE;
