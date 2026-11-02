@@ -3,7 +3,7 @@
 //! Every timestamp comes from the capture file, never from the wall clock, so
 //! the same files always yield the same packets.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -14,6 +14,7 @@ use pcap_file::pcap::PcapReader;
 use pcap_file::pcapng::blocks::interface_description::{
     InterfaceDescriptionBlock, InterfaceDescriptionOption,
 };
+use pcap_file::pcapng::blocks::interface_statistics::InterfaceStatisticsOption;
 use pcap_file::pcapng::{Block, PcapNgReader};
 use pcap_file::TsResolution;
 
@@ -101,6 +102,12 @@ pub enum SourceError {
 /// Yields packets in capture order.
 pub trait PacketSource {
     fn next(&mut self) -> Option<Result<CapturedPacket, SourceError>>;
+
+    /// Packets the capture reported dropped so far, if it reports drops.
+    /// Diagnostics only: drops never change the output.
+    fn capture_drops(&self) -> Option<u64> {
+        None
+    }
 }
 
 const PCAPNG_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
@@ -109,6 +116,9 @@ const PCAPNG_MAGIC: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
 pub struct FileSource {
     pending: VecDeque<PathBuf>,
     current: Option<OpenFile>,
+    /// The latest `isb_ifdrop` per Link. The counter runs from the start of
+    /// the capture, so a later block (or ring file) replaces an earlier one.
+    drops: BTreeMap<LinkId, u64>,
 }
 
 impl FileSource {
@@ -121,6 +131,7 @@ impl FileSource {
         FileSource {
             pending: paths.into_iter().map(Into::into).collect(),
             current: None,
+            drops: BTreeMap::new(),
         }
     }
 
@@ -134,7 +145,8 @@ impl PacketSource for FileSource {
     fn next(&mut self) -> Option<Result<CapturedPacket, SourceError>> {
         loop {
             if let Some(file) = &mut self.current {
-                match file.next() {
+                let item = file.next(&mut self.drops);
+                match item {
                     Some(item) => return Some(item),
                     None => self.current = None,
                 }
@@ -145,6 +157,12 @@ impl PacketSource for FileSource {
                 Err(e) => return Some(Err(e)),
             }
         }
+    }
+
+    /// The sum over Links of the latest Interface Statistics Block
+    /// `isb_ifdrop`, once any file has one.
+    fn capture_drops(&self) -> Option<u64> {
+        (!self.drops.is_empty()).then(|| self.drops.values().sum())
     }
 }
 
@@ -196,12 +214,12 @@ impl OpenFile {
         })
     }
 
-    fn next(&mut self) -> Option<Result<CapturedPacket, SourceError>> {
+    fn next(&mut self, drops: &mut BTreeMap<LinkId, u64>) -> Option<Result<CapturedPacket, SourceError>> {
         if self.failed {
             return None;
         }
         let item = match &mut self.reader {
-            Reader::Ng(reader) => next_pcapng(&self.path, reader),
+            Reader::Ng(reader) => next_pcapng(&self.path, reader, drops),
             Reader::Legacy {
                 reader,
                 link_type,
@@ -225,6 +243,7 @@ fn format_err(path: &Path, msg: impl Into<String>) -> SourceError {
 fn next_pcapng(
     path: &Path,
     reader: &mut PcapNgReader<BufReader<File>>,
+    drops: &mut BTreeMap<LinkId, u64>,
 ) -> Option<Result<CapturedPacket, SourceError>> {
     loop {
         let block = match reader.next_block()? {
@@ -245,6 +264,19 @@ fn next_pcapng(
                 epb.original_len,
                 epb.data.into_owned(),
             ),
+            Block::InterfaceStatistics(isb) => {
+                let dropped = isb.options.iter().find_map(|o| match o {
+                    InterfaceStatisticsOption::IsbIfDrop(n) => Some(*n),
+                    _ => None,
+                });
+                let interface_id = isb.interface_id;
+                drop(isb);
+                let idb = reader.interfaces().get(interface_id as usize);
+                if let (Some(n), Some(idb)) = (dropped, idb) {
+                    drops.insert(link_id(idb, interface_id), n);
+                }
+                continue;
+            }
             Block::SimplePacket(_) | Block::Packet(_) => {
                 return Some(Err(format_err(
                     path,

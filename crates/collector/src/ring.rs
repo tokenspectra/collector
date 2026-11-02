@@ -47,6 +47,12 @@ impl RingConfig {
         }
     }
 
+    /// The capture filter (`-f`) in [`Self::extra_args`], if any.
+    pub fn filter(&self) -> Option<&str> {
+        let i = self.extra_args.iter().position(|a| a == "-f")?;
+        self.extra_args.get(i + 1).map(String::as_str)
+    }
+
     /// The dumpcap arguments.
     pub fn args(&self) -> Result<Vec<OsString>, SourceError> {
         if self.interval_s == 0 {
@@ -85,6 +91,9 @@ pub struct RingSource<R: BufRead = BufReader<ChildStdout>> {
     files: Vec<PathBuf>,
     done: bool,
     log: Option<PathBuf>,
+    /// Drops from the ring files' statistics blocks, then from dumpcap's
+    /// final report once it exits.
+    drops: Option<u64>,
 }
 
 impl RingSource {
@@ -96,6 +105,8 @@ impl RingSource {
     /// [`SourceError::DumpcapFailed`] with the end of its log.
     pub fn spawn(cfg: &RingConfig) -> Result<Self, SourceError> {
         let args = cfg.args()?;
+        let filter = cfg.filter().unwrap_or("none");
+        tracing::info!(interface = %cfg.interface, filter, "dumpcap starting");
         let log_path = cfg.dir.join("dumpcap.log");
         let log = std::fs::File::create(&log_path)
             .map_err(|e| SourceError::Dumpcap(format!("creating log in {}: {e}", cfg.dir.display())))?;
@@ -121,6 +132,7 @@ impl RingSource {
             files: Vec::new(),
             done: false,
             log: Some(log_path),
+            drops: None,
         })
     }
 
@@ -141,6 +153,7 @@ impl<R: BufRead> RingSource<R> {
             files: Vec::new(),
             done: false,
             log: None,
+            drops: None,
         }
     }
 
@@ -169,8 +182,15 @@ impl<R: BufRead> RingSource<R> {
     /// Reaps dumpcap; an error if it failed.
     fn wait(&mut self) -> Option<SourceError> {
         let mut child = self.child.take()?;
-        match child.wait() {
-            Ok(status) if status.success() => None,
+        let status = child.wait();
+        if let Some(n) = self.log.as_deref().and_then(log_drops) {
+            self.drops = Some(self.drops.unwrap_or(0).max(n));
+        }
+        match status {
+            Ok(status) if status.success() => {
+                tracing::info!(files = self.files.len(), "dumpcap exited");
+                None
+            }
             Ok(status) => Some(SourceError::DumpcapFailed {
                 status,
                 log: self.log.as_deref().map(log_tail).unwrap_or_default(),
@@ -178,6 +198,24 @@ impl<R: BufRead> RingSource<R> {
             Err(e) => Some(SourceError::Dumpcap(format!("waiting: {e}"))),
         }
     }
+}
+
+/// Drops in dumpcap's final report, summed over interfaces:
+/// `Packets received/dropped on interface 'lo': 1234/5 (pcap:5/...)`.
+fn log_drops(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut total = None;
+    for line in text.lines() {
+        let Some((_, counts)) = line.split_once("dropped on interface") else {
+            continue;
+        };
+        let counts = counts.rsplit_once("': ").map_or(counts, |(_, c)| c);
+        let counts = counts.split_whitespace().next().unwrap_or_default();
+        if let Some(n) = counts.split_once('/').and_then(|(_, d)| d.parse::<u64>().ok()) {
+            *total.get_or_insert(0) += n;
+        }
+    }
+    total
 }
 
 /// The last few lines dumpcap wrote to its log, without the per-file
@@ -201,11 +239,17 @@ impl<R: BufRead> PacketSource for RingSource<R> {
             if let Some(file) = &mut self.current {
                 match file.next() {
                     Some(item) => return Some(item),
-                    None => self.current = None,
+                    None => {
+                        if let Some(n) = file.capture_drops() {
+                            self.drops = Some(self.drops.unwrap_or(0).max(n));
+                        }
+                        self.current = None;
+                    }
                 }
             }
             match self.next_file() {
                 Some(Ok(path)) => {
+                    tracing::debug!(file = %path.display(), "ring file closed");
                     self.files.push(path.clone());
                     self.current = Some(FileSource::new([path]));
                 }
@@ -218,6 +262,14 @@ impl<R: BufRead> PacketSource for RingSource<R> {
                     return None;
                 }
             }
+        }
+    }
+
+    fn capture_drops(&self) -> Option<u64> {
+        let current = self.current.as_ref().and_then(FileSource::capture_drops);
+        match (self.drops, current) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
         }
     }
 }
@@ -234,6 +286,16 @@ impl<R: BufRead> Drop for RingSource<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_filter_is_passed_to_dumpcap() {
+        let mut cfg = RingConfig::new("lo", 10, "/tmp/ring");
+        assert_eq!(cfg.filter(), None);
+        cfg.extra_args = vec!["-f".into(), "tcp port 11434".into()];
+        assert_eq!(cfg.filter(), Some("tcp port 11434"));
+        let args = cfg.args().unwrap();
+        assert_eq!(args[args.len() - 2..], ["-f", "tcp port 11434"]);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -276,6 +338,22 @@ mod tests {
         assert!(matches!(err, SourceError::DumpcapFailed { .. }), "{err}");
         assert!(err.to_string().contains("There is no device named"), "{err}");
         assert!(ring.next().is_none());
+    }
+
+    #[test]
+    fn drops_from_dumpcap_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("dumpcap.log");
+        std::fs::write(
+            &log,
+            "Capturing on 'lo'\nFile: /x/link_00001.pcapng\nPackets captured: 30\n\
+             Packets received/dropped on interface 'lo': 30/2 (pcap:2/dumpcap:0/flushed:0/ps_ifdrop:0) (93.8%)\n\
+             Packets received/dropped on interface 'eth0': 10/1 (pcap:1/dumpcap:0/flushed:0/ps_ifdrop:0) (90.9%)\n",
+        )
+        .unwrap();
+        assert_eq!(log_drops(&log), Some(3));
+        std::fs::write(&log, "Capturing on 'lo'\n").unwrap();
+        assert_eq!(log_drops(&log), None);
     }
 
     #[test]

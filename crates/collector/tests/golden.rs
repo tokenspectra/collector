@@ -18,45 +18,7 @@ use collector::flow::Dir;
 use collector::{FileSource, RingSource};
 
 use collect::{collect_files, fixture_dir, fixture_paths, run_to_dir, tables, tables_and_bodies};
-
-/// Real traffic from `fixtures/capture/capture.py`: the OpenAI SDK against
-/// the mock server, captured with dumpcap on `lo`.
-const CAPTURED: &[&str] = &[
-    "openai_h1_json",
-    "openai_h1_sse",
-    "openai_h2c_json",
-    "openai_h2c_sse",
-    "http_other_h1",
-];
-
-const DUMPCAP_KEEPALIVE: &[&str] = &[
-    "dumpcap_keepalive-1.pcapng",
-    "dumpcap_keepalive-2.pcapng",
-    "dumpcap_keepalive-3.pcapng",
-    "dumpcap_keepalive-4.pcapng",
-    "dumpcap_keepalive-5.pcapng",
-];
-
-/// (case name, files in read order).
-fn cases() -> Vec<(String, Vec<String>)> {
-    let mut cases: Vec<(String, Vec<String>)> = fixtures::all()
-        .into_iter()
-        .map(|fx| {
-            (
-                fx.name.to_string(),
-                fx.files.iter().map(|(n, _)| n.to_string()).collect(),
-            )
-        })
-        .collect();
-    cases.push((
-        "dumpcap_keepalive".into(),
-        DUMPCAP_KEEPALIVE.iter().map(|s| s.to_string()).collect(),
-    ));
-    for name in CAPTURED {
-        cases.push((name.to_string(), vec![format!("{name}.pcapng")]));
-    }
-    cases
-}
+use fixtures::{cases, DUMPCAP_KEEPALIVE};
 
 fn first_diff(expected: &[u8], actual: &[u8]) -> String {
     let e = String::from_utf8_lossy(expected);
@@ -741,4 +703,74 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// Tables are flushed and `by-exchange/` is extended as each window closes,
+/// so a live run's rows and views are on disk before it ends, and a killed
+/// run keeps every closed window.
+#[test]
+fn tables_and_views_are_on_disk_when_a_window_closes() {
+    use collector::output::JsonlSink;
+    use collector::run::run;
+    use collector::{AssemblerConfig, DecoderConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    // Left by an earlier run into the same directory.
+    std::fs::create_dir_all(dir.path().join("by-exchange/stale")).unwrap();
+    std::fs::write(dir.path().join("by-exchange/stale/0.request.json"), "{}").unwrap();
+    let mut sink = JsonlSink::create(dir.path()).unwrap();
+    let mut source = FileSource::new(fixture_paths(&["openai_h1_sse.pcapng"]));
+    run(
+        &mut source,
+        collect::WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut sink,
+    )
+    .unwrap();
+    // No `finish()` and no `views::write`: only the window-close work has run.
+    let on_disk = std::fs::read(dir.path().join("workunits.jsonl")).unwrap();
+    let golden = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/openai_h1_sse/workunits.jsonl"),
+    )
+    .unwrap();
+    assert!(!golden.is_empty());
+    assert_eq!(on_disk, golden, "{}", first_diff(&golden, &on_disk));
+
+    let live = view_tree(dir.path());
+    assert!(
+        live.iter().any(|(p, _)| p.ends_with(".response.merged.json")),
+        "{live:?}"
+    );
+    collector::views::write(dir.path()).unwrap();
+    assert_eq!(live, view_tree(dir.path()));
+}
+
+/// Every file under `by-exchange/`, with its link target or contents.
+fn view_tree(out: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, root: &Path, acc: &mut Vec<(String, Vec<u8>)>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.strip_prefix(root).unwrap().display().to_string();
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            if meta.is_dir() {
+                walk(&p, root, acc);
+            } else if meta.file_type().is_symlink() {
+                acc.push((
+                    name,
+                    std::fs::read_link(&p)
+                        .unwrap()
+                        .into_os_string()
+                        .into_encoded_bytes(),
+                ));
+            } else {
+                acc.push((name, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let root = out.join("by-exchange");
+    let mut acc = Vec::new();
+    walk(&root, &root, &mut acc);
+    acc.sort();
+    acc
 }

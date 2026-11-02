@@ -108,6 +108,16 @@ impl Buckets {
         } += n;
     }
 
+    pub fn get(&self, b: Bucket) -> u64 {
+        match b {
+            Bucket::Workunit => self.workunit,
+            Bucket::HttpOther => self.http_other,
+            Bucket::Framing => self.framing,
+            Bucket::Unexplained => self.unexplained,
+            Bucket::Gap => self.gap,
+        }
+    }
+
     pub fn total(&self) -> u64 {
         self.workunit + self.http_other + self.framing + self.unexplained + self.gap
     }
@@ -219,6 +229,34 @@ pub struct WorkunitRecord {
     pub sse_done: Option<bool>,
     /// Both messages reached their end with no gap.
     pub complete: bool,
+    /// The response was read as OpenAI JSON: the whole body, or every SSE
+    /// event. Diagnostics only, never written to the table.
+    #[serde(skip)]
+    pub response_parsed: bool,
+}
+
+impl WorkunitRecord {
+    /// `incomplete` on a gap or a message cut short, else `errored` when the
+    /// response could not be read, else `ok`.
+    pub fn outcome(&self) -> crate::stats::Outcome {
+        use crate::stats::Outcome;
+        if !self.complete {
+            Outcome::Incomplete
+        } else if !self.response_parsed {
+            Outcome::Errored
+        } else {
+            Outcome::Ok
+        }
+    }
+}
+
+/// A window has closed: every packet in it has been pushed (spec §3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowClose {
+    pub window_start_ns: u64,
+    pub window_ns: u64,
+    /// Packets the capture reported dropped so far, when it reports them.
+    pub capture_drops: Option<u64>,
 }
 
 /// Receives everything the Collector produces.
@@ -236,6 +274,9 @@ pub trait RecordSink {
     /// when `None` (a gap). Called once per body that had `body_data`, and
     /// for empty bodies.
     fn body_end(&mut self, _key: &BodyKey, _hash: Option<&str>) {}
+    /// A window closed. Its Flow rows may still follow, once their bytes
+    /// have buckets.
+    fn window_closed(&mut self, _w: &WindowClose) {}
 }
 
 pub struct Decoder<'a> {
@@ -323,6 +364,10 @@ impl FlowSink for Decoder<'_> {
 }
 
 impl Decoder<'_> {
+    pub fn window_closed(&mut self, w: &WindowClose) {
+        self.sink.window_closed(w);
+    }
+
     /// Flows with protocol state still held.
     pub fn open_flows(&self) -> usize {
         self.flows.len()
@@ -906,6 +951,15 @@ impl FlowState {
             reset: ex.reset,
         });
         for m in [&ex.req, &ex.resp].into_iter().flatten() {
+            if m.body.over_limit {
+                tracing::warn!(
+                    flow = %self.id,
+                    exchange = ex.seq,
+                    dir = %crate::stats::dir_str(m.dir),
+                    body_bytes = m.body.len,
+                    "body over the size cap: hashed and counted, not read as JSON"
+                );
+            }
             if m.body.stored {
                 let key = BodyKey {
                     flow: self.id.clone(),
@@ -922,7 +976,8 @@ impl FlowState {
         let request = ex.request.clone().unwrap_or_default();
         // A JSON response is read whole; SSE was read event by event.
         let sse = resp.body.sse.is_some();
-        if !sse && resp.done && resp.body.gap == 0 && !resp.body.over_limit && resp.identity() {
+        let read = sse || (resp.done && resp.body.gap == 0 && !resp.body.over_limit && resp.identity());
+        if !sse && read {
             ex.response.absorb(&resp.body.buf);
         }
         let complete = req.complete && resp.complete && req.body.gap == 0 && resp.body.gap == 0 && !ex.reset;
@@ -956,6 +1011,7 @@ impl FlowState {
             sse_events: sse.then(|| std::mem::take(&mut resp.body.events)),
             sse_done: sse.then_some(ex.response.done),
             complete,
+            response_parsed: read && ex.response.unparsed == 0,
         });
     }
 

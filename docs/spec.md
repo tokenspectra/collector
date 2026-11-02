@@ -67,6 +67,9 @@ trait PacketSource {           // yields packets in capture order
   - `dumpcap -i <if> -b interval:<W> -b printname:stdout -w <dir>/link.pcapng`.
   - It reads each file name dumpcap prints when the file closes, then hands that file to `FileSource`.
   - **Never use `-b files:N`**: dumpcap deletes the oldest files, and we lose packets if the Collector falls behind (research §1). The Collector deletes local files itself, after upload.
+  - **Capture filter:** `ring -f/--filter <bpf>` passes a BPF capture filter to dumpcap (`-f`), e.g. `tcp port 11434` to keep only the inference port. It is for tests and local runs.
+    - Packets the filter drops never reach the Collector, so they appear nowhere: not in any byte bucket, not as a gap. A filtered run accounts for a subset of the Link, never for the whole Link.
+    - So the filter is logged when dumpcap starts (§14).
 - **`LiveSource`** (later) reads libpcap directly through the `pcap` crate, for lower latency. Only if the file handoff turns out too slow.
 - **Determinism:** the same input files always give the same output, byte for byte.
   - Every timestamp comes from the capture, never the wall clock.
@@ -203,7 +206,8 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - Bodies hold plaintext prompts and outputs (§10). The option is for runs that should keep hashes only.
 - **Two views of the same bodies (proposal).** Keep both:
   - `bodies/` is the store: named by hash, checked by name, each body stored once, bytes exactly as hashed.
-  - `by-exchange/` is for people: named by Flow and exchange, rebuilt from the `http` table and `bodies/`, safe to delete.
+  - `by-exchange/` is for people: named by Flow and exchange, derived from the `http` table and `bodies/`, safe to delete.
+  - A live run adds each window's exchanges as the window closes, right after the tables are flushed (§11), so the view keeps up with the run. The end of a run (or `collector views`) rebuilds it from scratch; a new run into the same directory removes the old one first.
 
   ```
   bodies/{multihash}                                       # the store
@@ -255,6 +259,8 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
 - the index tables (§8), or their object keys;
 - a small window manifest: Collector id, Link ids, window, chunk hashes, pack keys, totals.
 
+**Locally**, the JSONL tables are flushed as each window closes. A live run's files are readable up to the last closed window, and a run that is killed keeps every row written before its last window closed.
+
 Transport follows TS-15:
 - an append-only local log as the source of truth;
 - a shipper POSTs to the control plane's ingest, deduplicated by window and Collector;
@@ -298,5 +304,45 @@ Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in 
 - **Keyed-hash key management** (rotation, disclosure for audits), for the Payload privacy work.
 - **Anthropic Messages** (`/v1/messages`) as the second Wire Protocol. It needs its own research.
 - **Keyed BLAKE3 in multihash.** The multicodec table has no code for keyed BLAKE3. Written under `0x1e`, a keyed hash would look like a plain one. The Payload privacy work (§10) needs its own code, from the private-use range or registered.
-- **Who writes `by-exchange/`.** The Collector at the end of a run, or a separate tool over its output. The merge is more parsing of Operator bytes, and the Collector is the component that must stay small.
+- **Who writes `by-exchange/`.** The Collector writes it now, as each window closes (TS-28). It could move to a separate tool over the Collector's output: the merge is more parsing of Operator bytes, and the Collector is the component that must stay small.
 - **Bodies and the Capture Rate.** Bodies are kept by default (§8). Whether the Capture Rate also drops bodies of Workunits it doesn't keep, as it truncates their packets in L0 (§7), is open. So is a size cap per body, and the window a body belongs to when its message spans two.
+
+## 14. Observability
+
+Console logs and counters for the people running a Collector (TS-28). **They are diagnostics only:** never part of the deterministic outputs (§3), and the only place wall-clock time appears. Turning logging or metrics up or down changes no output file.
+
+**Logs** use `tracing` and go to stdout, as text (default) or JSON lines (`--log-format json`).
+
+- Level: INFO by default; `-v` DEBUG, `-vv` TRACE; `-q` WARN, `-qq` ERROR. `--log-level <error|warn|info|debug|trace>` overrides the short flags, and `RUST_LOG`, when set, overrides both.
+- **ERROR:** dumpcap missing, not permitted or failing; write failures in the output; anything that ends the run.
+- **WARN:** capture drops reported by dumpcap or pcapng; a Flow that hits the reassembly buffer cap (`gap_buffer_limit`); a body over the size cap (`DecoderConfig::max_body`), hashed and counted but not read.
+- **INFO:** one line when dumpcap starts, with the interface and the capture filter (`none` if unset), so a filtered run is visible (§3); one line per closed window and one summary on exit. The window line has packets, bytes, Flows (new, active, closed), Request Workunits (`ok`, `errored`, `incomplete`), the share of accounted bytes in the `workunit` bucket, the share of closed Flows that carried a Workunit, gaps, and packets/s and Mbit/s over the window length.
+- **DEBUG:** one line per Request Workunit as it is emitted: `workunit_id`, Flow, request direction, method, path, model, HTTP status, `stream`, request and response body bytes, outcome. Also each new and closed Flow (with its verdict), gaps and anomalies.
+- **TRACE:** each reassembled segment.
+
+**Counters: one registry, three views.** One in-process registry, updated by the pipeline. The registry sits beside the sink: it sees every record on its way out and forwards it unchanged. It is read by:
+
+- the INFO line per window, above;
+- **an on-demand snapshot:** `s` or Enter when stdin is a terminal (read key by key, echo off), or `SIGUSR1` at any time, prints a table of cumulative totals and last-window rates to stdout (as one JSON line under `--log-format json`);
+- **`/metrics`:** Prometheus text format, served when `--metrics-addr` is given (off by default; e.g. `127.0.0.1:9464`). Raw counters and gauges only; ratios are computed in the snapshot and in PromQL.
+
+Metrics, all prefixed `ts_collector_` (labels in brackets):
+
+| Metric | Meaning |
+|---|---|
+| `packets_total`, `bytes_total` `[verdict]` | Packets and wire bytes. `verdict`: `http1`, `http2`, `tls`, `grpc`, `opaque` for TCP Flows; `udp`; `other` for other IP protocols, packets with no Flow, and Flows with no payload yet |
+| `flows_total` `[verdict]` | Closed Flows, by final verdict |
+| `flows_active` | Flows seen and not yet closed (gauge) |
+| `flows_with_workunit_total` | Closed Flows that carried at least one Request Workunit; over `flows_total`, the share of Flows that carry Workunits |
+| `accounted_bytes_total` `[bucket, direction]` | Stream bytes per bucket (§5) and direction (`orig`, `resp`); `workunit` over the sum is the share of bandwidth that is Workunits |
+| `workunits_total` `[outcome, http_class]` | Request Workunits. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the response could not be read: a body or SSE event that isn't JSON, a content coding, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
+| `gaps_total`, `gap_bytes_total` | Gaps (§4) and their bytes |
+| `retransmit_bytes_total`, `retransmit_differing_bytes_total` | Retransmitted stream bytes, and those that differ from the first copy |
+| `retransmits_differing_total` | `retransmit_differs` anomalies |
+| `mid_stream_starts_total` | Flows first seen without a handshake |
+| `capture_drops_total` | Packets the capture reports dropped: the latest pcapng Interface Statistics `isb_ifdrop` per Link (it counts from the start of the capture), or dumpcap's final report |
+| `windows_closed_total` | Windows closed |
+| `last_window_lag_seconds` | Wall clock at the close of the last window minus that window's end in capture time (gauge). Near `W` live; meaningless offline |
+
+- **Counts follow the tables.** Packets by verdict and bytes by bucket are added as each Flow row (§8) is written, so they can trail by a window: a row waits until every byte in it has a bucket (§5). At the end of a run they equal the tables exactly, and the buckets sum to every Flow's stream bytes.
+- **Later counters join the same registry:** kept and truncated bytes (the Capture Rate, §7) and object-store writes (TS-26).
