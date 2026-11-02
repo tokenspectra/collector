@@ -233,6 +233,7 @@ impl RecordSink for StatsSink<'_> {
         );
         r.set_window(ws, lag_s);
         self.prev = now;
+        self.inner.window_closed(w);
     }
 }
 

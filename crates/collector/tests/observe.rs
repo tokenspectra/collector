@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use collector::decode::Bucket;
+use collector::assembler::{EventRecord, PacketRecord, SegmentRecord};
+use collector::decode::{
+    BodyKey, Bucket, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord,
+};
 use collector::flow::FlowKind;
 use collector::observe::StatsSink;
 use collector::output::TABLES;
@@ -208,6 +211,66 @@ fn counting_changes_no_output() {
         let plain = tables_and_bodies_with(&mut FileSource::new(fixture_paths(&names)), true, false);
         let counted = tables_and_bodies_with(&mut FileSource::new(fixture_paths(&names)), true, true);
         assert!(plain == counted, "{case}");
+    }
+}
+
+/// Every [`RecordSink`] call, in order.
+#[derive(Default)]
+struct Recording(Vec<String>);
+
+impl RecordSink for Recording {
+    fn packet(&mut self, rec: &PacketRecord) {
+        self.0.push(format!("packet {rec:?}"));
+    }
+    fn segment(&mut self, rec: &SegmentRecord, data: &[u8]) {
+        self.0.push(format!("segment {rec:?} {data:?}"));
+    }
+    fn event(&mut self, rec: &EventRecord) {
+        self.0.push(format!("event {rec:?}"));
+    }
+    fn flow(&mut self, rec: &FlowRecord) {
+        self.0.push(format!("flow {rec:?}"));
+    }
+    fn exchange(&mut self, rec: &ExchangeRecord) {
+        self.0.push(format!("exchange {rec:?}"));
+    }
+    fn workunit(&mut self, rec: &WorkunitRecord) {
+        self.0.push(format!("workunit {rec:?}"));
+    }
+    fn body_data(&mut self, key: &BodyKey, data: &[u8]) {
+        self.0.push(format!("body_data {key:?} {data:?}"));
+    }
+    fn body_end(&mut self, key: &BodyKey, hash: Option<&str>) {
+        self.0.push(format!("body_end {key:?} {hash:?}"));
+    }
+    fn window_closed(&mut self, w: &WindowClose) {
+        self.0.push(format!("window_closed {w:?}"));
+    }
+}
+
+/// A [`StatsSink`] passes every call through, `window_closed` included.
+#[test]
+fn stats_sink_forwards_every_call() {
+    let record = |files: &[String], observe: bool| {
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        let cfg = DecoderConfig {
+            keep_bodies: true,
+            ..DecoderConfig::default()
+        };
+        let mut sink = Recording::default();
+        let source = &mut FileSource::new(fixture_paths(&names));
+        if observe {
+            let mut stats = StatsSink::new(&mut sink, Registry::new());
+            run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut stats).expect("run");
+        } else {
+            run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut sink).expect("run");
+        }
+        sink.0
+    };
+    for (case, files) in cases() {
+        let plain = record(&files, false);
+        assert!(plain.iter().any(|c| c.starts_with("window_closed ")), "{case}");
+        assert!(plain == record(&files, true), "{case}");
     }
 }
 
