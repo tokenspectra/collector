@@ -24,7 +24,7 @@ enum Cmd {
         #[arg(short, long, default_value_t = 10)]
         window_s: u32,
         /// Output directory for the JSONL tables.
-        #[arg(short, long, default_value = ".")]
+        #[arg(short, long, default_value = "ts-captures")]
         out: PathBuf,
         files: Vec<PathBuf>,
     },
@@ -47,7 +47,7 @@ enum Cmd {
         #[arg(long, default_value = "dumpcap")]
         dumpcap: PathBuf,
         /// Output directory for the JSONL tables.
-        #[arg(short, long, default_value = ".")]
+        #[arg(short, long, default_value = "ts-captures")]
         out: PathBuf,
     },
 }

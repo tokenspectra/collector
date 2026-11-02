@@ -46,7 +46,7 @@ cargo run -- files -w 10 -o out/ capture-1.pcapng capture-2.pcapng
 sg wireshark -c "cargo run -- ring -i lo -w 10 -t 60"
 ```
 
-- `-o/--out` defaults to the current directory.
+- `-o/--out` defaults to `ts-captures/` in the current directory (created if missing).
 - `-d/--ring-dir` defaults to `<tmp>/tokenspectra-ring-<interface>`.
 - If dumpcap is missing, not runnable (not in the `wireshark` group) or fails (e.g. unknown interface), `ring` exits non-zero with a message saying which, and how to fix it. `files` never needs dumpcap.
 - Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter).
