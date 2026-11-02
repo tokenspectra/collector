@@ -10,7 +10,7 @@
 //! local files itself, after upload. [`RingConfig::extra_args`] rejects it.
 
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
@@ -84,20 +84,35 @@ pub struct RingSource<R: BufRead = BufReader<ChildStdout>> {
     current: Option<FileSource>,
     files: Vec<PathBuf>,
     done: bool,
+    log: Option<PathBuf>,
 }
 
 impl RingSource {
     /// Starts dumpcap. Its stderr goes to `<dir>/dumpcap.log`.
+    ///
+    /// A missing dumpcap gives [`SourceError::DumpcapNotFound`], one the user
+    /// may not run gives [`SourceError::DumpcapNotPermitted`]; dumpcap
+    /// failing later (e.g. an unknown interface) gives
+    /// [`SourceError::DumpcapFailed`] with the end of its log.
     pub fn spawn(cfg: &RingConfig) -> Result<Self, SourceError> {
-        let log = std::fs::File::create(cfg.dir.join("dumpcap.log"))
+        let args = cfg.args()?;
+        let log_path = cfg.dir.join("dumpcap.log");
+        let log = std::fs::File::create(&log_path)
             .map_err(|e| SourceError::Dumpcap(format!("creating log in {}: {e}", cfg.dir.display())))?;
         let mut child = Command::new(&cfg.dumpcap)
-            .args(cfg.args()?)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(log)
             .spawn()
-            .map_err(|e| SourceError::Dumpcap(format!("starting {}: {e}", cfg.dumpcap.display())))?;
+            .map_err(|e| {
+                let program = cfg.dumpcap.clone();
+                match e.kind() {
+                    ErrorKind::NotFound => SourceError::DumpcapNotFound { program },
+                    ErrorKind::PermissionDenied => SourceError::DumpcapNotPermitted { program },
+                    _ => SourceError::Dumpcap(format!("starting {}: {e}", cfg.dumpcap.display())),
+                }
+            })?;
         let stdout = child.stdout.take().expect("piped");
         Ok(RingSource {
             names: BufReader::new(stdout),
@@ -105,6 +120,7 @@ impl RingSource {
             current: None,
             files: Vec::new(),
             done: false,
+            log: Some(log_path),
         })
     }
 
@@ -124,6 +140,7 @@ impl<R: BufRead> RingSource<R> {
             current: None,
             files: Vec::new(),
             done: false,
+            log: None,
         }
     }
 
@@ -154,10 +171,25 @@ impl<R: BufRead> RingSource<R> {
         let mut child = self.child.take()?;
         match child.wait() {
             Ok(status) if status.success() => None,
-            Ok(status) => Some(SourceError::Dumpcap(format!("exited with {status}"))),
+            Ok(status) => Some(SourceError::DumpcapFailed {
+                status,
+                log: self.log.as_deref().map(log_tail).unwrap_or_default(),
+            }),
             Err(e) => Some(SourceError::Dumpcap(format!("waiting: {e}"))),
         }
     }
+}
+
+/// The last few lines dumpcap wrote to its log, without the per-file
+/// `File: ...` notices, joined with `; `.
+fn log_tail(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("File: "))
+        .collect();
+    lines[lines.len().saturating_sub(5)..].join("; ")
 }
 
 impl<R: BufRead> PacketSource for RingSource<R> {
@@ -202,6 +234,49 @@ impl<R: BufRead> Drop for RingSource<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_or_forbidden_dumpcap_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = RingConfig::new("lo", 1, tmp.path());
+        cfg.dumpcap = tmp.path().join("no-such-dumpcap");
+        let err = RingSource::spawn(&cfg).err().unwrap();
+        assert!(matches!(err, SourceError::DumpcapNotFound { .. }), "{err}");
+        assert!(err.to_string().contains("--dumpcap"), "{err}");
+
+        let script = tmp.path().join("not-executable");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        cfg.dumpcap = script;
+        let err = RingSource::spawn(&cfg).err().unwrap();
+        assert!(matches!(err, SourceError::DumpcapNotPermitted { .. }), "{err}");
+        assert!(err.to_string().contains("wireshark"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dumpcap_failure_reports_its_log() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("failing-dumpcap");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'Capturing on nosuchif' >&2\necho 'There is no device named \"nosuchif\".' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = RingConfig::new("nosuchif", 1, tmp.path());
+        cfg.dumpcap = script;
+        let mut ring = RingSource::spawn(&cfg).unwrap();
+        let err = ring.next().unwrap().err().unwrap();
+        assert!(matches!(err, SourceError::DumpcapFailed { .. }), "{err}");
+        assert!(err.to_string().contains("There is no device named"), "{err}");
+        assert!(ring.next().is_none());
+    }
 
     #[test]
     fn args_never_use_files() {

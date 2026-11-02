@@ -76,6 +76,26 @@ pub enum SourceError {
     Format { path: PathBuf, msg: String },
     #[error("dumpcap: {0}")]
     Dumpcap(String),
+    #[error(
+        "dumpcap not found: `{}` is not on PATH or does not exist. Live capture needs Wireshark's \
+         dumpcap (Debian/Ubuntu: `sudo apt install wireshark-common`; Fedora: `sudo dnf install \
+         wireshark-cli`; macOS: install Wireshark), or point to it with `--dumpcap <path>`. \
+         Reading files (`collector files ...`) does not need it",
+        program.display()
+    )]
+    DumpcapNotFound { program: PathBuf },
+    #[error(
+        "not allowed to run `{}`: live capture needs membership of the `wireshark` group \
+         (`sudo usermod -aG wireshark $USER`, then log in again, or run under \
+         `sg wireshark -c \"...\"`)",
+        program.display()
+    )]
+    DumpcapNotPermitted { program: PathBuf },
+    #[error("dumpcap exited with {status}{}", if log.is_empty() { String::new() } else { format!(": {log}") })]
+    DumpcapFailed {
+        status: std::process::ExitStatus,
+        log: String,
+    },
 }
 
 /// Yields packets in capture order.
