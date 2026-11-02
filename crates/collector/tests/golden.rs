@@ -481,6 +481,84 @@ fn openai_responses_errors_are_workunits() {
     assert_eq!(responses_extra(failed, "status"), "failed");
 }
 
+/// Real Ollama: streamed chat and generate are NDJSON, `"stream": false`
+/// and embed are one JSON object, and an unknown model is a JSON error.
+#[test]
+fn ollama_native_ndjson_and_json() {
+    let c = collect_files(&["ollama_native.pcapng"]);
+    assert!(c.flows.iter().all(|f| f.verdict == Some(Verdict::Http1)));
+    assert_eq!(bytes_where(&c, |b| b.unexplained + b.gap + b.http_other), 0);
+    let got: Vec<(&str, bool, u16, Option<&str>)> = c
+        .workunits
+        .iter()
+        .map(|w| (w.endpoint, w.stream, w.status, w.response_content_type.as_deref()))
+        .collect();
+    let (nd, json) = (Some("application/x-ndjson"), Some("application/json"));
+    assert_eq!(
+        got,
+        [
+            ("/api/chat", true, 200, nd),
+            ("/api/generate", true, 200, nd),
+            ("/api/chat", false, 200, json),
+            ("/api/generate", false, 200, json),
+            ("/api/embed", false, 200, json),
+            ("/api/chat", false, 404, json),
+        ]
+    );
+    for w in &c.workunits {
+        assert_eq!(w.protocol, "ollama");
+        assert!(w.complete && w.outcome() == collector::stats::Outcome::Ok);
+        assert_eq!(w.response_model, w.model.clone().filter(|_| w.status == 200));
+        // NDJSON is not SSE, and Ollama sends no usage object.
+        assert_eq!((w.sse_events.as_ref(), w.sse_done, &w.usage), (None, None, &None));
+    }
+    for w in &c.workunits[..4] {
+        assert_eq!(w.model.as_deref(), Some("qwen2.5:0.5b"));
+        assert_eq!((w.input_tokens, w.output_tokens), (Some(32), Some(8)));
+        assert_eq!(w.finish_reason[0].finish_reason, "length");
+        let x = w.extra.as_ref().unwrap();
+        assert!(x["total_duration"].as_u64().unwrap() >= x["eval_duration"].as_u64().unwrap());
+        // `done` is reported for streams only.
+        assert_eq!(
+            x["done"],
+            if w.stream {
+                serde_json::json!(true)
+            } else {
+                serde_json::Value::Null
+            }
+        );
+    }
+    let embed = &c.workunits[4];
+    assert_eq!((embed.input_tokens, embed.output_tokens), (Some(5), None));
+    assert!(embed.finish_reason.is_empty());
+    assert_eq!(
+        c.workunits[5].extra.as_ref().unwrap()["error"],
+        "model 'no-such-model' not found"
+    );
+}
+
+/// Ollama's OpenAI-compatible `/v1/*` endpoints are the OpenAI protocol's.
+#[test]
+fn ollama_openai_compatible_endpoints_decode_as_openai() {
+    let c = collect_files(&["ollama_openai_compat.pcapng"]);
+    assert_eq!(bytes_where(&c, |b| b.unexplained + b.gap + b.http_other), 0);
+    let got: Vec<(&str, &str, bool)> = c
+        .workunits
+        .iter()
+        .map(|w| (w.protocol, w.endpoint, w.stream))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("openai", "/v1/chat/completions", false),
+            ("openai", "/v1/chat/completions", true),
+        ]
+    );
+    assert!(c.workunits.iter().all(|w| w.complete && w.response_id.is_some()));
+    assert_eq!(c.workunits[0].output_tokens, Some(8));
+    assert_eq!(c.workunits[1].sse_done, Some(true));
+}
+
 /// The same bodies sent over HTTP/1.1 and h2c hash the same: body hashes
 /// cover the bytes, not the framing around them.
 #[test]

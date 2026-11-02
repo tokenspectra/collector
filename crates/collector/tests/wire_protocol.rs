@@ -30,7 +30,7 @@ mod ndtest {
 
     pub static NDTEST: NdTest = NdTest;
 
-    pub const GENERATE: &str = "/api/generate";
+    pub const GENERATE: &str = "/test/generate";
     pub const EVENTS: &str = "/test/*/events";
     const SHARED: &str = "/v1/chat/completions";
     const ROUTES: &[Route] = &[Route::post(GENERATE), Route::post(EVENTS), Route::post(SHARED)];
@@ -193,7 +193,7 @@ const CHAT_JSON: &str =
 const ND_JSON: &str = "{\"model\":\"m\",\"done\":true,\"done_reason\":\"stop\"}";
 
 fn capture() -> tempfile::NamedTempFile {
-    let gen = request("/api/generate", "", "{\"model\":\"m\",\"prompt\":\"hi\"}");
+    let gen = request("/test/generate", "", "{\"model\":\"m\",\"prompt\":\"hi\"}");
     let nd = response_head("application/x-ndjson", NDJSON_BODY.len());
     let sse = response_head("text/event-stream", SSE_BODY.len());
     let shared_body = "{\"model\":\"m\",\"prompt\":\"hi\",\"stream\":false}";
