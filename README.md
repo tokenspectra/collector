@@ -143,6 +143,37 @@ A body with a gap has `body_hash: null`. A request body that is incomplete, has 
 - HTTP/1.1 `Upgrade` (including h2c via Upgrade) and CONNECT tunnels: the bytes after the switch are `unexplained`. h2c works with prior knowledge.
 - gRPC payloads, TLS, content-coded bodies: identified, not decoded.
 
+## Quick start: traffic → capture → viewer
+
+Capture a local LLM's traffic on loopback and browse it. Tested on Linux (Ubuntu).
+
+**You need:**
+- Rust (`cargo`).
+- **dumpcap**, Wireshark's capture tool, runnable without root:
+  - Debian/Ubuntu: `sudo apt install wireshark-common`, answer **Yes** to "non-superusers capture" (or `sudo dpkg-reconfigure wireshark-common`), then `sudo usermod -aG wireshark $USER`.
+  - Fedora: `sudo dnf install wireshark-cli`, then `sudo usermod -aG wireshark $USER`.
+  - The group applies at next login; until then wrap commands in `sg wireshark -c "..."`. Check with `dumpcap -D`.
+- [Ollama](https://ollama.com) (or any OpenAI-compatible server), and Python 3: the traffic script uses the standard library only.
+- A browser.
+
+**Run it**, from the repo root:
+
+```sh
+ollama pull qwen2.5:0.5b                                            # small model; any model works
+
+# terminal 1: capture lo in 10 s windows
+sg wireshark -c "cargo run -- -v ring -i lo -w 10 -o ts-captures-demo"
+
+# terminal 2: 5 rounds of prompts, some multi-turn, streamed
+python3 tools/llm_traffic.py --stream --count 5 --interval 10
+```
+
+When the script ends, wait one window and press Ctrl-C in terminal 1. Then open `viewer/index.html` in the browser, choose `ts-captures-demo/`, and go to **Request Workunits › conversation**.
+
+- `tools/llm_traffic.py` speaks `POST /v1/chat/completions`: the only endpoints the Collector decodes as Request Workunits are that and `/v1/completions`. Flags: `--model`, `--host` (e.g. `http://localhost:8000` for vLLM), `--stream`, `--multiturn`, `--count`, `--seed`; see `--help`.
+- Ollama also talks to its own llama.cpp runner on a random loopback port (`/completion`, `/tokenize`, `/health`). That shows up as `http_other`; the viewer still rebuilds its conversation from the templated prompt.
+- `ts-captures*` is gitignored. Bodies hold the prompts and replies in plaintext.
+
 ## Running
 
 ```sh
