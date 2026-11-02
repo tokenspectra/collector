@@ -381,6 +381,139 @@ pub fn non_http_tcp() -> Fixture {
     }
 }
 
+pub const EDGE_A_REQ: &[u8] = b"POST /v1/chat/completions HTTP/1.1\r\nHost: gw\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{\"model\":\"m\",\"stream\":true}";
+pub const EDGE_A_RESP: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"error\":\"bad\"}";
+pub const EDGE_B_REQ: &[u8] =
+    b"POST /v1/completions HTTP/1.1\r\nHost: gw\r\nContent-Length: 13\r\n\r\n{\"model\":\"m\"}";
+pub const EDGE_C_REQ: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: gw\r\n\r\n";
+pub const EDGE_B_RESP: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 9\r\n\r\ndata: x\n\n";
+pub const EDGE_C_HEAD: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n";
+pub const EDGE_C_CHUNK: &[u8] = b"0123456789abcdefghij";
+
+/// HTTP/1.1 edge cases on one keep-alive Flow:
+/// - a streaming chat request in window 0 whose JSON error response comes in
+///   window 1: a Workunit (`application/json` is accepted even with
+///   `stream: true`), so window 0's request bytes wait for it;
+/// - two pipelined requests in one segment;
+/// - a non-streaming completion answered with `text/event-stream`: not a
+///   Workunit;
+/// - a chunked `/metrics` response whose middle segment, inside chunk data,
+///   is lost: a gap that keeps the parser in sync.
+pub fn http1_edge() -> Fixture {
+    let mut c = Conn::new(CLIENT, SERVER, 3000, 4000);
+    let mut f = Vec::new();
+    c.handshake(T0 + 100 * MS, &mut f);
+    f.push(c.send(true, T0 + 200 * MS, PSH | ACK, EDGE_A_REQ));
+    f.push(c.ack(false, T0 + 201 * MS));
+    f.push(c.send(false, T0 + 1100 * MS, PSH | ACK, EDGE_A_RESP));
+    f.push(c.send(
+        true,
+        T0 + 1200 * MS,
+        PSH | ACK,
+        &[EDGE_B_REQ, EDGE_C_REQ].concat(),
+    ));
+    f.push(c.send(false, T0 + 1300 * MS, PSH | ACK, EDGE_B_RESP));
+    let first = [EDGE_C_HEAD, b"14\r\n", &EDGE_C_CHUNK[..5]].concat();
+    f.push(c.send(false, T0 + 1310 * MS, ACK, &first));
+    let _lost = c.send(false, T0 + 1311 * MS, ACK, &EDGE_C_CHUNK[5..15]);
+    let last = [&EDGE_C_CHUNK[15..], b"\r\n0\r\n\r\n"].concat();
+    f.push(c.send(false, T0 + 1312 * MS, PSH | ACK, &last));
+    f.push(c.ack(true, T0 + 1313 * MS));
+    c.close(T0 + 1400 * MS, &mut f);
+    Fixture {
+        name: "http1_edge",
+        files: vec![("http1_edge.pcapng", f)],
+    }
+}
+
+pub const TLS_CLIENT_HELLO: &[u8] = b"\x16\x03\x01\x00\x2f\x01\x00\x00\x2b\x03\x03\
+    \x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\
+    \x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\
+    \x00\x00\x02\x13\x01\x01\x00\x00\x00";
+pub const TLS_SERVER_HELLO: &[u8] = b"\x16\x03\x03\x00\x0a\x02\x00\x00\x06\x03\x03\x00\x13\x01\x00";
+pub const TLS_APP_DATA: &[u8] = b"\x17\x03\x03\x00\x05\xde\xad\xbe\xef\x00";
+
+/// A TLS handshake and one application-data record on port 8000 of the
+/// plaintext Link: verdict `tls`, every byte unexplained.
+pub fn tls_plaintext() -> Fixture {
+    let mut c = Conn::new(CLIENT, SERVER, 500, 600);
+    let mut f = Vec::new();
+    c.handshake(T0 + 10 * MS, &mut f);
+    f.push(c.send(true, T0 + 20 * MS, PSH | ACK, TLS_CLIENT_HELLO));
+    f.push(c.send(false, T0 + 21 * MS, PSH | ACK, TLS_SERVER_HELLO));
+    f.push(c.send(true, T0 + 22 * MS, PSH | ACK, TLS_APP_DATA));
+    c.close(T0 + 30 * MS, &mut f);
+    Fixture {
+        name: "tls_plaintext",
+        files: vec![("tls_plaintext.pcapng", f)],
+    }
+}
+
+pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+pub fn h2_frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+    f.push(ty);
+    f.push(flags);
+    f.extend_from_slice(&stream.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// HPACK header block of literals without indexing, new names, no Huffman.
+pub fn hpack_literals(fields: &[(&str, &str)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    for (n, v) in fields {
+        b.extend_from_slice(&[0x00, n.len() as u8]);
+        b.extend_from_slice(n.as_bytes());
+        b.push(v.len() as u8);
+        b.extend_from_slice(v.as_bytes());
+    }
+    b
+}
+
+/// A gRPC call over h2c: parsed as HTTP/2, verdict `grpc`, payload opaque.
+pub fn grpc_h2c() -> Fixture {
+    const HEADERS: u8 = 1;
+    const DATA: u8 = 0;
+    const SETTINGS: u8 = 4;
+    let mut c = Conn::new(CLIENT, (SERVER.0, 50051), 7000, 8000);
+    let mut f = Vec::new();
+    c.handshake(T0 + 10 * MS, &mut f);
+    let req_head = hpack_literals(&[
+        (":method", "POST"),
+        (":scheme", "http"),
+        (":path", "/pkg.Svc/Call"),
+        ("content-type", "application/grpc"),
+    ]);
+    let client = [
+        H2_PREFACE,
+        &h2_frame(SETTINGS, 0, 0, b""),
+        &h2_frame(HEADERS, 0x4, 1, &req_head),
+        &h2_frame(DATA, 0x1, 1, b"\x00\x00\x00\x00\x03abc"),
+    ]
+    .concat();
+    f.push(c.send(true, T0 + 20 * MS, PSH | ACK, &client));
+    let resp_head = hpack_literals(&[(":status", "200"), ("content-type", "application/grpc")]);
+    let server = [
+        &h2_frame(SETTINGS, 0, 0, b"")[..],
+        &h2_frame(SETTINGS, 0x1, 0, b""),
+        &h2_frame(HEADERS, 0x4, 1, &resp_head),
+        &h2_frame(DATA, 0, 1, b"\x00\x00\x00\x00\x02ok"),
+        &h2_frame(HEADERS, 0x5, 1, &hpack_literals(&[("grpc-status", "0")])),
+    ]
+    .concat();
+    f.push(c.send(false, T0 + 21 * MS, PSH | ACK, &server));
+    c.close(T0 + 30 * MS, &mut f);
+    Fixture {
+        name: "grpc_h2c",
+        files: vec![("grpc_h2c.pcapng", f)],
+    }
+}
+
 pub fn all() -> Vec<Fixture> {
     vec![
         span_windows(),
@@ -389,5 +522,8 @@ pub fn all() -> Vec<Fixture> {
         retransmit_differs(),
         udp(),
         non_http_tcp(),
+        http1_edge(),
+        tls_plaintext(),
+        grpc_h2c(),
     ]
 }

@@ -6,10 +6,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord, SliceRecord};
+use collector::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
 use collector::flow::Dir;
-use collector::output::{JsonlSink, TABLES};
+use collector::output::{JsonlSink, BODIES, TABLES};
 use collector::run::run;
-use collector::{AssemblerConfig, FileSource, FlowSink, PacketSource};
+use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource};
 
 pub const WINDOW_NS: u64 = 1_000_000_000;
 
@@ -21,6 +22,12 @@ pub struct Collected {
     pub segments: Vec<SegmentRecord>,
     pub events: Vec<EventRecord>,
     pub slices: Vec<SliceRecord>,
+    pub flows: Vec<FlowRecord>,
+    pub exchanges: Vec<ExchangeRecord>,
+    pub workunits: Vec<WorkunitRecord>,
+    /// Kept bodies by hash name.
+    pub bodies: BTreeMap<String, Vec<u8>>,
+    open_bodies: BTreeMap<BodyKey, Vec<u8>>,
     pub streams: BTreeMap<(String, Dir), Vec<u8>>,
 }
 
@@ -41,7 +48,7 @@ impl Collected {
     }
 }
 
-impl FlowSink for Collected {
+impl RecordSink for Collected {
     fn packet(&mut self, rec: &PacketRecord) {
         self.packets.push(rec.clone());
     }
@@ -62,8 +69,31 @@ impl FlowSink for Collected {
         self.events.push(rec.clone());
     }
 
-    fn slice(&mut self, rec: &SliceRecord) {
-        self.slices.push(rec.clone());
+    fn flow(&mut self, rec: &FlowRecord) {
+        self.slices.push(rec.slice.clone());
+        self.flows.push(rec.clone());
+    }
+
+    fn exchange(&mut self, rec: &ExchangeRecord) {
+        self.exchanges.push(rec.clone());
+    }
+
+    fn workunit(&mut self, rec: &WorkunitRecord) {
+        self.workunits.push(rec.clone());
+    }
+
+    fn body_data(&mut self, key: &BodyKey, data: &[u8]) {
+        self.open_bodies
+            .entry(key.clone())
+            .or_default()
+            .extend_from_slice(data);
+    }
+
+    fn body_end(&mut self, key: &BodyKey, hash: Option<&str>) {
+        let body = self.open_bodies.remove(key).unwrap_or_default();
+        if let Some(hash) = hash {
+            self.bodies.insert(hash.to_string(), body);
+        }
     }
 }
 
@@ -77,7 +107,14 @@ pub fn fixture_paths(names: &[&str]) -> Vec<PathBuf> {
 
 pub fn collect(source: &mut dyn PacketSource) -> Collected {
     let mut sink = Collected::default();
-    run(source, WINDOW_NS, AssemblerConfig::default(), &mut sink).expect("run");
+    run(
+        source,
+        WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut sink,
+    )
+    .expect("run");
     sink
 }
 
@@ -85,18 +122,63 @@ pub fn collect_files(names: &[&str]) -> Collected {
     collect(&mut FileSource::new(fixture_paths(names)))
 }
 
+/// (file name, bytes) per output file.
+pub type Files = Vec<(String, Vec<u8>)>;
+
 /// Runs `source` and returns each JSONL table's bytes, in [`TABLES`] order.
-pub fn tables(source: &mut dyn PacketSource) -> Vec<(String, Vec<u8>)> {
+pub fn tables(source: &mut dyn PacketSource) -> Files {
+    tables_and_bodies(source, true).0
+}
+
+/// Like [`tables`], also returning the files in `bodies/` (name, bytes),
+/// sorted by name.
+pub fn tables_and_bodies(source: &mut dyn PacketSource, keep_bodies: bool) -> (Files, Files) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut sink = JsonlSink::create(dir.path()).expect("sink");
-    run(source, WINDOW_NS, AssemblerConfig::default(), &mut sink).expect("run");
+    let cfg = DecoderConfig {
+        keep_bodies,
+        ..DecoderConfig::default()
+    };
+    run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut sink).expect("run");
     sink.finish().expect("finish");
-    TABLES
+    let mut bodies: Files = std::fs::read_dir(dir.path().join(BODIES))
+        .map(|rd| {
+            rd.map(|e| {
+                let e = e.expect("entry");
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).expect("body"),
+                )
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    bodies.sort();
+    let tables = TABLES
         .iter()
         .map(|t| {
             let name = format!("{t}.jsonl");
             let bytes = std::fs::read(dir.path().join(&name)).expect("read table");
             (name, bytes)
         })
-        .collect()
+        .collect();
+    (tables, bodies)
+}
+
+/// Runs `source` into a fresh output directory, bodies and views included,
+/// the way the CLI does.
+pub fn run_to_dir(source: &mut dyn PacketSource) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut sink = JsonlSink::create(dir.path()).expect("sink");
+    run(
+        source,
+        WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut sink,
+    )
+    .expect("run");
+    sink.finish().expect("finish");
+    collector::views::write(dir.path()).expect("views");
+    dir
 }

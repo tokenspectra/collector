@@ -1,6 +1,8 @@
-//! Drives a [`PacketSource`] through windowing and Flow assembly.
+//! Drives a [`PacketSource`] through windowing, Flow assembly and protocol
+//! decoding.
 
-use crate::assembler::{Assembler, AssemblerConfig, FlowSink};
+use crate::assembler::{Assembler, AssemblerConfig};
+use crate::decode::{Decoder, DecoderConfig, RecordSink};
 use crate::source::{PacketSource, SourceError};
 use crate::window::Windower;
 
@@ -10,30 +12,34 @@ pub struct Summary {
     pub windows: u64,
 }
 
-/// Runs every packet of `source` through the assembler, closing windows of
-/// `window_ns` as capture time passes, and ends all Flows at the end.
+/// Runs every packet of `source` through the assembler and decoder,
+/// closing windows of `window_ns` as capture time passes, and ends all
+/// Flows at the end.
 pub fn run(
     source: &mut dyn PacketSource,
     window_ns: u64,
     cfg: AssemblerConfig,
-    sink: &mut dyn FlowSink,
+    decoder_cfg: DecoderConfig,
+    sink: &mut dyn RecordSink,
 ) -> Result<Summary, SourceError> {
     let mut windower = Windower::new(window_ns);
     let mut assembler = Assembler::new(cfg);
+    let mut decoder = Decoder::new(decoder_cfg, sink);
     let mut summary = Summary::default();
     while let Some(pkt) = source.next() {
         let pkt = pkt?;
         let placed = windower.place(&pkt.link_id, pkt.ts_ns);
         if let Some(closed) = placed.closed {
-            assembler.close_window(closed, pkt.ts_ns, sink);
+            assembler.close_window(closed, pkt.ts_ns, &mut decoder);
             summary.windows += 1;
         }
-        assembler.push(&pkt, placed.at, sink);
+        assembler.push(&pkt, placed.at, &mut decoder);
         summary.packets += 1;
     }
     if let Some(last) = windower.current() {
-        assembler.finish(last, sink);
+        assembler.finish(last, &mut decoder);
         summary.windows += 1;
     }
+    debug_assert_eq!(decoder.open_flows(), 0, "every Flow ended");
     Ok(summary)
 }

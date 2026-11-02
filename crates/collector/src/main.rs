@@ -7,13 +7,16 @@ use clap::{Parser, Subcommand};
 
 use collector::output::JsonlSink;
 use collector::run::run;
-use collector::{AssemblerConfig, FileSource, PacketSource, RingConfig, RingSource};
+use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource, RingConfig, RingSource};
 
 #[derive(Parser)]
 #[command(about = "TokenSpectra Collector")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Don't keep HTTP bodies under <out>/bodies/; hashes and tables stay the same.
+    #[arg(long, global = true)]
+    no_bodies: bool,
 }
 
 #[derive(Subcommand)]
@@ -27,6 +30,12 @@ enum Cmd {
         #[arg(short, long, default_value = "ts-captures")]
         out: PathBuf,
         files: Vec<PathBuf>,
+    },
+    /// Rebuild `by-exchange/` in an output directory from its `http.jsonl`
+    /// and `bodies/`.
+    Views {
+        #[arg(default_value = "ts-captures")]
+        out: PathBuf,
     },
     /// Capture live with a dumpcap ring buffer and assemble Flows.
     Ring {
@@ -63,8 +72,23 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
-    let (mut source, window_s, out): (Box<dyn PacketSource>, u32, PathBuf) = match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let decoder_cfg = DecoderConfig {
+        keep_bodies: !cli.no_bodies,
+        ..DecoderConfig::default()
+    };
+    let (mut source, window_s, out): (Box<dyn PacketSource>, u32, PathBuf) = match cli.cmd {
         Cmd::Files { window_s, out, files } => (Box::new(FileSource::new(files)), window_s, out),
+        Cmd::Views { out } => {
+            let s = collector::views::write(&out)?;
+            eprintln!(
+                "collector: {} body links, {} merged views -> {}",
+                s.links,
+                s.merged,
+                out.display()
+            );
+            return Ok(());
+        }
         Cmd::Ring {
             window_s,
             interface,
@@ -95,9 +119,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         source.as_mut(),
         u64::from(window_s) * 1_000_000_000,
         AssemblerConfig::default(),
+        decoder_cfg,
         &mut sink,
     )?;
     sink.finish()?;
+    // Views for people, derived from the tables and bodies just written.
+    if !cli.no_bodies {
+        collector::views::write(&out)?;
+    }
     eprintln!(
         "collector: {} packets, {} windows -> {}",
         summary.packets,
