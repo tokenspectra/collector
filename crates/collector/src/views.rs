@@ -2,7 +2,7 @@
 //! bodies").
 //!
 //! `by-exchange/{flow}/{exchange}.{request|response}.{ext}` are symlinks to
-//! `bodies/{multihash}`, and SSE Workunits also get
+//! `bodies/{multihash}`, and OpenAI SSE Workunits also get
 //! `{exchange}.response.merged.json`: the streamed chunks joined into one
 //! completion object. Everything here is derived from `http.jsonl` and
 //! `bodies/` and safe to delete. A live run adds each window's exchanges as
@@ -22,7 +22,8 @@ use serde_json::Value;
 
 use crate::mh;
 use crate::output::BODIES;
-use crate::sse::Sse;
+use crate::wire::framing::{Framer, Framing};
+use crate::wire::{openai, target_path};
 
 pub const BY_EXCHANGE: &str = "by-exchange";
 
@@ -98,7 +99,7 @@ pub fn link_exchange(out: &Path, row: &Value) -> io::Result<Summary> {
         let link = dir.join(format!("{exchange}.{role}.{ext}"));
         std::os::unix::fs::symlink(Path::new("../..").join(BODIES).join(hash), link)?;
         summary.links += 1;
-        if role == "response" && row["bucket"] == "workunit" && ext == "sse" {
+        if role == "response" && row["bucket"] == "workunit" && ext == "sse" && is_openai(row) {
             let body = std::fs::read(bodies.join(hash))?;
             let mut merged = serde_json::to_vec_pretty(&merge_sse(&body))?;
             merged.push(b'\n');
@@ -107,6 +108,14 @@ pub fn link_exchange(out: &Path, row: &Value) -> io::Result<Summary> {
         }
     }
     Ok(summary)
+}
+
+/// The merge below knows OpenAI chunks only, so other Wire Protocols get no
+/// merged file. The `http` row has no protocol, so this goes by route.
+fn is_openai(row: &Value) -> bool {
+    let target = row["request"]["target"].as_str().unwrap_or("");
+    row["request"]["method"] == "POST"
+        && [openai::CHAT_COMPLETIONS, openai::COMPLETIONS].contains(&target_path(target))
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -150,7 +159,7 @@ pub struct Merged {
 /// first event; the last `usage`.
 pub fn merge_sse(body: &[u8]) -> Merged {
     let mut events = Vec::new();
-    let mut sse = Sse::default();
+    let mut sse = Framer::new(Framing::Sse).expect("SSE has a framer");
     sse.push(body, 0, &mut events);
     let mut m = Merged {
         object: "chat.completion".into(),
@@ -208,7 +217,7 @@ pub fn merge_sse(body: &[u8]) -> Merged {
         }
     }
     m.choices = choices.into_values().collect();
-    m.incomplete = !done || m.unparsed_events > 0 || sse.broken;
+    m.incomplete = !done || m.unparsed_events > 0 || sse.lost() > 0;
     m
 }
 

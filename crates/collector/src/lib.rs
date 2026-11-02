@@ -2,7 +2,8 @@
 //!
 //! Packet input ([`source`], [`ring`]), windowing ([`window`]), Flow
 //! assembly ([`assembler`]), and protocol identification, byte accounting,
-//! HTTP/1.1, h2c, SSE and OpenAI Request Workunits ([`decode`]), multihash
+//! HTTP/1.1 and h2c ([`decode`]), Wire Protocols, their response framing
+//! (SSE, NDJSON) and Request Workunits ([`wire`]), multihash
 //! names ([`mh`]) and body views ([`views`]). Hashing, the Capture Rate
 //! cut and the object store: L0 chunks ([`chunk`], [`capture`]), packs
 //! ([`pack`]), Parquet index tables ([`index`]), all written by [`store`]. Counters and diagnostics
@@ -23,22 +24,22 @@ pub mod index;
 pub mod mh;
 pub mod net;
 pub mod observe;
-pub mod openai;
 pub mod output;
 pub mod pack;
 pub mod ring;
 pub mod run;
 pub mod source;
-mod sse;
 pub mod stats;
 pub mod store;
 mod tcp;
 #[cfg(unix)]
 pub mod views;
 pub mod window;
+pub mod wire;
 
 pub use assembler::{Assembler, AssemblerConfig, FlowSink};
 pub use decode::{Decoder, DecoderConfig, RecordSink};
 pub use ring::{RingConfig, RingSource};
 pub use source::{CapturedPacket, FileSource, LinkId, PacketSource, SourceError};
 pub use window::{PacketRef, Windower};
+pub use wire::{Protocols, WireProtocol};

@@ -1,5 +1,5 @@
-//! Protocol identification, HTTP and the OpenAI Wire Protocol on top of
-//! Flow assembly (L2–L3, spec §5).
+//! Protocol identification, HTTP and the Wire Protocols on top of Flow
+//! assembly (L2–L3, spec §5).
 //!
 //! [`Decoder`] sits between the [`Assembler`](crate::Assembler) and the
 //! output. For each TCP Flow it:
@@ -9,7 +9,8 @@
 //!   record header → `tls`; `content-type: application/grpc` refines
 //!   `http2` to `grpc`; anything else → `opaque`. Ports never count;
 //! - parses HTTP/1.1 (chunked included) or h2c, pairs requests with
-//!   responses, and decides which pairs are Request Workunits;
+//!   responses, and asks the registered Wire Protocols ([`crate::wire`])
+//!   which pairs are Request Workunits;
 //! - puts every stream byte in one bucket (`workunit`, `http_other`,
 //!   `framing`, `unexplained`, `gap`) and reports the buckets per Flow,
 //!   direction and Slice.
@@ -30,10 +31,10 @@ use crate::http::{Head, HeadReply, Lab, Out, StartLine};
 use crate::http1::{parse_request_line, parse_status_line, H1};
 use crate::http2::{H2, PREFACE};
 use crate::mh;
-use crate::openai;
 use crate::source::CapturedPacket;
-use crate::sse::{self, Sse};
 use crate::window::PacketRef;
+use crate::wire::framing::{Framed, Framer};
+use crate::wire::{self, Claim, Frame, Framing, Protocols, ResponseDecoder};
 
 /// Bytes held per direction while the verdict is open.
 const MAX_DETECT: usize = 16 << 10;
@@ -47,6 +48,8 @@ pub struct DecoderConfig {
     /// Hand every HTTP body to [`RecordSink::body_data`] so it can be kept
     /// (spec §8). Off with `--no-bodies`: hashes and tables stay the same.
     pub keep_bodies: bool,
+    /// The Wire Protocols requests are matched against (spec §5).
+    pub protocols: Protocols,
 }
 
 impl Default for DecoderConfig {
@@ -54,6 +57,7 @@ impl Default for DecoderConfig {
         DecoderConfig {
             max_body: 16 << 20,
             keep_bodies: true,
+            protocols: Protocols::default(),
         }
     }
 }
@@ -209,6 +213,7 @@ pub struct WorkunitRecord {
     pub exchange: u64,
     pub http: HttpVersion,
     pub h2_stream: Option<u32>,
+    /// The route pattern the request matched, e.g. `/v1/chat/completions`.
     pub endpoint: &'static str,
     /// First byte of the request, last byte of the response.
     pub received_ts_ns: u64,
@@ -226,14 +231,25 @@ pub struct WorkunitRecord {
     pub response_body_len: u64,
     pub response_id: Option<String>,
     pub response_model: Option<String>,
-    pub finish_reason: Vec<openai::FinishReason>,
+    pub finish_reason: Vec<wire::FinishReason>,
     pub usage: Option<serde_json::Value>,
     pub sse_events: Option<Vec<SseEventRecord>>,
     pub sse_done: Option<bool>,
     /// Both messages reached their end with no gap.
     pub complete: bool,
-    /// The response was read as OpenAI JSON: the whole body, or every SSE
-    /// event. Diagnostics only, never written to the table.
+    /// The Wire Protocol's id ([`wire::WireProtocol::id`]).
+    #[serde(skip)]
+    pub protocol: &'static str,
+    /// Token counts from the usage the protocol reports, if it does.
+    #[serde(skip)]
+    pub input_tokens: Option<u64>,
+    #[serde(skip)]
+    pub output_tokens: Option<u64>,
+    /// Protocol-specific fields, as one JSON object ([`wire::extra`]).
+    #[serde(skip)]
+    pub extra: Option<serde_json::Value>,
+    /// The protocol read the response: the whole body, or every frame.
+    /// Diagnostics only, never written to the table.
     #[serde(skip)]
     pub response_parsed: bool,
 }
@@ -576,14 +592,28 @@ struct Body {
     keep: bool,
     buf: Vec<u8>,
     over_limit: bool,
-    sse: Option<Sse>,
-    events: Vec<SseEventRecord>,
+    /// Bytes held while the response's protocol is still open, to replay
+    /// into its framer once it is known.
+    pending: Option<Pending>,
     /// Still streaming to the sink (keep_bodies on, no gap yet).
     stored: bool,
 }
 
+enum Held {
+    Data(Vec<u8>, u64),
+    Gap(u64),
+}
+
+#[derive(Default)]
+struct Pending {
+    pieces: Vec<Held>,
+    bytes: usize,
+    /// Passed the size cap, so it cannot be replayed.
+    over_limit: bool,
+}
+
 impl Body {
-    fn new(keep: bool, sse: bool) -> Self {
+    fn new(keep: bool) -> Self {
         Body {
             len: 0,
             gap: 0,
@@ -591,14 +621,12 @@ impl Body {
             keep,
             buf: Vec::new(),
             over_limit: false,
-            sse: sse.then(Sse::default),
-            events: Vec::new(),
+            pending: None,
             stored: false,
         }
     }
 
-    /// Adds body bytes; SSE events they complete go to `events`.
-    fn push(&mut self, data: &[u8], ts: u64, max: usize, events: &mut Vec<sse::Event>) {
+    fn push(&mut self, data: &[u8], ts: u64, max: usize) {
         self.len += data.len() as u64;
         self.hasher.update(data);
         if self.keep && !self.over_limit {
@@ -609,21 +637,25 @@ impl Body {
                 self.buf = Vec::new();
             }
         }
-        if let Some(s) = &mut self.sse {
-            s.push(data, ts, events);
-            self.events.extend(events.iter().map(|e| SseEventRecord {
-                body_off: e.body_off,
-                len: e.len,
-                ts_ns: e.ts_ns,
-            }));
+        if let Some(p) = &mut self.pending {
+            if p.over_limit || data.is_empty() {
+            } else if p.bytes + data.len() <= max {
+                p.bytes += data.len();
+                p.pieces.push(Held::Data(data.to_vec(), ts));
+            } else {
+                *p = Pending {
+                    over_limit: true,
+                    ..Pending::default()
+                };
+            }
         }
     }
 
     fn gap(&mut self, len: u64) {
         self.len += len;
         self.gap += len;
-        if let Some(s) = &mut self.sse {
-            s.gap();
+        if let Some(p) = &mut self.pending {
+            p.pieces.push(Held::Gap(len));
         }
     }
 
@@ -684,12 +716,123 @@ struct Exchange {
     resp: Option<Msg>,
     interim: u32,
     reset: bool,
-    endpoint: Option<&'static str>,
-    request: Option<openai::Request>,
-    response: openai::Response,
+    /// The Wire Protocols that claim the request, best first.
+    claims: Vec<Claim>,
+    /// The claim that read the request body, and what it read.
+    owner: Option<(Claim, wire::Request)>,
+    /// Reads the response once its protocol is known.
+    reader: Option<Reader>,
     bucket: Option<Bucket>,
     /// Set once the bucket is `workunit`.
     tag: Option<Arc<WorkunitTag>>,
+}
+
+impl Exchange {
+    /// Starts reading the response once both its head and its protocol are
+    /// known, replaying any body bytes that arrived before.
+    fn start_reader(&mut self) {
+        if self.reader.is_some() {
+            return;
+        }
+        let Some(resp) = &mut self.resp else { return };
+        if self.bucket.is_some_and(|b| b != Bucket::Workunit) {
+            resp.body.pending = None;
+            return;
+        }
+        let Some((claim, request)) = &self.owner else {
+            return;
+        };
+        let (p, endpoint) = (claim.protocol, claim.endpoint);
+        let pending = resp.body.pending.take();
+        let Some(framing) = p.response_framing(endpoint, request, resp.head.media_type().as_deref()) else {
+            return;
+        };
+        // A content coding hides the frames.
+        let framer = (framing.is_stream() && resp.identity())
+            .then(|| Framer::new(framing))
+            .flatten();
+        let mut reader = Reader {
+            framing,
+            framer,
+            decoder: p.decoder(endpoint, request),
+            events: Vec::new(),
+            lost: 0,
+        };
+        resp.body.keep = framing == Framing::Json;
+        if let Some(pending) = pending {
+            if pending.over_limit {
+                resp.body.over_limit |= resp.body.keep;
+                reader.lost += 1;
+            }
+            for piece in pending.pieces {
+                match piece {
+                    Held::Data(d, ts) => {
+                        if resp.body.keep {
+                            resp.body.buf.extend_from_slice(&d);
+                        }
+                        reader.push(&d, ts);
+                    }
+                    Held::Gap(n) => reader.gap(n),
+                }
+            }
+        }
+        if resp.done && resp.complete {
+            reader.finish(resp.last_ts);
+        }
+        self.reader = Some(reader);
+    }
+}
+
+/// A response on its way through its protocol's framer and decoder.
+struct Reader {
+    framing: Framing,
+    /// `None` for a whole JSON body, or a stream under a content coding.
+    framer: Option<Framer>,
+    decoder: Box<dyn ResponseDecoder>,
+    /// SSE events, for the record.
+    events: Vec<SseEventRecord>,
+    /// Bytes that could not be replayed (over the size cap).
+    lost: u64,
+}
+
+impl Reader {
+    fn push(&mut self, data: &[u8], ts: u64) {
+        let Some(f) = &mut self.framer else { return };
+        let mut out = Vec::new();
+        f.push(data, ts, &mut out);
+        self.take(out);
+    }
+
+    fn gap(&mut self, len: u64) {
+        if let Some(f) = &mut self.framer {
+            f.gap(len);
+        }
+    }
+
+    fn finish(&mut self, ts: u64) {
+        let Some(f) = &mut self.framer else { return };
+        let mut out = Vec::new();
+        f.finish(ts, &mut out);
+        self.take(out);
+    }
+
+    fn take(&mut self, frames: Vec<Framed>) {
+        for e in frames {
+            if self.framing == Framing::Sse {
+                self.events.push(SseEventRecord {
+                    body_off: e.body_off,
+                    len: e.len,
+                    ts_ns: e.ts_ns,
+                });
+            }
+            self.decoder.frame(e.frame());
+        }
+    }
+
+    /// Frames the protocol never saw.
+    fn lost(&self) -> u64 {
+        self.lost + self.framer.as_ref().map_or(0, Framer::lost)
+    }
 }
 
 /// Which way a direction's first bytes point.
@@ -955,9 +1098,9 @@ impl FlowState {
                 resp: None,
                 interim: 0,
                 reset: false,
-                endpoint: None,
-                request: None,
-                response: openai::Response::default(),
+                claims: Vec::new(),
+                owner: None,
+                reader: None,
                 bucket: None,
                 tag: None,
             },
@@ -1003,6 +1146,7 @@ impl FlowState {
                 }
             }
         }
+        ex.start_reader();
         let finished = ex.reset || resp_closed || ex.resp.as_ref().is_some_and(|r| r.done);
         let Some(bucket) = ex.bucket else { return };
         if !finished || (!ex.req.as_ref().is_none_or(|r| r.done) && !req_closed && !ex.reset) {
@@ -1058,13 +1202,31 @@ impl FlowState {
         let (Some(req), Some(resp)) = (&ex.req, &mut ex.resp) else {
             return;
         };
-        let request = ex.request.clone().unwrap_or_default();
-        // A JSON response is read whole; SSE was read event by event.
-        let sse = resp.body.sse.is_some();
-        let read = sse || (resp.done && resp.body.gap == 0 && !resp.body.over_limit && resp.identity());
-        if !sse && read {
-            ex.response.absorb(&resp.body.buf);
-        }
+        let (claim, request) = ex.owner.take().expect("a Workunit has an owner");
+        let reader = ex.reader.take();
+        let framing = reader.as_ref().map(|r| r.framing);
+        // A JSON response is read whole; a stream was read frame by frame.
+        let streamed = reader.as_ref().is_some_and(|r| r.framer.is_some());
+        let read = streamed
+            || (framing == Some(Framing::Json)
+                && resp.done
+                && resp.body.gap == 0
+                && !resp.body.over_limit
+                && resp.identity());
+        let (response, events, lost) = match reader {
+            Some(mut r) => {
+                if !streamed && read {
+                    r.decoder.frame(Frame {
+                        event: None,
+                        data: &resp.body.buf,
+                    });
+                }
+                let lost = r.lost();
+                (r.decoder.finish(), std::mem::take(&mut r.events), lost)
+            }
+            None => (wire::Response::default(), Vec::new(), 0),
+        };
+        let sse = streamed && framing == Some(Framing::Sse);
         let complete = req.complete && resp.complete && req.body.gap == 0 && resp.body.gap == 0 && !ex.reset;
         let status = match resp.head.start {
             StartLine::Response { status } => status,
@@ -1076,7 +1238,7 @@ impl FlowState {
             exchange: ex.seq,
             http,
             h2_stream: ex.h2_stream,
-            endpoint: ex.endpoint.unwrap_or_default(),
+            endpoint: claim.endpoint,
             received_ts_ns: req.first_ts,
             completed_ts_ns: resp.done.then_some(resp.last_ts),
             model: request.model,
@@ -1089,14 +1251,18 @@ impl FlowState {
             request_body_len: req.body.len,
             response_body_hash: resp.body.hash(),
             response_body_len: resp.body.len,
-            response_id: ex.response.id.clone(),
-            response_model: ex.response.model.clone(),
-            finish_reason: ex.response.finish_reasons(),
-            usage: ex.response.usage.clone(),
-            sse_events: sse.then(|| std::mem::take(&mut resp.body.events)),
-            sse_done: sse.then_some(ex.response.done),
+            response_id: response.id,
+            response_model: response.model,
+            finish_reason: response.finish_reason,
+            usage: response.usage,
+            sse_events: sse.then_some(events),
+            sse_done: sse.then_some(response.done),
             complete,
-            response_parsed: read && ex.response.unparsed == 0,
+            protocol: claim.protocol.id(),
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            extra: response.extra,
+            response_parsed: read && response.unreadable == 0 && lost == 0,
         });
     }
 
@@ -1129,26 +1295,36 @@ fn classify(ex: &mut Exchange, grpc: bool, req_closed: bool, resp_closed: bool) 
         // A response without a request we saw.
         return Some(Bucket::HttpOther);
     };
-    if ex.endpoint.is_none() {
+    if ex.claims.is_empty() {
         return Some(Bucket::HttpOther);
     }
-    if ex.request.is_none() {
+    if ex.owner.is_none() {
         if !req.done {
             return (req_closed || ex.reset).then_some(Bucket::HttpOther);
         }
         let readable = req.complete && req.body.gap == 0 && !req.body.over_limit && req.identity();
-        match readable.then(|| openai::parse_request(&req.body.buf)).flatten() {
-            Some(r) => ex.request = Some(r),
+        // Body sniffing: the first claim that reads the body owns it.
+        let owner = readable
+            .then(|| {
+                ex.claims
+                    .iter()
+                    .find_map(|c| c.protocol.request(c.endpoint, &req.body.buf).map(|r| (*c, r)))
+            })
+            .flatten();
+        match owner {
+            Some(o) => ex.owner = Some(o),
             None => return Some(Bucket::HttpOther),
         }
     }
-    let stream = ex.request.as_ref().is_some_and(|r| r.stream);
+    let (claim, request) = ex.owner.as_ref().expect("set above");
     match &ex.resp {
         Some(resp) => Some(
-            if openai::response_matches(resp.head.media_type().as_deref(), stream) {
-                Bucket::Workunit
-            } else {
-                Bucket::HttpOther
+            match claim
+                .protocol
+                .response_framing(claim.endpoint, request, resp.head.media_type().as_deref())
+            {
+                Some(_) => Bucket::Workunit,
+                None => Bucket::HttpOther,
             },
         ),
         None => (resp_closed || ex.reset).then_some(Bucket::HttpOther),
@@ -1180,11 +1356,6 @@ impl Ctx<'_> {
     }
 
     fn new_msg(&self, start: u64, ts: u64, head: Head, keep: bool) -> Msg {
-        let sse = !self.is_client()
-            && head.media_type().as_deref() == Some("text/event-stream")
-            && head
-                .header_str("content-encoding")
-                .is_none_or(|c| c.eq_ignore_ascii_case("identity"));
         Msg {
             dir: self.dir,
             start,
@@ -1194,7 +1365,7 @@ impl Ctx<'_> {
             head,
             body: Body {
                 stored: self.cfg.keep_bodies,
-                ..Body::new(keep, sse)
+                ..Body::new(keep)
             },
             done: false,
             complete: false,
@@ -1243,15 +1414,15 @@ impl Out for Ctx<'_> {
             {
                 self.f.grpc = true;
             }
-            let endpoint = openai::endpoint(method, target);
+            let claims = self.cfg.protocols.claims(method, target, &head.headers);
             let id = self.f.new_exchange(h2_stream);
             if !h2 {
                 self.f.current[self.dir.idx()] = Some(id);
                 self.f.awaiting.push_back(id);
             }
-            let msg = self.new_msg(start, ts, head, endpoint.is_some());
+            let msg = self.new_msg(start, ts, head, !claims.is_empty());
             let ex = self.f.exchanges.get_mut(&id).expect("new");
-            ex.endpoint = endpoint;
+            ex.claims = claims;
             ex.req = Some(msg);
             self.settle(id);
             return reply;
@@ -1273,10 +1444,13 @@ impl Out for Ctx<'_> {
         if !h2 {
             self.f.current[self.dir.idx()] = Some(id);
         }
-        let candidate = self.f.exchanges[&id].endpoint.is_some();
+        let ex = &self.f.exchanges[&id];
+        // Until a protocol owns the request, hold the body to replay.
+        let hold = !ex.claims.is_empty() && ex.owner.is_none() && ex.bucket.is_none();
         let msg = (!interim).then(|| {
-            let json = head.media_type().as_deref() == Some("application/json");
-            self.new_msg(start, ts, head, candidate && json)
+            let mut m = self.new_msg(start, ts, head, false);
+            m.body.pending = hold.then(Pending::default);
+            m
         });
         let ex = self.f.exchanges.get_mut(&id).expect("exists");
         if let Some(StartLine::Request { method, .. }) = ex.req.as_ref().map(|r| &r.head.start) {
@@ -1300,8 +1474,7 @@ impl Out for Ctx<'_> {
         let Some(m) = (if client { ex.req.as_mut() } else { ex.resp.as_mut() }) else {
             return;
         };
-        let mut events = Vec::new();
-        m.body.push(data, ts, self.cfg.max_body, &mut events);
+        m.body.push(data, ts, self.cfg.max_body);
         m.last_ts = ts;
         if m.body.stored && !data.is_empty() {
             let key = BodyKey {
@@ -1311,8 +1484,10 @@ impl Out for Ctx<'_> {
             };
             self.sink.body_data(&key, data);
         }
-        for e in events {
-            ex.response.absorb(&e.data);
+        if !client {
+            if let Some(r) = &mut ex.reader {
+                r.push(data, ts);
+            }
         }
     }
 
@@ -1322,6 +1497,11 @@ impl Out for Ctx<'_> {
         };
         let flow = self.f.id.clone();
         let dir = self.dir;
+        if !self.is_client() {
+            if let Some(r) = self.f.exchanges.get_mut(&id).and_then(|e| e.reader.as_mut()) {
+                r.gap(len);
+            }
+        }
         let Some(m) = self.msg(stream) else { return };
         m.body.gap(len);
         // A body with a gap has no hash, so it is not kept.
@@ -1344,6 +1524,11 @@ impl Out for Ctx<'_> {
             m.last_ts = m.last_ts.max(ts);
             m.done = true;
             m.complete = complete;
+        }
+        if complete && !self.is_client() {
+            if let Some(r) = self.f.exchanges.get_mut(&id).and_then(|e| e.reader.as_mut()) {
+                r.finish(ts);
+            }
         }
         self.settle(id);
     }
