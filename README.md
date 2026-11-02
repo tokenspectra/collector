@@ -40,11 +40,15 @@ Stage 1 (TS-24): packet input and Flow assembly. Protocol identification, hashin
 
 ```sh
 # Offline, over files in order (window = Slice length).
-cargo run -- files --window-s 10 --out out/ capture-1.pcapng capture-2.pcapng
+cargo run -- files -w 10 -o out/ capture-1.pcapng capture-2.pcapng
 
 # Live, through a dumpcap ring buffer. dumpcap needs the wireshark group.
-sg wireshark -c "cargo run -- ring --interface lo --window-s 10 --ring-dir ring/ --out out/ --duration-s 60"
+sg wireshark -c "cargo run -- ring -i lo -w 10 -t 60"
 ```
+
+- `-o/--out` defaults to the current directory.
+- `-d/--ring-dir` defaults to `<tmp>/tokenspectra-ring-<interface>`.
+- Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter).
 
 ## Tests
 

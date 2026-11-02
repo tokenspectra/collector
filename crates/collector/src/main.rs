@@ -21,33 +21,33 @@ enum Cmd {
     /// Assemble Flows from .pcap/.pcapng files, read in the order given.
     Files {
         /// Window (Slice) length in seconds.
-        #[arg(long, default_value_t = 10)]
+        #[arg(short, long, default_value_t = 10)]
         window_s: u32,
         /// Output directory for the JSONL tables.
-        #[arg(long)]
+        #[arg(short, long, default_value = ".")]
         out: PathBuf,
         files: Vec<PathBuf>,
     },
     /// Capture live with a dumpcap ring buffer and assemble Flows.
     Ring {
         /// Window (Slice) length in seconds; also dumpcap's `-b interval`.
-        #[arg(long, default_value_t = 10)]
+        #[arg(short, long, default_value_t = 10)]
         window_s: u32,
-        #[arg(long)]
+        #[arg(short, long)]
         interface: String,
-        /// Directory for dumpcap's ring files.
-        #[arg(long)]
-        ring_dir: PathBuf,
+        /// Directory for dumpcap's ring files [default: <tmp>/tokenspectra-ring-<interface>].
+        #[arg(short = 'd', long)]
+        ring_dir: Option<PathBuf>,
         /// Stop after this many seconds.
-        #[arg(long)]
+        #[arg(short = 't', long)]
         duration_s: Option<u32>,
         /// Capture filter (dumpcap `-f`).
-        #[arg(long)]
+        #[arg(short, long)]
         filter: Option<String>,
         #[arg(long, default_value = "dumpcap")]
         dumpcap: PathBuf,
         /// Output directory for the JSONL tables.
-        #[arg(long)]
+        #[arg(short, long, default_value = ".")]
         out: PathBuf,
     },
 }
@@ -74,6 +74,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             dumpcap,
             out,
         } => {
+            let ring_dir = ring_dir
+                .unwrap_or_else(|| std::env::temp_dir().join(format!("tokenspectra-ring-{interface}")));
             std::fs::create_dir_all(&ring_dir)?;
             let mut cfg = RingConfig::new(interface, window_s, ring_dir);
             cfg.autostop_s = duration_s;
