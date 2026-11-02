@@ -218,7 +218,12 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Ship { out } => {
             let ingest = ingest.ok_or("`collector ship` needs --ingest")?;
             let s = ship::ship_pending(&out, &ingest, Duration::from_secs(10))?;
-            info!(sent = s.sent, pending = s.pending, "manifests shipped");
+            // No deadline here, so the count is always known.
+            info!(
+                sent = s.sent,
+                pending = s.pending.unwrap_or_default(),
+                "manifests shipped"
+            );
             return Ok(());
         }
         Cmd::Ring {
