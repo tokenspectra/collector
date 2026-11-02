@@ -121,7 +121,7 @@ Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: re
 
 ### Request Workunits
 
-A request/response pair is a Request Workunit when a registered Wire Protocol claims its route, reads its request body, and accepts its response media type (spec §5). For OpenAI: `POST /v1/chat/completions` or `POST /v1/completions` with a JSON body, answered with `application/json`, or `text/event-stream` when the request set `"stream": true`. Everything else is `http_other`.
+A request/response pair is a Request Workunit when a registered Wire Protocol claims its route, reads its request body, and accepts its response media type (spec §5). For OpenAI: `POST /v1/chat/completions`, `POST /v1/completions` or `POST /v1/responses` (the Responses API) with a JSON body, answered with `application/json`, or `text/event-stream` when the request set `"stream": true`. Everything else is `http_other`.
 
 **Adding a Wire Protocol** takes one module under `crates/collector/src/wire/` implementing `WireProtocol` (routes, optional header sniffing, request parsing, the response `Framing`, a frame decoder) and one line in `wire::BUILTIN`. Its fields beyond the common columns go in `extra`. `crates/collector/tests/wire_protocol.rs` registers a protocol that lives only in that test.
 
@@ -177,7 +177,7 @@ python3 tools/llm_traffic.py --stream --count 5 --interval 10
 
 When the script ends, wait one window and press Ctrl-C in terminal 1. Then open `viewer/index.html` in the browser, choose `ts-captures-demo/`, and go to **Request Workunits › conversation**.
 
-- `tools/llm_traffic.py` speaks `POST /v1/chat/completions`: the only endpoints the Collector decodes as Request Workunits are that and `/v1/completions`. Flags: `--model`, `--host` (e.g. `http://localhost:8000` for vLLM), `--stream`, `--multiturn`, `--count`, `--seed`; see `--help`.
+- `tools/llm_traffic.py` speaks `POST /v1/chat/completions`, or the Responses API `POST /v1/responses` with `--api responses` (Ollama serves both). Flags: `--api`, `--model`, `--host` (e.g. `http://localhost:8000` for vLLM), `--stream`, `--multiturn`, `--count`, `--seed`; see `--help`.
 - Ollama also talks to its own llama.cpp runner on a random loopback port (`/completion`, `/tokenize`, `/health`). That shows up as `http_other`; the viewer still rebuilds its conversation from the templated prompt.
 - `ts-captures*` is gitignored. Bodies hold the prompts and replies in plaintext.
 

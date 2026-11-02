@@ -139,6 +139,13 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 
 **The common record** (`workunits`, §8) stays compatible with TS-15 and is the same for every protocol: `protocol` (the protocol's id), `endpoint`, `model`, `stream`, `status`, timing, body hashes and byte counts, `finish_reason` per choice index, `usage` as sent with `input_tokens` and `output_tokens` read from it when the protocol reports them, `complete`. `seed`, `n`, `response_id`, `response_model` are filled where the protocol has them. `sse_events` and `sse_done` are set for `sse` framing only; `sse_done` means the protocol's end-of-stream marker arrived (`data: [DONE]` for OpenAI). Protocol-specific fields go in `extra`, one JSON object built from the protocol's own typed struct, `null` when empty, never new top-level columns.
 
+**OpenAI Responses** (`openai_responses`, TS-30). Route `POST /v1/responses` with a JSON body; the response is `application/json`, or `sse` when the request set `stream: true`. Retrieval (`GET /v1/responses/{id}`) and cancel are `http_other`. A stream is named events whose `data` is a JSON object with a matching `type`. The decoder only reads the events that carry a `response` object (`response.created`, `response.in_progress` and the terminal ones), plus `error`; the last one wins. Ollama (0.40) serves the same route and events.
+- `model`, `stream` from the request; it has no `seed` or `n`. `response_id`, `response_model` and `usage` come from the response object; `input_tokens` and `output_tokens` are read from `usage`.
+- `finish_reason[0]`: the API has no per-choice finish reason, so this is why the response ended. For an `incomplete` response it is `incomplete_details.reason` (e.g. `max_output_tokens`); otherwise it is the final status (`completed`, `failed`, `cancelled`). A `queued` or `in_progress` response has none.
+- `sse_done`: `response.completed`, `response.incomplete`, `response.failed` or `error` arrived.
+- `extra`: `status` (the last status), `error_code` (`error.code` of a failed response, an `error` event or an error body, else its `type`), `previous_response_id`, `service_tier`.
+- An error body (`{"error": {...}}`, e.g. a 404 for an unknown model) is read: an `ok` Workunit with a `4xx` status and no finish reason.
+
 **Byte accounting.** For each Flow, direction and Slice, every stream byte falls in exactly one bucket:
 
 | Bucket | Meaning |
@@ -383,7 +390,7 @@ Metrics, all prefixed `ts_collector_` (labels in brackets):
 | `flows_active` | Flows seen and not yet closed (gauge) |
 | `flows_with_workunit_total` | Closed Flows that carried at least one Request Workunit; over `flows_total`, the share of Flows that carry Workunits |
 | `accounted_bytes_total` `[bucket, direction]` | Stream bytes per bucket (§5) and direction (`orig`, `resp`); `workunit` over the sum is the share of bandwidth that is Workunits |
-| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding, a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
+| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`, `openai_responses`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding, a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
 | `gaps_total`, `gap_bytes_total` | Gaps (§4) and their bytes |
 | `retransmit_bytes_total`, `retransmit_differing_bytes_total` | Retransmitted stream bytes, and those that differ from the first copy |
 | `retransmits_differing_total` | `retransmit_differs` anomalies |
