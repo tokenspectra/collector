@@ -704,3 +704,32 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// Tables are flushed as each window closes, so a live run's rows are on
+/// disk before it ends, and a killed run keeps every closed window.
+#[test]
+fn tables_are_on_disk_when_a_window_closes() {
+    use collector::output::JsonlSink;
+    use collector::run::run;
+    use collector::{AssemblerConfig, DecoderConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut sink = JsonlSink::create(dir.path()).unwrap();
+    let mut source = FileSource::new(fixture_paths(&["openai_h1_sse.pcapng"]));
+    run(
+        &mut source,
+        collect::WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut sink,
+    )
+    .unwrap();
+    // No `finish()`: only the window-close flush has run.
+    let on_disk = std::fs::read(dir.path().join("workunits.jsonl")).unwrap();
+    let golden = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/openai_h1_sse/workunits.jsonl"),
+    )
+    .unwrap();
+    assert!(!golden.is_empty());
+    assert_eq!(on_disk, golden, "{}", first_diff(&golden, &on_disk));
+}

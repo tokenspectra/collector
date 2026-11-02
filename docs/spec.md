@@ -258,6 +258,8 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
 - the index tables (§8), or their object keys;
 - a small window manifest: Collector id, Link ids, window, chunk hashes, pack keys, totals.
 
+**Locally**, the JSONL tables are flushed as each window closes. A live run's files are readable up to the last closed window, and a run that is killed keeps every row written before its last window closed.
+
 Transport follows TS-15:
 - an append-only local log as the source of truth;
 - a shipper POSTs to the control plane's ingest, deduplicated by window and Collector;

@@ -9,6 +9,10 @@
 //! HTTP bodies go to `bodies/{multihash}`, one file per distinct body, until
 //! packs exist (spec §8). `b3sum` of a file prints the last 64 digits of its
 //! name.
+//!
+//! The tables are flushed when each window closes, so a live run's files are
+//! readable up to the last closed window, and an abrupt stop loses at most
+//! the rows since then.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -18,7 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
-use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
+use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord};
 use crate::mh;
 
 pub const TABLES: [&str; 6] = ["packets", "segments", "events", "flows", "http", "workunits"];
@@ -99,6 +103,17 @@ impl JsonlSink {
         Ok(())
     }
 
+    fn tables(&mut self) -> [&mut BufWriter<File>; 6] {
+        [
+            &mut self.packets,
+            &mut self.segments,
+            &mut self.events,
+            &mut self.flows,
+            &mut self.http,
+            &mut self.workunits,
+        ]
+    }
+
     /// Flushes every file and reports the first write error, if any.
     pub fn finish(mut self) -> io::Result<()> {
         for (_, (path, _)) in self.open.drain() {
@@ -107,14 +122,7 @@ impl JsonlSink {
         if let Some(e) = self.error.take() {
             return Err(e);
         }
-        for w in [
-            &mut self.packets,
-            &mut self.segments,
-            &mut self.events,
-            &mut self.flows,
-            &mut self.http,
-            &mut self.workunits,
-        ] {
+        for w in self.tables() {
             w.flush()?;
         }
         Ok(())
@@ -170,6 +178,16 @@ impl RecordSink for JsonlSink {
     fn body_end(&mut self, key: &BodyKey, hash: Option<&str>) {
         if let Err(e) = self.keep_body(key, hash) {
             self.error.get_or_insert(e);
+        }
+    }
+
+    fn window_closed(&mut self, _w: &WindowClose) {
+        if self.error.is_some() {
+            return;
+        }
+        let res = self.tables().into_iter().try_for_each(|w| w.flush());
+        if let Err(e) = res {
+            self.error = Some(e);
         }
     }
 }
