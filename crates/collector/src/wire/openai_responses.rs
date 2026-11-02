@@ -14,6 +14,14 @@
 //! `incomplete_details.reason` of an `incomplete` response (such as
 //! `max_output_tokens`), else its final status (`completed`, `failed`,
 //! `cancelled`). A response still `queued` or `in_progress` has none.
+//!
+//! Outcome: a stream is read whole only once `response.completed` or
+//! `response.incomplete` arrives. `incomplete` (e.g. `max_output_tokens`)
+//! is a whole, readable response, like a Chat Completions `finish_reason:
+//! length`. A stream that ends without a terminal event, and a failure in
+//! band behind HTTP 200 (`response.failed`, an `error` event, or a response
+//! object with status `failed`), are counted as not read, so the Workunit
+//! is `errored`; a gap still makes it `incomplete` first.
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -65,8 +73,11 @@ impl WireProtocol for OpenAiResponses {
         }
     }
 
-    fn decoder(&self, _endpoint: &'static str, _request: &Request) -> Box<dyn ResponseDecoder> {
-        Box::<Decoder>::default()
+    fn decoder(&self, _endpoint: &'static str, request: &Request) -> Box<dyn ResponseDecoder> {
+        Box::new(Decoder {
+            stream: request.stream,
+            ..Decoder::default()
+        })
     }
 }
 
@@ -96,6 +107,14 @@ struct Decoder {
     unreadable: u64,
     /// A terminal stream event was seen.
     done: bool,
+    /// The request asked for a stream.
+    stream: bool,
+    /// The response was one JSON body (a response object or an error), not
+    /// a stream of events.
+    json_body: bool,
+    /// The response failed in band: `response.failed`, an `error` event, or
+    /// status `failed`.
+    failed: bool,
 }
 
 fn string(o: &Map<String, Value>, k: &str) -> Option<String> {
@@ -119,6 +138,7 @@ impl Decoder {
         set(&mut self.id, "id");
         set(&mut self.model, "model");
         set(&mut self.status, "status");
+        self.failed |= self.status.as_deref() == Some("failed");
         set(&mut self.previous_response_id, "previous_response_id");
         set(&mut self.service_tier, "service_tier");
         if let Some(reason) = r
@@ -145,11 +165,13 @@ impl ResponseDecoder for Decoder {
         };
         if frame.event.is_none() && v.get("object").and_then(Value::as_str) == Some("response") {
             // A whole JSON body: the response object itself.
+            self.json_body = true;
             self.response(&v);
             return;
         }
         if frame.event.is_none() && !v.contains_key("type") {
             // A JSON error body: {"error": {...}}.
+            self.json_body = true;
             match v.get("error").filter(|e| e.is_object()) {
                 Some(e) => self.error_code = error_code(e),
                 None => self.unreadable += 1,
@@ -168,6 +190,7 @@ impl ResponseDecoder for Decoder {
             self.response(r);
         }
         if kind == "error" {
+            self.failed = true;
             if let Some(code) = string(&v, "code") {
                 self.error_code = Some(code);
             }
@@ -178,6 +201,7 @@ impl ResponseDecoder for Decoder {
     }
 
     fn finish(self: Box<Self>) -> Response {
+        let unfinished = self.stream && !self.json_body && !self.done;
         let tokens = |k: &str| self.usage.as_ref().and_then(|u| u.get(k)).and_then(Value::as_u64);
         let reason = match self.status.as_deref() {
             Some("incomplete") => self.incomplete_reason.clone().or(self.status.clone()),
@@ -204,7 +228,8 @@ impl ResponseDecoder for Decoder {
                 .collect(),
             usage: self.usage,
             done: self.done,
-            unreadable: self.unreadable,
+            // Not read whole: the shared outcome check makes it `errored`.
+            unreadable: self.unreadable + u64::from(self.failed || unfinished),
         }
     }
 }
@@ -217,7 +242,11 @@ mod tests {
     use crate::wire::Protocols;
 
     fn decode(frames: &[(Option<&str>, &str)]) -> Response {
-        let mut d = OpenAiResponses.decoder(RESPONSES, &Request::default());
+        let stream = Request {
+            stream: frames.iter().any(|(e, _)| e.is_some()),
+            ..Request::default()
+        };
+        let mut d = OpenAiResponses.decoder(RESPONSES, &stream);
         for (event, data) in frames {
             d.frame(Frame {
                 event: event.map(str::as_bytes),
@@ -299,6 +328,7 @@ mod tests {
         )]);
         assert_eq!(r.finish_reason[0].finish_reason, "max_output_tokens");
         assert_eq!(r.extra.unwrap()["status"], "incomplete");
+        assert_eq!(r.unreadable, 0, "incomplete is a readable response");
     }
 
     #[test]
@@ -346,6 +376,8 @@ mod tests {
         )]);
         assert!(!r.done && r.finish_reason.is_empty());
         assert_eq!(r.extra.unwrap()["status"], "in_progress");
+        // A stream request: ending before a terminal event is not read whole.
+        assert_eq!(r.unreadable, 1);
     }
 
     #[test]
@@ -354,7 +386,7 @@ mod tests {
             Some("response.failed"),
             r#"{"type":"response.failed","response":{"object":"response","status":"failed","error":{"code":"server_error","message":"x"}}}"#,
         )]);
-        assert!(r.done);
+        assert_eq!((r.done, r.unreadable), (true, 1));
         assert_eq!(r.finish_reason[0].finish_reason, "failed");
         assert_eq!(r.extra.unwrap()["error_code"], "server_error");
         let r = decode(&[(
@@ -362,6 +394,7 @@ mod tests {
             r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down","param":null}"#,
         )]);
         assert!(r.done && r.finish_reason.is_empty());
+        assert_eq!(r.unreadable, 1);
         assert_eq!(r.extra.unwrap()["error_code"], "rate_limit_exceeded");
     }
 

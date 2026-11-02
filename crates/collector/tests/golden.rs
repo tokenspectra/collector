@@ -472,8 +472,10 @@ fn openai_responses_errors_are_workunits() {
     assert_eq!(missing.outcome(), collector::stats::Outcome::Ok);
     assert!(missing.finish_reason.is_empty() && missing.response_id.is_none());
     assert_eq!(responses_extra(missing, "error_code"), "model_not_found");
-    // A stream that ends in response.failed.
-    assert!(failed.stream && failed.sse_done == Some(true));
+    // A stream that ends in response.failed: a failure in band behind
+    // HTTP 200, so `errored`.
+    assert!(failed.stream && failed.complete && failed.sse_done == Some(true));
+    assert_eq!(failed.outcome(), collector::stats::Outcome::Errored);
     assert_eq!(failed.finish_reason[0].finish_reason, "failed");
     assert_eq!(responses_extra(failed, "error_code"), "server_error");
     assert_eq!(responses_extra(failed, "status"), "failed");

@@ -143,6 +143,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 - `model`, `stream` from the request; it has no `seed` or `n`. `response_id`, `response_model` and `usage` come from the response object; `input_tokens` and `output_tokens` are read from `usage`.
 - `finish_reason[0]`: the API has no per-choice finish reason, so this is why the response ended. For an `incomplete` response it is `incomplete_details.reason` (e.g. `max_output_tokens`); otherwise it is the final status (`completed`, `failed`, `cancelled`). A `queued` or `in_progress` response has none.
 - `sse_done`: `response.completed`, `response.incomplete`, `response.failed` or `error` arrived.
+- Outcome (§14): a stream is `ok` only when it ends in `response.completed` or `response.incomplete`. `incomplete` (e.g. `max_output_tokens`, recorded as the finish reason) is a whole, readable response, like a Chat Completions `finish_reason: length`. A stream with no terminal event, and a failure in band behind HTTP 200 (`response.failed`, an `error` event, or a response object with status `failed`), is `errored`. A gap makes it `incomplete` first.
 - `extra`: `status` (the last status), `error_code` (`error.code` of a failed response, an `error` event or an error body, else its `type`), `previous_response_id`, `service_tier`.
 - An error body (`{"error": {...}}`, e.g. a 404 for an unknown model) is read: an `ok` Workunit with a `4xx` status and no finish reason.
 
