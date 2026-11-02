@@ -17,6 +17,8 @@ pub(crate) struct Emit<'a> {
     pub flow: &'a FlowId,
     pub dir: Dir,
     pub stats: &'a mut DirStats,
+    /// This direction's Slice hash chain; every delivered byte goes in.
+    pub hash: &'a mut blake3::Hasher,
 }
 
 impl Emit<'_> {
@@ -247,6 +249,7 @@ impl TcpDir {
             self.pending_bytes -= p.len;
             match p.data {
                 Some(data) => {
+                    e.hash.update(&data);
                     e.sink.segment(
                         &SegmentRecord {
                             flow: e.flow.clone(),

@@ -39,6 +39,7 @@ pub fn run(
             });
             summary.windows += 1;
         }
+        decoder.captured(&pkt, placed.at);
         assembler.push(&pkt, placed.at, &mut decoder);
         summary.packets += 1;
     }

@@ -3,6 +3,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
@@ -12,6 +13,7 @@ use collector::observe::{log_summary, StatsSink};
 use collector::output::JsonlSink;
 use collector::run::run;
 use collector::stats::{serve_metrics, Registry};
+use collector::store::{StoreConfig, StoreSink};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource, RingConfig, RingSource};
 
 #[derive(Parser)]
@@ -38,6 +40,32 @@ struct Cli {
     /// Serve Prometheus metrics at http://<addr>/metrics, e.g. 127.0.0.1:9464.
     #[arg(long, global = true)]
     metrics_addr: Option<String>,
+    /// Object store root for L0 chunks, packs and Parquet index tables
+    /// [default: <out>/store].
+    #[arg(long, global = true)]
+    store: Option<PathBuf>,
+    /// The `{site}` part of object keys.
+    #[arg(long, global = true, default_value = "local")]
+    site: String,
+    /// The `{collector}` part of object keys.
+    #[arg(long, global = true, default_value = "local")]
+    collector_id: String,
+    /// Capture Rate: share of Request Workunits whose packets L0 chunks keep
+    /// in full (0 to 1). The rest are truncated; every byte is still hashed.
+    #[arg(long, global = true, default_value_t = 1.0)]
+    capture_rate: f64,
+    /// 64 hex digits: the key each window's Capture Rate secret is derived
+    /// from, until the control plane hands out secrets. Needed when
+    /// --capture-rate is below 1.
+    #[arg(long, global = true)]
+    capture_key: Option<String>,
+    /// Captured bytes left in a truncated packet.
+    #[arg(long, global = true, default_value_t = 128)]
+    truncate_to: u32,
+    /// Captured bytes of alarm packets (unexplained, tls, opaque, grpc, UDP)
+    /// kept in full per Flow per Slice; later ones are truncated.
+    #[arg(long, global = true, default_value_t = 16 << 20)]
+    alarm_cap: u64,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -139,6 +167,19 @@ fn init_logging(cli: &Cli) {
     }
 }
 
+/// A 32-byte key from 64 hex digits.
+fn parse_key(hex: &str) -> Result<[u8; 32], String> {
+    let bad = || "--capture-key must be 64 hex digits".to_string();
+    if hex.len() != 64 || !hex.is_ascii() {
+        return Err(bad());
+    }
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+    }
+    Ok(key)
+}
+
 fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let decoder_cfg = DecoderConfig {
         keep_bodies: !cli.no_bodies,
@@ -175,7 +216,24 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if window_s == 0 {
         return Err("window must be positive".into());
     }
+    let window_ns = u64::from(window_s) * 1_000_000_000;
+    let mut store_cfg = StoreConfig::new(window_ns);
+    store_cfg.site = cli.site.clone();
+    store_cfg.collector = cli.collector_id.clone();
+    store_cfg.capture.rate = cli.capture_rate;
+    store_cfg.capture.truncate_to = cli.truncate_to;
+    store_cfg.capture.alarm_cap_bytes = cli.alarm_cap;
+    store_cfg.capture.key = cli.capture_key.as_deref().map(parse_key).transpose()?;
+    if !(0.0..=1.0).contains(&cli.capture_rate) {
+        return Err("--capture-rate must be between 0 and 1".into());
+    }
+    if cli.capture_rate < 1.0 && store_cfg.capture.key.is_none() {
+        return Err("--capture-rate below 1 needs --capture-key: the draw must be unpredictable".into());
+    }
     std::fs::create_dir_all(&out)?;
+    let store_dir = cli.store.clone().unwrap_or_else(|| out.join("store"));
+    std::fs::create_dir_all(&store_dir)?;
+    let object_store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&store_dir)?);
     let registry = Registry::new();
     if let Some(addr) = &cli.metrics_addr {
         let bound = serve_metrics(addr.as_str(), registry.clone())
@@ -198,14 +256,23 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
     let mut sink = JsonlSink::create(&out)?;
+    let mut store = StoreSink::new(&mut sink, object_store, store_cfg, Some(registry.clone()));
     run(
         source.as_mut(),
-        u64::from(window_s) * 1_000_000_000,
+        window_ns,
         AssemblerConfig::default(),
         decoder_cfg,
-        &mut StatsSink::new(&mut sink, registry.clone()),
+        &mut StatsSink::new(&mut store, registry.clone()),
     )?;
+    let stored = store.finish()?;
     sink.finish()?;
+    info!(
+        store = %store_dir.display(),
+        chunks = stored.chunks,
+        packs = stored.packs,
+        index_files = stored.index_files,
+        "object store written"
+    );
     // Views for people, derived from the tables and bodies just written.
     if !cli.no_bodies {
         collector::views::write(&out)?;

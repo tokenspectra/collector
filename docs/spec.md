@@ -157,6 +157,10 @@ BLAKE3 everywhere, at 3.4 GiB/s per core and 10 GiB/s on 4 threads on a modest V
     - Not `multihash-codetable`: it adds hasher plumbing (`multihash-derive`, `digest`) we don't need, and builds `blake3` with default features off.
     - Not `multibase`: the text form is `f` + hex, a few lines. Add it if a second base is ever needed.
   - **Parsing is strict.** For now a name is accepted only as `f1e20` + 64 lowercase hex digits; anything else is rejected, not guessed at.
+- **Encodings (TS-26).** The rules above, made exact:
+  - **L0 packet:** `blake3(captured bytes)`, the `hash` column of `packets`. The Merkle root over a chunk's packets, in packet order, uses leaves `blake3(0x00 ‖ packet hash)` and nodes `blake3(0x01 ‖ left ‖ right)`, so a leaf never passes for a node; an odd node at the end of a level moves up unchanged.
+  - **L1 Slice:** `slice_hash[n] = blake3(slice_hash[n-1] ‖ flow_id ‖ 0x00 ‖ dir ‖ bytes)`, with `dir` one byte (`0` orig, `1` resp), the same layout as `workunit_id`. `slice_hash[-1] = blake3(flow_id ‖ 0x00 ‖ first_ts_ns as u64 big-endian)`. Every Slice row has one per direction (`orig_stats.slice_hash`, `resp_stats.slice_hash`), even when that direction sent nothing. UDP and other IP protocols have no stream: each datagram's captured payload goes in with a u32 big-endian length prefix, so datagram boundaries are committed too.
+  - **L3 record:** the record bytes are the `workunits` row's JSON, as written in the table.
 - **Bao (later).** Verified range reads against a body or chunk hash. Bao is beta and unaudited (research §6), so v1 verifies whole objects only.
 
 ## 7. Capture Rate and retention at the packet level
@@ -175,6 +179,16 @@ The Collector holds one window in memory (or on local disk), hashes all of it, t
   - This is separate from the Sampler's Recompute Rate secret, which never reaches the edge (architecture.md §3).
 - **Deletion is the control plane's job**, under the Retention Policy. The Collector only writes.
 
+**As built (TS-26).**
+- **Which packets.** A packet is kept in full unless:
+  - it carries `unexplained` bytes, or is a UDP or other IP datagram with payload (the alarm): then full until the Flow's alarm packets in this Slice pass `--alarm-cap` captured bytes (default 16 MiB), truncated after;
+  - it carries bytes of a Request Workunit the Capture Rate did not keep, and otherwise only `framing` or `gap` bytes: then truncated to `--truncate-to` bytes (default 128).
+  - A packet with any `http_other` or kept Workunit byte stays whole, and so does one an anomaly event points at (e.g. `retransmit_differs`), since it is evidence.
+- **The draw.** `--capture-rate` (default 1: keep every Workunit). A Workunit is kept when the first 8 bytes of `keyed_hash(window secret, workunit_id)`, read as a big-endian integer, fall below `rate · 2^64`. The window is the one the request started in.
+  - Until the control plane hands out secrets, each window's secret is `keyed_hash(run key, window_start_ns as u64 big-endian)`, with the run key from `--capture-key`. A rate below 1 without a key is refused, never filled in from the traffic or the clock.
+- **When a chunk is written.** A packet's class needs its bytes' buckets, which can wait a window for a response head (§5). So a window is held until it has closed and every TCP packet in it has its buckets, or until two more windows have closed; packets still unknown then are kept in full.
+- **Bodies are not cut.** Bodies stay in packs at any Capture Rate (§13).
+
 ## 8. Object-store layout
 
 The seam is the `object_store` crate's `ObjectStore` trait (research §3):
@@ -189,7 +203,9 @@ packs/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}.pack          # L2 bodi
 index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
 ```
 
-- **L0 chunks:** one object per Link per window, zstd-compressed. If a chunk passes a size cap (e.g. 1 GiB), split it into `-partN` objects.
+- **As built (TS-26):** `{window_start}` is the window start in nanoseconds since the Unix epoch, the `window_start_ns` column; `{yyyy}/{mm}/{dd}` is its UTC date; `{site}` and `{collector}` come from `--site` and `--collector-id` (default `local`); `{link}` is the Link with every character outside `[A-Za-z0-9._-]` replaced by `_`. The CLI writes to a `LocalFileSystem` at `--store` (default `<out>/store`).
+  - A put that finds the object already there reads it back: the same bytes (a re-run over the same capture) are left alone, other bytes fail the run. Nothing is overwritten.
+- **L0 chunks:** one object per Link per window, zstd-compressed. If a chunk passes a size cap (e.g. 1 GiB), split it into `-partN` objects. _Not built yet: v1 writes one object per chunk with a single put, since `put_multipart` cannot be write-once (no `PutMode::Create`)._
   - Big objects use `put_multipart` (5 MiB–5 GiB parts, ≤ 10,000 parts; research §4).
   - The name includes the chunk hash, so a chunk can be checked from its name alone.
 - **Packs:** L2 bodies and L3 records are KB-sized, and object stores charge per request. One pack per window holds many items:
@@ -201,7 +217,7 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
 - **Which bodies (proposal, TS-25):** every HTTP body that has a `body_hash` is kept, request and response, Workunit or `http_other`.
   - Kept by default. An option (`--no-bodies`) turns body storage off. Hashes, lengths and every index table stay the same; only the blobs are missing.
   - Bytes as hashed (§6): chunked encoding removed, content coding kept, one blob per SSE response. A body with a gap has no `body_hash` and is not kept; its packets are still in L0.
-  - Until packs exist, the Collector writes one file per body, `bodies/{multihash}`, next to its output tables. `b3sum` of the file prints the last 64 digits of its name.
+  - Packs hold them, beside every Request Workunit record (TS-26). The Collector also writes one file per body, `bodies/{multihash}`, next to its output tables, as the local view. `b3sum` of the file prints the last 64 digits of its name.
   - Why: without them, reading a request or response means reassembling its Flow from L0 chunks. With them, every body hash in the index can be read directly (`GET /blobs/{blake3}`, §11).
   - Bodies hold plaintext prompts and outputs (§10). The option is for runs that should keep hashes only.
 - **Two views of the same bodies (proposal).** Keep both:
@@ -232,6 +248,10 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - `packets`: chunk, packet index, timestamp, Flow, direction, stream offset, captured and original length, packet hash;
   - `workunits`: L3 records;
   - `blobs`: hash → pack location.
+  - As built (TS-26), also `segments`, `events` and `http`, the same tables as the local JSONL, and `chunks`: one row per L0 chunk with its key, chunk hash, Merkle root, packet count and the Capture Rate's kept and truncated bytes.
+  - Each table has a fixed schema, so a column keeps its type in every window. Nested records are flattened (`orig_stats.packets` → `orig_stats_packets`). Values the Operator sends as arbitrary JSON (`usage`, `seed`, `n`), and lists, are JSON text. Every column is optional.
+  - A row goes in the window it belongs to (a packet's, a Slice's) while that window is held; otherwise, and for `http`, `workunits` and pack items, in the newest window held when it is written.
+- **Local view.** `bodies/` and `by-exchange/` stay beside the tables as the local view; packs are the store.
 - **Tamper evidence (optional):** S3 Object Lock in compliance mode makes objects WORM, even for the account root. It needs versioning (research §4).
 - **S3 checksums are not our hashes.** S3 has no BLAKE3 (research §4). Our hashes live in the index and the key names. S3's own checksum (e.g. CRC64NVME) only protects the upload.
 - **Dedup across turns (later).** In multi-turn chat, each request resends the whole conversation. FastCDC chunking of request bodies (research §3) could store the shared history once. Not in v1.
@@ -298,7 +318,7 @@ Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in 
 
 - **Window length `W`** and the in-memory budget for holding one window at line rate.
 - **Self-hosted S3-compatible store**, now that community MinIO has no binaries.
-- **Truncated-packet length** (128 B?), and the per-Flow cap for alarm Flows.
+- **Truncated-packet length** and the per-Flow cap for alarm Flows. TS-26 defaults to 128 B and 16 MiB per Flow per Slice, both flags.
 - **The `workunit_id` scheme**, and whether TS-15's UUID moves to it.
 - **dumpcap throughput and drops** at Link speed. Only loopback has been tested so far.
 - **Keyed-hash key management** (rotation, disclosure for audits), for the Payload privacy work.
@@ -345,4 +365,11 @@ Metrics, all prefixed `ts_collector_` (labels in brackets):
 | `last_window_lag_seconds` | Wall clock at the close of the last window minus that window's end in capture time (gauge). Near `W` live; meaningless offline |
 
 - **Counts follow the tables.** Packets by verdict and bytes by bucket are added as each Flow row (§8) is written, so they can trail by a window: a row waits until every byte in it has a bucket (§5). At the end of a run they equal the tables exactly, and the buckets sum to every Flow's stream bytes.
-- **Later counters join the same registry:** kept and truncated bytes (the Capture Rate, §7) and object-store writes (TS-26).
+- **Capture Rate and store (TS-26):**
+
+| Metric | Meaning |
+|---|---|
+| `capture_packets_total` `[cut]` | Packets written to L0 chunks, `full` or `truncated` |
+| `capture_kept_bytes_total`, `capture_truncated_bytes_total` | Captured bytes written to chunks, and captured bytes the Capture Rate cut |
+| `store_objects_total`, `store_bytes_total` `[kind]` | Objects written and their bytes; `kind`: `chunk`, `pack`, `index` |
+| `store_existing_total` | Puts that found the same object already there (a re-run) |

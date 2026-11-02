@@ -12,6 +12,7 @@ use collector::observe::StatsSink;
 use collector::output::{JsonlSink, BODIES, TABLES};
 use collector::run::run;
 use collector::stats::{Registry, Snapshot};
+use collector::store::{StoreConfig, StoreSink};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource};
 
 pub const WINDOW_NS: u64 = 1_000_000_000;
@@ -161,18 +162,17 @@ pub fn tables_and_bodies_with(
     observe: bool,
 ) -> (Files, Files) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut sink = JsonlSink::create(dir.path()).expect("sink");
     let cfg = DecoderConfig {
         keep_bodies,
         ..DecoderConfig::default()
     };
-    if observe {
-        let mut stats = StatsSink::new(&mut sink, Registry::new());
-        run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut stats).expect("run");
-    } else {
-        run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut sink).expect("run");
-    }
-    sink.finish().expect("finish");
+    run_stored(
+        source,
+        dir.path(),
+        cfg,
+        StoreConfig::new(WINDOW_NS),
+        observe.then(Registry::new),
+    );
     let mut bodies: Files = std::fs::read_dir(dir.path().join(BODIES))
         .map(|rd| {
             rd.map(|e| {
@@ -197,20 +197,47 @@ pub fn tables_and_bodies_with(
     (tables, bodies)
 }
 
-/// Runs `source` into a fresh output directory, bodies and views included,
-/// the way the CLI does.
+/// Runs `source` into `out` the way the CLI does: tables in `out`, the
+/// object store in `out/store`, and with a registry, through a
+/// [`StatsSink`].
+pub fn run_stored(
+    source: &mut dyn PacketSource,
+    out: &Path,
+    cfg: DecoderConfig,
+    store_cfg: StoreConfig,
+    reg: Option<std::sync::Arc<Registry>>,
+) {
+    let store_dir = out.join("store");
+    std::fs::create_dir_all(&store_dir).expect("store dir");
+    let store = std::sync::Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(&store_dir).expect("local store"),
+    );
+    let mut sink = JsonlSink::create(out).expect("sink");
+    let mut stored = StoreSink::new(&mut sink, store, store_cfg, reg.clone());
+    match reg {
+        Some(reg) => {
+            let mut stats = StatsSink::new(&mut stored, reg);
+            run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut stats).expect("run");
+        }
+        None => {
+            run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut stored).expect("run");
+        }
+    }
+    stored.finish().expect("store");
+    sink.finish().expect("finish");
+}
+
+/// Runs `source` into a fresh output directory, bodies, views and the
+/// object store included, the way the CLI does.
 pub fn run_to_dir(source: &mut dyn PacketSource) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut sink = JsonlSink::create(dir.path()).expect("sink");
-    run(
+    run_stored(
         source,
-        WINDOW_NS,
-        AssemblerConfig::default(),
+        dir.path(),
         DecoderConfig::default(),
-        &mut sink,
-    )
-    .expect("run");
-    sink.finish().expect("finish");
+        StoreConfig::new(WINDOW_NS),
+        None,
+    );
     collector::views::write(dir.path()).expect("views");
     dir
 }

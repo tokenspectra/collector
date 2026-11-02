@@ -2,8 +2,10 @@
 //!
 //! `packets`, `segments` (stream offset → packet), `events` (gaps,
 //! anomalies), `flows` (one row per Flow per Slice, with verdict and byte
-//! accounting), `http` (one row per HTTP exchange) and `workunits` (Request
-//! Workunits). Rows are written in a fixed order with fixed field order, so
+//! accounting), `http` (one row per HTTP exchange), `workunits` (Request
+//! Workunits), and, when a [`StoreSink`](crate::store::StoreSink) writes the
+//! object store in front of this sink, `chunks` (one row per L0 chunk) and
+//! `blobs` (one row per pack item). Rows are written in a fixed order with fixed field order, so
 //! the files are byte-identical across runs.
 //!
 //! HTTP bodies go to `bodies/{multihash}`, one file per distinct body, until
@@ -24,9 +26,19 @@ use serde::Serialize;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord};
+use crate::store::{BlobRecord, ChunkRecord};
 use crate::{mh, views};
 
-pub const TABLES: [&str; 6] = ["packets", "segments", "events", "flows", "http", "workunits"];
+pub const TABLES: [&str; 8] = [
+    "packets",
+    "segments",
+    "events",
+    "flows",
+    "http",
+    "workunits",
+    "chunks",
+    "blobs",
+];
 
 /// Directory of kept bodies, inside the output directory.
 pub const BODIES: &str = "bodies";
@@ -38,6 +50,8 @@ pub struct JsonlSink {
     flows: BufWriter<File>,
     http: BufWriter<File>,
     workunits: BufWriter<File>,
+    chunks: BufWriter<File>,
+    blobs: BufWriter<File>,
     out: PathBuf,
     bodies: PathBuf,
     /// `http` rows not yet in `by-exchange/`; linked when the window closes,
@@ -65,6 +79,8 @@ impl JsonlSink {
             flows: open("flows")?,
             http: open("http")?,
             workunits: open("workunits")?,
+            chunks: open("chunks")?,
+            blobs: open("blobs")?,
             out: dir.to_owned(),
             bodies: dir.join(BODIES),
             unlinked: Vec::new(),
@@ -115,7 +131,7 @@ impl JsonlSink {
         Ok(())
     }
 
-    fn tables(&mut self) -> [&mut BufWriter<File>; 6] {
+    fn tables(&mut self) -> [&mut BufWriter<File>; 8] {
         [
             &mut self.packets,
             &mut self.segments,
@@ -123,6 +139,8 @@ impl JsonlSink {
             &mut self.flows,
             &mut self.http,
             &mut self.workunits,
+            &mut self.chunks,
+            &mut self.blobs,
         ]
     }
 
@@ -182,6 +200,14 @@ impl RecordSink for JsonlSink {
 
     fn workunit(&mut self, rec: &WorkunitRecord) {
         write_row(&mut self.workunits, &mut self.error, rec);
+    }
+
+    fn chunk(&mut self, rec: &ChunkRecord) {
+        write_row(&mut self.chunks, &mut self.error, rec);
+    }
+
+    fn blob(&mut self, rec: &BlobRecord) {
+        write_row(&mut self.blobs, &mut self.error, rec);
     }
 
     fn body_data(&mut self, key: &BodyKey, data: &[u8]) {

@@ -14,12 +14,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 
 use crate::assembler::{EventKind, EventRecord, PacketRecord, SegmentRecord};
-use crate::decode::{BodyKey, Bucket, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord};
+use crate::decode::{
+    BodyKey, Bucket, ExchangeRecord, FlowRecord, RecordSink, Span, WindowClose, WorkunitRecord,
+};
 use crate::flow::{Dir, FlowId};
+use crate::source::CapturedPacket;
 use crate::stats::{
     add, bucket_str, dir_str, fmt_ts, pct, HttpClass, Outcome, Registry, Snapshot, VerdictLabel, WindowStats,
     BUCKETS, DIRS,
 };
+use crate::store::{BlobRecord, ChunkRecord};
+use crate::window::PacketRef;
 
 /// What is known about an open Flow.
 #[derive(Default)]
@@ -195,6 +200,30 @@ impl RecordSink for StatsSink<'_> {
 
     fn body_end(&mut self, key: &BodyKey, hash: Option<&str>) {
         self.inner.body_end(key, hash);
+    }
+
+    fn captured(&mut self, pkt: &CapturedPacket, at: PacketRef) {
+        self.inner.captured(pkt, at);
+    }
+
+    fn spans(&mut self, flow: &FlowId, dir: Dir, spans: &[Span]) {
+        self.inner.spans(flow, dir, spans);
+    }
+
+    fn chunk(&mut self, rec: &ChunkRecord) {
+        debug!(
+            link = %rec.link,
+            window = %fmt_ts(rec.window_start_ns),
+            packets = rec.packets,
+            truncated = rec.truncated_packets,
+            key = %rec.key,
+            "chunk stored"
+        );
+        self.inner.chunk(rec);
+    }
+
+    fn blob(&mut self, rec: &BlobRecord) {
+        self.inner.blob(rec);
     }
 
     fn window_closed(&mut self, w: &WindowClose) {

@@ -17,7 +17,7 @@ use collector::decode::{Bucket, Buckets, HttpVersion, Verdict};
 use collector::flow::Dir;
 use collector::{FileSource, RingSource};
 
-use collect::{collect_files, fixture_dir, fixture_paths, run_to_dir, tables, tables_and_bodies};
+use collect::{collect_files, fixture_dir, fixture_paths, run_to_dir, tables, tables_and_bodies, Files};
 use fixtures::{cases, DUMPCAP_KEEPALIVE};
 
 fn first_diff(expected: &[u8], actual: &[u8]) -> String {
@@ -613,9 +613,29 @@ fn bodies_are_kept_by_hash_unless_opted_out() {
         }
         kept_any |= bodies.iter().any(|(_, b)| !b.is_empty());
 
+        // Only the blobs are missing: every other table is the same, and the
+        // pack holds the same Workunit records, without bodies.
         let (without, none) = tables_and_bodies(&mut FileSource::new(fixture_paths(&names)), false);
         assert!(none.is_empty(), "{case}");
-        assert_eq!(without, tables, "{case}");
+        let not_blobs =
+            |t: &Files| -> Files { t.iter().filter(|(n, _)| n != "blobs.jsonl").cloned().collect() };
+        assert_eq!(not_blobs(&without), not_blobs(&tables), "{case}");
+        let records = |t: &Files, kind: &str| -> Vec<String> {
+            let blobs = &t.iter().find(|(n, _)| n == "blobs.jsonl").unwrap().1;
+            blobs
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_slice::<serde_json::Value>(l).unwrap())
+                .filter(|r| r["kind"] == kind)
+                .map(|r| r["hash"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(records(&without, "body").is_empty(), "{case}");
+        assert_eq!(
+            records(&without, "workunit"),
+            records(&tables, "workunit"),
+            "{case}"
+        );
     }
     assert!(kept_any);
 }

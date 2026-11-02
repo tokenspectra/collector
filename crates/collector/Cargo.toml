@@ -17,6 +17,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi", "std"] }
 signal-hook = "0.3"
 libc = "0.2"
+object_store = "0.14"
+futures-executor = "0.3"
+parquet = { version = "60", default-features = false, features = ["zstd"] }
+zstd = "0.14"
 
 [dev-dependencies]
+bytes = "1"
 tempfile = "3"
