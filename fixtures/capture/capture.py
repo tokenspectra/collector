@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai==3.42.1", "ollama==0.6.3", "httpx[http2]==0.28.1", "h2==4.4.1"]
+# dependencies = ["openai==3.42.1", "anthropic==2.3.0", "ollama==0.6.3", "httpx[http2]==0.28.1", "httpx2[http2]==2.16.0", "h2==4.4.1"]
 # ///
 """Captures real Wire Protocol traffic into golden .pcapng fixtures.
 
@@ -9,7 +9,7 @@ Starts mock_server.py on loopback, then for each scenario starts dumpcap on
 HTTP/1.1 or h2c, stops dumpcap and writes
 crates/collector/tests/fixtures/<scenario>.pcapng.
 
-Scenarios live with their protocol: capture_openai.py, ... each export
+Scenarios live with their protocol: capture_openai.py, capture_anthropic.py, ... each export
 `SCENARIOS`, a dict from fixture name to a function of the port. A new
 protocol adds its module and one line to SCENARIO_MODULES, plus its client
 SDK to the dependencies above. A module that sets `PORT` is captured against
@@ -34,6 +34,7 @@ import threading
 import time
 from pathlib import Path
 
+import capture_anthropic
 import capture_ollama
 import capture_openai
 import capture_openai_responses
@@ -42,7 +43,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE.parent.parent / "crates/collector/tests/fixtures"
 
 # One line per Wire Protocol.
-SCENARIO_MODULES = [capture_openai, capture_openai_responses, capture_ollama]
+SCENARIO_MODULES = [capture_openai, capture_openai_responses, capture_ollama, capture_anthropic]
 
 
 def scenarios():

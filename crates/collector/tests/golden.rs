@@ -587,6 +587,85 @@ fn body_hashes_do_not_depend_on_framing() {
 }
 
 #[test]
+fn anthropic_json_over_http1_and_h2c() {
+    for name in ["anthropic_h1_json", "anthropic_h2c_json"] {
+        let c = collect_files(&[&format!("{name}.pcapng")]);
+        assert_eq!(
+            bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),
+            0,
+            "{name}"
+        );
+        assert_eq!(c.workunits.len(), 2, "{name}");
+        for w in &c.workunits {
+            assert_eq!((w.protocol, w.endpoint), ("anthropic", "/v1/messages"));
+            assert!(w.complete && !w.stream && w.sse_events.is_none(), "{name}");
+            assert_eq!(w.outcome(), collector::stats::Outcome::Ok, "{name}");
+            assert_eq!((&w.seed, &w.n), (&None, &None));
+        }
+        let ok = &c.workunits[0];
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.response_id.as_deref(), Some("msg_mock_0001"));
+        assert_eq!(ok.response_model.as_deref(), Some("mock-model"));
+        assert_eq!(ok.finish_reason[0].finish_reason, "end_turn");
+        assert_eq!((ok.input_tokens, ok.output_tokens), (Some(9), Some(4)));
+        let extra = ok.extra.as_ref().unwrap();
+        assert_eq!(extra["cache_read_input_tokens"], 6);
+        assert_eq!(extra["cache_creation_input_tokens"], 0);
+        // An error body is still the protocol's: status and error type.
+        let err = &c.workunits[1];
+        assert_eq!(err.status, 400);
+        assert!(err.finish_reason.is_empty() && err.usage.is_none());
+        assert_eq!(err.extra.as_ref().unwrap()["error_type"], "invalid_request_error");
+    }
+}
+
+#[test]
+fn anthropic_sse_over_http1_chunked_and_h2c() {
+    for name in ["anthropic_h1_sse", "anthropic_h2c_sse"] {
+        let c = collect_files(&[&format!("{name}.pcapng")]);
+        assert_eq!(c.workunits.len(), 2, "{name}");
+        let ok = &c.workunits[0];
+        assert!(ok.stream && ok.complete && ok.sse_done == Some(true), "{name}");
+        // message_start, content_block_start, ping, four deltas,
+        // content_block_stop, message_delta, message_stop.
+        let events = ok.sse_events.as_ref().unwrap();
+        assert_eq!(events.len(), 10, "{name}");
+        assert_eq!(events.iter().map(|e| e.len).sum::<u64>(), ok.response_body_len);
+        assert!(events.windows(2).all(|w| w[0].ts_ns < w[1].ts_ns));
+        assert_eq!(ok.finish_reason[0].finish_reason, "end_turn");
+        // message_delta's cumulative output count replaces message_start's.
+        assert_eq!((ok.input_tokens, ok.output_tokens), (Some(9), Some(4)));
+        assert_eq!(ok.extra.as_ref().unwrap()["cache_read_input_tokens"], 6);
+
+        // An `error` event after the first token: the HTTP exchange is whole,
+        // but the message never stopped.
+        let cut = &c.workunits[1];
+        assert_eq!((cut.status, cut.complete), (200, true), "{name}");
+        assert_eq!(cut.sse_done, Some(false));
+        assert_eq!(cut.sse_events.as_ref().unwrap().len(), 5);
+        assert!(cut.finish_reason.is_empty());
+        assert_eq!(cut.output_tokens, Some(1));
+        assert_eq!(cut.extra.as_ref().unwrap()["error_type"], "overloaded_error");
+
+        assert_eq!(
+            bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),
+            0,
+            "{name}"
+        );
+        assert!(bytes_where(&c, |b| b.framing) > 0);
+    }
+    let hashes = |name: &str| -> Vec<Option<String>> {
+        collect_files(&[&format!("{name}.pcapng")])
+            .workunits
+            .iter()
+            .map(|w| w.response_body_hash.clone())
+            .collect()
+    };
+    assert_eq!(hashes("anthropic_h1_sse"), hashes("anthropic_h2c_sse"));
+    assert_eq!(hashes("anthropic_h1_json"), hashes("anthropic_h2c_json"));
+}
+
+#[test]
 fn health_models_and_bad_json_are_http_other() {
     let c = collect_files(&["http_other_h1.pcapng"]);
     assert!(c.workunits.is_empty());

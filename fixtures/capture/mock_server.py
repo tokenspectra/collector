@@ -6,7 +6,7 @@
 
 Serves HTTP/1.1 and cleartext HTTP/2 (h2c, prior knowledge) on one port:
 a connection that starts with the HTTP/2 preface is HTTP/2. The transport
-here is shared; each protocol module (mock_openai.py, ...) only lists its
+here is shared; each protocol module (mock_openai.py, mock_anthropic.py, ...) only lists its
 routes in `ROUTES`, mapping (method, path) to a handler that takes the
 request body and lowercase headers and returns a mock_common.Reply. A new
 protocol adds its module and one line to PROTOCOLS. GET /health is served
@@ -23,12 +23,13 @@ import h2.config
 import h2.connection
 import h2.events
 
+import mock_anthropic
 import mock_openai
 import mock_openai_responses
 from mock_common import Reply
 
 # One line per Wire Protocol. Earlier modules win a (method, path) clash.
-PROTOCOLS = [mock_openai, mock_openai_responses]
+PROTOCOLS = [mock_openai, mock_openai_responses, mock_anthropic]
 
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # Delay between stream frames, so each one leaves in its own TCP segment.

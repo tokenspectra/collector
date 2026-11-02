@@ -529,8 +529,8 @@ pub fn all() -> Vec<Fixture> {
 }
 
 /// Real traffic from `fixtures/capture/capture.py`, captured with dumpcap
-/// on `lo`: the OpenAI SDK against the mock server, and the Ollama SDK and
-/// httpx against a real local Ollama.
+/// on `lo`: the OpenAI and Anthropic SDKs against the mock server, and the
+/// Ollama SDK and httpx against a real local Ollama.
 pub const CAPTURED: &[&str] = &[
     "openai_h1_json",
     "openai_h1_sse",
@@ -544,6 +544,10 @@ pub const CAPTURED: &[&str] = &[
     "openai_responses_error_h1",
     "ollama_native",
     "ollama_openai_compat",
+    "anthropic_h1_json",
+    "anthropic_h1_sse",
+    "anthropic_h2c_json",
+    "anthropic_h2c_sse",
 ];
 
 pub const DUMPCAP_KEEPALIVE: &[&str] = &[
