@@ -536,6 +536,11 @@ pub const CAPTURED: &[&str] = &[
     "openai_h2c_json",
     "openai_h2c_sse",
     "http_other_h1",
+    "openai_responses_h1_json",
+    "openai_responses_h1_sse",
+    "openai_responses_h2c_json",
+    "openai_responses_h2c_sse",
+    "openai_responses_error_h1",
 ];
 
 pub const DUMPCAP_KEEPALIVE: &[&str] = &[

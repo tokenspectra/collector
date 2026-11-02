@@ -32,12 +32,13 @@ import time
 from pathlib import Path
 
 import capture_openai
+import capture_openai_responses
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE.parent.parent / "crates/collector/tests/fixtures"
 
 # One line per Wire Protocol.
-SCENARIO_MODULES = [capture_openai]
+SCENARIO_MODULES = [capture_openai, capture_openai_responses]
 
 
 def scenarios():
