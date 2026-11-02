@@ -12,6 +12,7 @@
 //! Bodies are parsed for record fields only; they are never re-serialised,
 //! and their hashes cover the bytes as on the wire.
 
+pub mod anthropic;
 pub mod framing;
 pub mod ollama;
 pub mod openai;
@@ -31,6 +32,7 @@ pub const BUILTIN: &[&dyn WireProtocol] = &[
     &openai::OpenAi,
     &openai_responses::OpenAiResponses,
     &ollama::Ollama,
+    &anthropic::Anthropic,
 ];
 
 /// A route a protocol serves: an HTTP method and a path pattern.
@@ -427,7 +429,7 @@ mod tests {
     fn builtin_ids_are_unique() {
         assert_eq!(
             Protocols::default().ids().collect::<Vec<_>>(),
-            ["openai", "openai_responses", "ollama"]
+            ["openai", "openai_responses", "ollama", "anthropic"]
         );
     }
 
