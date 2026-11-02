@@ -5,17 +5,24 @@
 //! accounting), `http` (one row per HTTP exchange) and `workunits` (Request
 //! Workunits). Rows are written in a fixed order with fixed field order, so
 //! the files are byte-identical across runs.
+//!
+//! HTTP bodies go to `bodies/b3_{blake3}`, one file per distinct body, until
+//! packs exist (spec §8). `b3sum` of a file reproduces its name.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
-use crate::decode::{ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
+use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
 
 pub const TABLES: [&str; 6] = ["packets", "segments", "events", "flows", "http", "workunits"];
+
+/// Directory of kept bodies, inside the output directory.
+pub const BODIES: &str = "bodies";
 
 pub struct JsonlSink {
     packets: BufWriter<File>,
@@ -24,6 +31,10 @@ pub struct JsonlSink {
     flows: BufWriter<File>,
     http: BufWriter<File>,
     workunits: BufWriter<File>,
+    bodies: PathBuf,
+    /// Bodies being written, each to a temporary file until its hash is known.
+    open: HashMap<BodyKey, (PathBuf, BufWriter<File>)>,
+    next_tmp: u64,
     error: Option<io::Error>,
 }
 
@@ -38,12 +49,59 @@ impl JsonlSink {
             flows: open("flows")?,
             http: open("http")?,
             workunits: open("workunits")?,
+            bodies: dir.join(BODIES),
+            open: HashMap::new(),
+            next_tmp: 0,
             error: None,
         })
     }
 
+    fn body_file(&mut self, key: &BodyKey) -> io::Result<&mut BufWriter<File>> {
+        if !self.open.contains_key(key) {
+            std::fs::create_dir_all(&self.bodies)?;
+            let path = self.bodies.join(format!(".partial-{}", self.next_tmp));
+            self.next_tmp += 1;
+            let file = BufWriter::new(File::create(&path)?);
+            self.open.insert(key.clone(), (path, file));
+        }
+        Ok(&mut self.open.get_mut(key).expect("just opened").1)
+    }
+
+    /// Moves a finished body to its name; an identical body may already be
+    /// there.
+    fn keep_body(&mut self, key: &BodyKey, b3: Option<&str>) -> io::Result<()> {
+        let open = self.open.remove(key);
+        let Some(b3) = b3 else {
+            if let Some((path, _)) = open {
+                std::fs::remove_file(path)?;
+            }
+            return Ok(());
+        };
+        let target = self.bodies.join(b3.replacen("b3:", "b3_", 1));
+        match open {
+            Some((path, mut file)) => {
+                file.flush()?;
+                drop(file);
+                if target.exists() {
+                    std::fs::remove_file(path)?;
+                } else {
+                    std::fs::rename(path, target)?;
+                }
+            }
+            None if !target.exists() => {
+                std::fs::create_dir_all(&self.bodies)?;
+                File::create(target)?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     /// Flushes every file and reports the first write error, if any.
     pub fn finish(mut self) -> io::Result<()> {
+        for (_, (path, _)) in self.open.drain() {
+            std::fs::remove_file(path)?;
+        }
         if let Some(e) = self.error.take() {
             return Err(e);
         }
@@ -96,5 +154,20 @@ impl RecordSink for JsonlSink {
 
     fn workunit(&mut self, rec: &WorkunitRecord) {
         write_row(&mut self.workunits, &mut self.error, rec);
+    }
+
+    fn body_data(&mut self, key: &BodyKey, data: &[u8]) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(e) = self.body_file(key).and_then(|f| f.write_all(data)) {
+            self.error = Some(e);
+        }
+    }
+
+    fn body_end(&mut self, key: &BodyKey, b3: Option<&str>) {
+        if let Err(e) = self.keep_body(key, b3) {
+            self.error.get_or_insert(e);
+        }
     }
 }

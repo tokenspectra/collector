@@ -53,6 +53,16 @@ Hashing of chunks and Slices, the Capture Rate cut and the object store come nex
 | `http` | HTTP request/response pair | method, target, status, content type, body length, `body_b3`, bucket, `workunit_id` |
 | `workunits` | Request Workunit | the record below |
 
+### Bodies
+
+Every HTTP body that has a `body_b3` is kept as `<out>/bodies/b3_<blake3>`: requests and responses, Workunit or `http_other` (spec §8). `b3sum` of a file reproduces its name, and identical bodies are stored once.
+
+- The bytes are the bytes that were hashed: chunked encoding removed, content coding kept, one file per SSE response.
+- A body with a gap has no `body_b3` and is not kept; its packets are still in L0.
+- `--no-bodies` turns this off. Hashes, lengths and every table stay the same; only `bodies/` is missing.
+- Bodies hold plaintext prompts and outputs (spec §10).
+- Packs replace the per-body files once the object store lands.
+
 ### Verdicts and byte accounting (spec §5)
 
 - **Verdict** from the first bytes of each direction, never ports: the HTTP/2 preface → `http2`; an HTTP/1 request or status line → `http1`; a TLS record header → `tls`; `content-type: application/grpc` on an h2c request → `grpc`; anything else → `opaque`. UDP and other IP protocols are `opaque`. A Flow with no payload yet has `verdict: null`.
@@ -103,6 +113,7 @@ sg wireshark -c "cargo run -- ring -i lo -w 10 -t 60"
 - `-o/--out` defaults to `ts-captures/` in the current directory (created if missing).
 - `-d/--ring-dir` defaults to `<tmp>/tokenspectra-ring-<interface>`.
 - If dumpcap is missing, not runnable (not in the `wireshark` group) or fails (e.g. unknown interface), `ring` exits non-zero with a message saying which, and how to fix it. `files` never needs dumpcap.
+- `--no-bodies`: keep hashes only, no `bodies/` directory.
 - Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter).
 
 ## Tests
@@ -115,7 +126,7 @@ cargo test --workspace
   - **Captured OpenAI traffic** (`openai_h1_json`, `openai_h1_sse`, `openai_h2c_json`, `openai_h2c_sse`, `http_other_h1`): the official OpenAI Python SDK (and httpx for `/health`, `/v1/models` and a malformed body) against a mock OpenAI-compatible server, over HTTP/1.1 and h2c, captured with dumpcap. See below.
   - **Synthetic** fixtures, built packet by packet in `tests/support/fixtures.rs` and written by `cargo run -p collector --example gen_fixtures`: edge cases a live run can't produce on demand (lost segment, retransmit with different bytes, mid-stream start, Flows spanning windows, UDP, non-HTTP TCP, a TLS Flow on the plaintext Link, gRPC over h2c, HTTP/1.1 pipelining and a request whose response lands in the next window).
   - `dumpcap_keepalive-*`: real dumpcap ring files of a keep-alive Flow whose SYN predates the capture.
-- Besides the expected tables, the tests check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
+- Besides the expected tables, the tests check that every body with a `body_b3` is kept under its hash and that `--no-bodies` changes no table. They also check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
 - **Capturing the OpenAI fixtures again** (only when the mock or the scenarios change; CI never captures). Needs [uv](https://docs.astral.sh/uv/) and dumpcap; Python dependencies are pinned in the scripts:
 
   ```sh

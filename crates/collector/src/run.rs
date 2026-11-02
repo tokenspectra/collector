@@ -19,11 +19,12 @@ pub fn run(
     source: &mut dyn PacketSource,
     window_ns: u64,
     cfg: AssemblerConfig,
+    decoder_cfg: DecoderConfig,
     sink: &mut dyn RecordSink,
 ) -> Result<Summary, SourceError> {
     let mut windower = Windower::new(window_ns);
     let mut assembler = Assembler::new(cfg);
-    let mut decoder = Decoder::new(DecoderConfig::default(), sink);
+    let mut decoder = Decoder::new(decoder_cfg, sink);
     let mut summary = Summary::default();
     while let Some(pkt) = source.next() {
         let pkt = pkt?;

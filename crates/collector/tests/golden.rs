@@ -17,7 +17,7 @@ use collector::decode::{Bucket, Buckets, HttpVersion, Verdict};
 use collector::flow::Dir;
 use collector::{FileSource, RingSource};
 
-use collect::{collect_files, fixture_dir, fixture_paths, tables};
+use collect::{collect_files, fixture_dir, fixture_paths, tables, tables_and_bodies};
 
 /// Real traffic from `fixtures/capture/capture.py`: the OpenAI SDK against
 /// the mock server, captured with dumpcap on `lo`.
@@ -601,9 +601,18 @@ fn corrupted_payloads_never_break_accounting() {
                 &mut Packets(pkts.into_iter()),
                 collect::WINDOW_NS,
                 collector::AssemblerConfig::default(),
+                collector::DecoderConfig::default(),
                 &mut sink,
             )
             .unwrap();
+            // Every kept body still matches its name.
+            for (b3, body) in &sink.bodies {
+                assert_eq!(
+                    *b3,
+                    format!("b3:{}", blake3::hash(body).to_hex()),
+                    "{case} round {round}"
+                );
+            }
             for f in &sink.flows {
                 for (stats, bytes) in [
                     (&f.slice.orig_stats, &f.orig_bytes),
@@ -618,4 +627,51 @@ fn corrupted_payloads_never_break_accounting() {
             }
         }
     }
+}
+
+/// Every body with a `body_b3` in the `http` table is kept under
+/// `bodies/b3_{hash}`, and the file hashes to its name. `--no-bodies` keeps
+/// none and leaves every table unchanged.
+#[test]
+fn bodies_are_kept_by_hash_unless_opted_out() {
+    let mut kept_any = false;
+    for (case, files) in cases() {
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        let (tables, bodies) = tables_and_bodies(&mut FileSource::new(fixture_paths(&names)), true);
+        let http = &tables.iter().find(|(n, _)| n == "http.jsonl").unwrap().1;
+        let mut want = std::collections::BTreeSet::new();
+        for line in http.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            let row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            for m in ["request", "response"] {
+                if let Some(b3) = row[m]["body_b3"].as_str() {
+                    want.insert(b3.replacen("b3:", "b3_", 1));
+                }
+            }
+        }
+        let got: std::collections::BTreeSet<String> = bodies.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(got, want, "{case}");
+        for (name, body) in &bodies {
+            assert_eq!(*name, format!("b3_{}", blake3::hash(body).to_hex()), "{case}");
+        }
+        kept_any |= bodies.iter().any(|(_, b)| !b.is_empty());
+
+        let (without, none) = tables_and_bodies(&mut FileSource::new(fixture_paths(&names)), false);
+        assert!(none.is_empty(), "{case}");
+        assert_eq!(without, tables, "{case}");
+    }
+    assert!(kept_any);
+}
+
+#[test]
+fn workunit_bodies_are_readable_by_hash() {
+    let c = collect_files(&["openai_h1_sse.pcapng"]);
+    let w = &c.workunits[0];
+    let req = &c.bodies[w.request_body_b3.as_ref().unwrap()];
+    assert!(req.starts_with(b"{") && req.len() as u64 == w.request_body_len);
+    // One blob per SSE response, chunked encoding removed.
+    let resp = &c.bodies[w.response_body_b3.as_ref().unwrap()];
+    assert!(resp.starts_with(b"data: {") && resp.ends_with(b"data: [DONE]\n\n"));
+    // The /metrics body with a lost segment has no hash and is not kept.
+    let c = collect_files(&["http1_edge.pcapng"]);
+    assert!(!c.bodies.values().any(|b| b.starts_with(fixtures::EDGE_C_CHUNK)));
 }

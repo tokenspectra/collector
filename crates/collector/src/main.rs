@@ -7,13 +7,16 @@ use clap::{Parser, Subcommand};
 
 use collector::output::JsonlSink;
 use collector::run::run;
-use collector::{AssemblerConfig, FileSource, PacketSource, RingConfig, RingSource};
+use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource, RingConfig, RingSource};
 
 #[derive(Parser)]
 #[command(about = "TokenSpectra Collector")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Don't keep HTTP bodies under <out>/bodies/; hashes and tables stay the same.
+    #[arg(long, global = true)]
+    no_bodies: bool,
 }
 
 #[derive(Subcommand)]
@@ -63,7 +66,12 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
-    let (mut source, window_s, out): (Box<dyn PacketSource>, u32, PathBuf) = match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let decoder_cfg = DecoderConfig {
+        keep_bodies: !cli.no_bodies,
+        ..DecoderConfig::default()
+    };
+    let (mut source, window_s, out): (Box<dyn PacketSource>, u32, PathBuf) = match cli.cmd {
         Cmd::Files { window_s, out, files } => (Box::new(FileSource::new(files)), window_s, out),
         Cmd::Ring {
             window_s,
@@ -95,6 +103,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         source.as_mut(),
         u64::from(window_s) * 1_000_000_000,
         AssemblerConfig::default(),
+        decoder_cfg,
         &mut sink,
     )?;
     sink.finish()?;

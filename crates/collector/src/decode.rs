@@ -40,12 +40,26 @@ pub struct DecoderConfig {
     /// record fields from. Larger bodies are still hashed and counted; a
     /// larger request cannot be checked as JSON, so it is `http_other`.
     pub max_body: usize,
+    /// Hand every HTTP body to [`RecordSink::body_data`] so it can be kept
+    /// (spec §8). Off with `--no-bodies`: hashes and tables stay the same.
+    pub keep_bodies: bool,
 }
 
 impl Default for DecoderConfig {
     fn default() -> Self {
-        DecoderConfig { max_body: 16 << 20 }
+        DecoderConfig {
+            max_body: 16 << 20,
+            keep_bodies: true,
+        }
     }
+}
+
+/// Names one HTTP body while it streams in.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BodyKey {
+    pub flow: FlowId,
+    pub exchange: u64,
+    pub dir: Dir,
 }
 
 /// A Flow's protocol verdict (spec §5).
@@ -213,6 +227,13 @@ pub trait RecordSink {
     fn flow(&mut self, rec: &FlowRecord);
     fn exchange(&mut self, rec: &ExchangeRecord);
     fn workunit(&mut self, rec: &WorkunitRecord);
+    /// More bytes of a body, as hashed: chunked encoding removed, content
+    /// coding kept. Only called when [`DecoderConfig::keep_bodies`] is set.
+    fn body_data(&mut self, _key: &BodyKey, _data: &[u8]) {}
+    /// The body is complete: keep it under `b3` (its `body_b3`), or drop it
+    /// when `None` (a gap). Called once per body that had `body_data`, and
+    /// for empty bodies.
+    fn body_end(&mut self, _key: &BodyKey, _b3: Option<&str>) {}
 }
 
 pub struct Decoder<'a> {
@@ -434,6 +455,8 @@ struct Body {
     over_limit: bool,
     sse: Option<Sse>,
     events: Vec<SseEventRecord>,
+    /// Still streaming to the sink (keep_bodies on, no gap yet).
+    stored: bool,
 }
 
 impl Body {
@@ -447,6 +470,7 @@ impl Body {
             over_limit: false,
             sse: sse.then(Sse::default),
             events: Vec::new(),
+            stored: false,
         }
     }
 
@@ -879,6 +903,16 @@ impl FlowState {
             interim_responses: ex.interim,
             reset: ex.reset,
         });
+        for m in [&ex.req, &ex.resp].into_iter().flatten() {
+            if m.body.stored {
+                let key = BodyKey {
+                    flow: self.id.clone(),
+                    exchange: ex.seq,
+                    dir: m.dir,
+                };
+                sink.body_end(&key, m.body.b3().as_deref());
+            }
+        }
         let Some(workunit_id) = workunit_id else { return };
         let (Some(req), Some(resp)) = (&ex.req, &mut ex.resp) else {
             return;
@@ -1004,7 +1038,10 @@ impl Ctx<'_> {
             first_ts: ts,
             last_ts: ts,
             head,
-            body: Body::new(keep, sse),
+            body: Body {
+                stored: self.cfg.keep_bodies,
+                ..Body::new(keep, sse)
+            },
             done: false,
             complete: false,
         }
@@ -1109,14 +1146,35 @@ impl Out for Ctx<'_> {
         let mut events = Vec::new();
         m.body.push(data, ts, self.cfg.max_body, &mut events);
         m.last_ts = ts;
+        if m.body.stored && !data.is_empty() {
+            let key = BodyKey {
+                flow: self.f.id.clone(),
+                exchange: id,
+                dir: self.dir,
+            };
+            self.sink.body_data(&key, data);
+        }
         for e in events {
             ex.response.absorb(&e.data);
         }
     }
 
     fn body_gap(&mut self, stream: u32, len: u64) {
-        if let Some(m) = self.msg(stream) {
-            m.body.gap(len);
+        let Some(id) = self.f.exchange_of(self.dir, stream) else {
+            return;
+        };
+        let flow = self.f.id.clone();
+        let dir = self.dir;
+        let Some(m) = self.msg(stream) else { return };
+        m.body.gap(len);
+        // A body with a gap has no hash, so it is not kept.
+        if std::mem::take(&mut m.body.stored) {
+            let key = BodyKey {
+                flow,
+                exchange: id,
+                dir,
+            };
+            self.sink.body_end(&key, None);
         }
     }
 
