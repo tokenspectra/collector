@@ -13,6 +13,7 @@ use collector::observe::{log_summary, StatsSink};
 use collector::output::JsonlSink;
 use collector::run::run;
 use collector::ship::{self, Ingest, Shipper};
+use collector::spool::{Spool, Uploaded, Uploader};
 use collector::stats::{serve_metrics, Registry};
 use collector::store::{StoreConfig, StoreSink};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource, RingConfig, RingSource};
@@ -46,6 +47,18 @@ struct Cli {
     /// from the AWS_* environment variables [default: <out>/store].
     #[arg(long, global = true)]
     store: Option<String>,
+    /// With an s3:// store: the local directory objects wait in until they
+    /// are uploaded [default: <out>/spool].
+    #[arg(long, global = true)]
+    spool: Option<PathBuf>,
+    /// The most the spool holds, in MiB. A window that would pass it waits
+    /// for uploads, holding the run back.
+    #[arg(long, global = true, default_value_t = 4096)]
+    spool_max_mib: u64,
+    /// Seconds the uploader has, at the end of a run or of `collector
+    /// upload`, to empty the spool; what it does not get to stays there.
+    #[arg(long, global = true, default_value_t = 30)]
+    upload_wait_s: u64,
     /// The control plane's ingest, e.g. http://127.0.0.1:8090/ingest/windows:
     /// each window's manifest is POSTed there as the window is sealed.
     /// Without it, manifests stay in <out>/manifests.jsonl for `collector ship`.
@@ -119,6 +132,12 @@ enum Cmd {
         #[arg(default_value = "ts-captures")]
         out: PathBuf,
     },
+    /// Upload what an output directory's spool still holds to --store
+    /// (an s3:// URL).
+    Upload {
+        #[arg(default_value = "ts-captures")]
+        out: PathBuf,
+    },
     /// Capture live with a dumpcap ring buffer and assemble Flows.
     Ring {
         /// Window (Slice) length in seconds; also dumpcap's `-b interval`.
@@ -189,6 +208,20 @@ fn init_logging(cli: &Cli) {
     }
 }
 
+fn log_uploaded(u: &Uploaded) {
+    if u.left == 0 {
+        info!(objects = u.objects, bytes = u.bytes, "spool uploaded");
+    } else {
+        warn!(
+            objects = u.objects,
+            bytes = u.bytes,
+            left = u.left,
+            left_bytes = u.left_bytes,
+            "spool not empty: the next run or `collector upload` sends the rest"
+        );
+    }
+}
+
 /// A 32-byte key from 64 hex digits.
 fn parse_key(hex: &str) -> Result<[u8; 32], String> {
     let bad = || "--capture-key must be 64 hex digits".to_string();
@@ -225,6 +258,20 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 pending = s.pending.unwrap_or_default(),
                 "manifests shipped"
             );
+            return Ok(());
+        }
+        Cmd::Upload { out } => {
+            let store = cli.store.as_deref().filter(|s| collector::store::is_remote(s));
+            let store = store.ok_or("`collector upload` needs an s3:// --store")?;
+            let spool = Spool::open(
+                &cli.spool.clone().unwrap_or_else(|| out.join("spool")),
+                u64::MAX,
+                None,
+            )?;
+            let (objects, bytes) = spool.pending();
+            info!(objects, bytes, "uploading the spool");
+            let uploader = Uploader::spawn(spool, collector::store::open(store)?)?;
+            log_uploaded(&uploader.finish(Duration::from_secs(cli.upload_wait_s))?);
             return Ok(());
         }
         Cmd::Ring {
@@ -276,8 +323,23 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .store
         .clone()
         .unwrap_or_else(|| out.join("store").display().to_string());
-    let object_store = collector::store::open(&store_url)?;
     let registry = Registry::new();
+    // A remote store is written through the spool, inside the boundary.
+    let spooled = if collector::store::is_remote(&store_url) {
+        let dir = cli.spool.clone().unwrap_or_else(|| out.join("spool"));
+        let spool = Spool::open(&dir, cli.spool_max_mib << 20, Some(registry.clone()))?;
+        let (objects, bytes) = spool.pending();
+        if objects > 0 {
+            info!(
+                objects,
+                bytes, "the spool holds objects from a past run; uploading them first"
+            );
+        }
+        let uploader = Uploader::spawn(spool.clone(), collector::store::open(&store_url)?)?;
+        Some((spool, uploader))
+    } else {
+        None
+    };
     if let Some(addr) = &cli.metrics_addr {
         let bound = serve_metrics(addr.as_str(), registry.clone())
             .map_err(|e| format!("--metrics-addr {addr}: {e}"))?;
@@ -305,7 +367,15 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let shipper = ingest
         .map(|i| Shipper::spawn(out.clone(), i, Duration::from_secs(1)))
         .transpose()?;
-    let mut store = StoreSink::new(&mut sink, object_store, store_cfg, Some(registry.clone()));
+    let mut store = match &spooled {
+        Some((spool, _)) => StoreSink::spooled(&mut sink, spool.clone(), store_cfg, Some(registry.clone())),
+        None => StoreSink::new(
+            &mut sink,
+            collector::store::open(&store_url)?,
+            store_cfg,
+            Some(registry.clone()),
+        ),
+    };
     run(
         source.as_mut(),
         window_ns,
@@ -322,6 +392,9 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         index_files = stored.index_files,
         "object store written"
     );
+    if let Some((_, uploader)) = spooled {
+        log_uploaded(&uploader.finish(Duration::from_secs(cli.upload_wait_s))?);
+    }
     // Views for people, derived from the tables and bodies just written.
     if !cli.no_bodies {
         collector::views::write(&out)?;

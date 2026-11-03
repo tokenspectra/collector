@@ -1,7 +1,10 @@
 //! The S3 backend end to end (TS-38, spec §8), against a real
 //! S3-compatible store: the objects are the local store's, byte for byte,
 //! every one reads back and verifies, a re-run leaves them alone, an object
-//! with other bytes is never overwritten, and split chunks join.
+//! with other bytes is never overwritten, and split chunks join. Through
+//! the spool: an outage during a run delays the objects without ending
+//! the run, and a full spool holds the run back until uploads make room.
+//! A proxy that can be switched off stands in for the outage.
 //!
 //! Needs `TS_S3_TEST_URL=s3://bucket[/prefix]` and the `AWS_*` variables
 //! [`collector::store::open`] reads; each test writes under a prefix of its
@@ -14,32 +17,43 @@ mod collect;
 mod fixtures;
 
 use std::collections::BTreeMap;
+use std::io;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use collector::output::JsonlSink;
+use collector::spool::{Spool, Uploader};
 use collector::stats::Registry;
-use collector::store::{fetch_blob, fetch_chunk, BlobKind, BlobRecord, StoreConfig};
-use collector::{mh, DecoderConfig, FileSource};
+use collector::store::{fetch_blob, fetch_chunk, BlobKind, BlobRecord, StoreConfig, StoreSink};
+use collector::{mh, AssemblerConfig, DecoderConfig, FileSource};
 use futures::TryStreamExt;
+use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::prefix::PrefixStore;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, RetryConfig};
 use serde_json::Value;
 
 use collect::{fixture_paths, run_into, run_stored, WINDOW_NS};
 use fixtures::cases;
 
-/// A fresh, empty store under its own prefix, or `None` when no S3 store
-/// is configured.
-fn s3(test: &str) -> Option<Arc<dyn ObjectStore>> {
+/// A fresh `s3://` URL under a prefix of its own, or `None` when no S3
+/// store is configured.
+fn s3_url(test: &str) -> Option<String> {
     let Ok(base) = std::env::var("TS_S3_TEST_URL") else {
         assert!(std::env::var_os("CI").is_none(), "CI must set TS_S3_TEST_URL");
         eprintln!("{test}: TS_S3_TEST_URL is not set; skipped");
         return None;
     };
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let url = format!("{}/{test}-{nanos}", base.trim_end_matches('/'));
-    Some(collector::store::open(&url).expect("S3 store"))
+    Some(format!("{}/{test}-{nanos}", base.trim_end_matches('/')))
+}
+
+/// A fresh, empty store under its own prefix.
+fn s3(test: &str) -> Option<Arc<dyn ObjectStore>> {
+    Some(collector::store::open(&s3_url(test)?).expect("S3 store"))
 }
 
 fn rt() -> tokio::runtime::Runtime {
@@ -217,4 +231,201 @@ fn s3_split_chunks_join() {
         let bytes = fetch_chunk(store.as_ref(), key, parts).unwrap();
         assert_eq!(mh::of(&bytes), c["chunk_hash"]);
     }
+}
+
+type Store = Arc<dyn ObjectStore>;
+
+/// Forwards TCP to the S3 endpoint while up. Switched down, it closes every
+/// open connection and refuses new ones: the store is unreachable.
+struct Proxy {
+    url: String,
+    up: Arc<AtomicBool>,
+    open: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Proxy {
+    fn start(target: &str) -> Proxy {
+        let target = target
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (up, open) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(Vec::new())));
+        let (up2, open2) = (up.clone(), open.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                if !up2.load(Ordering::SeqCst) {
+                    drop(client);
+                    continue;
+                }
+                let Ok(server) = TcpStream::connect(&target) else {
+                    continue;
+                };
+                let mut open = open2.lock().unwrap();
+                open.push(client.try_clone().unwrap());
+                open.push(server.try_clone().unwrap());
+                for (mut from, mut to) in [
+                    (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                    (server, client),
+                ] {
+                    std::thread::spawn(move || {
+                        let _ = io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(Shutdown::Write);
+                    });
+                }
+            }
+        });
+        Proxy { url, up, open }
+    }
+
+    fn set_up(&self, up: bool) {
+        self.up.store(up, Ordering::SeqCst);
+        if !up {
+            for s in self.open.lock().unwrap().drain(..) {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// A fresh prefix of the test store, reached through a [`Proxy`] (down to
+/// start with) and directly, or `None` when no S3 store is configured.
+fn s3_behind_proxy(test: &str) -> Option<(Proxy, Store, Store)> {
+    let url = s3_url(test)?;
+    let direct = collector::store::open(&url).expect("S3 store");
+    let (bucket, prefix) = url["s3://".len()..].split_once('/').unwrap();
+    let endpoint = std::env::var("AWS_ENDPOINT").expect("the proxy needs AWS_ENDPOINT");
+    let proxy = Proxy::start(&endpoint);
+    proxy.set_up(false);
+    // Fails fast while the proxy is down; the uploader does the retrying.
+    let retry = RetryConfig {
+        max_retries: 1,
+        retry_timeout: Duration::from_secs(2),
+        ..RetryConfig::default()
+    };
+    let s3 = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .with_endpoint(&proxy.url)
+        .with_retry(retry)
+        .build()
+        .unwrap();
+    let through: Store = Arc::new(PrefixStore::new(s3, ObjectPath::from(prefix)));
+    Some((proxy, through, direct))
+}
+
+/// Runs `names` with its tables in `out` and its objects in `spool`.
+fn run_spooled(
+    names: &[&str],
+    out: &Path,
+    spool: Arc<Spool>,
+    reg: Arc<Registry>,
+) -> Result<(), collector::store::StoreError> {
+    let mut sink = JsonlSink::create(out).unwrap();
+    let mut stored = StoreSink::spooled(&mut sink, spool, StoreConfig::new(WINDOW_NS), Some(reg));
+    collector::run::run(
+        &mut FileSource::new(fixture_paths(names)),
+        WINDOW_NS,
+        AssemblerConfig::default(),
+        DecoderConfig::default(),
+        &mut stored,
+    )
+    .unwrap();
+    let res = stored.finish().map(drop);
+    sink.finish().unwrap();
+    res
+}
+
+/// The local store's objects for `names`: what the remote store must end
+/// up holding.
+fn local_objects(names: &[&str]) -> BTreeMap<String, Vec<u8>> {
+    let dir = tempfile::tempdir().unwrap();
+    run_stored(
+        &mut FileSource::new(fixture_paths(names)),
+        dir.path(),
+        DecoderConfig::default(),
+        StoreConfig::new(WINDOW_NS),
+        None,
+    );
+    tree(&dir.path().join("store"))
+}
+
+const SPAN: [&str; 2] = ["span_windows-1.pcapng", "span_windows-2.pcapng"];
+
+/// The store is down for the whole run: the run still ends, its manifests
+/// committed and its objects in the spool. They stay there past the
+/// uploader's deadline, and the next uploader, once the store is back,
+/// sends them all.
+#[test]
+fn an_outage_delays_the_objects_without_ending_the_run() {
+    let Some((proxy, through, direct)) = s3_behind_proxy("outage") else {
+        return;
+    };
+    let want = local_objects(&SPAN);
+    let (out, spool_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let reg = Registry::new();
+    let spool = Spool::open(spool_dir.path(), u64::MAX, Some(reg.clone())).unwrap();
+    let uploader = Uploader::spawn(spool.clone(), through.clone()).unwrap();
+    run_spooled(&SPAN, out.path(), spool.clone(), reg.clone()).unwrap();
+
+    let manifests = std::fs::read_to_string(out.path().join(collector::manifest::LOG)).unwrap();
+    assert!(manifests.lines().count() > 1, "every window is sealed");
+    let done = uploader.finish(Duration::from_secs(1)).unwrap();
+    assert_eq!((done.objects, done.left), (0, want.len() as u64));
+    assert!(reg.snapshot().upload_retries > 0);
+    assert!(objects(direct.as_ref()).is_empty());
+    assert_eq!(tree(spool_dir.path()), want, "the spool holds every object");
+
+    // The next run (or `collector upload`) finds them on disk.
+    proxy.set_up(true);
+    let spool = Spool::open(spool_dir.path(), u64::MAX, None).unwrap();
+    assert_eq!(spool.pending().0, want.len() as u64);
+    let done = Uploader::spawn(spool, through)
+        .unwrap()
+        .finish(Duration::from_secs(60))
+        .unwrap();
+    assert_eq!((done.objects, done.left), (want.len() as u64, 0));
+    assert_eq!(objects(direct.as_ref()), want);
+    assert!(
+        tree(spool_dir.path()).is_empty(),
+        "uploaded objects leave the spool"
+    );
+}
+
+/// A spool smaller than the run's objects, with the store down: the run
+/// waits once the spool is full, and goes on when the store comes back.
+#[test]
+fn a_full_spool_holds_the_run_back() {
+    let Some((proxy, through, direct)) = s3_behind_proxy("full") else {
+        return;
+    };
+    let want = local_objects(&SPAN);
+    let biggest = want.values().map(Vec::len).max().unwrap() as u64;
+    let total: u64 = want.values().map(|v| v.len() as u64).sum();
+    let max = biggest.max(total / 3);
+    assert!(total > max, "the run does not fit in the spool");
+
+    let (out, spool_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let reg = Registry::new();
+    let spool = Spool::open(spool_dir.path(), max, Some(reg.clone())).unwrap();
+    let uploader = Uploader::spawn(spool.clone(), through).unwrap();
+    let run = {
+        let (spool, reg, out) = (spool.clone(), reg.clone(), out.path().to_path_buf());
+        std::thread::spawn(move || run_spooled(&SPAN, &out, spool, reg))
+    };
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!run.is_finished(), "the run waits for room");
+    let (_, held) = spool.pending();
+    assert!(held <= max && held > 0, "{held} bytes held, {max} allowed");
+    assert_eq!(reg.snapshot().spool_bytes, held);
+    assert!(objects(direct.as_ref()).is_empty());
+
+    proxy.set_up(true);
+    run.join().unwrap().unwrap();
+    let done = uploader.finish(Duration::from_secs(60)).unwrap();
+    assert_eq!((done.objects, done.left), (want.len() as u64, 0));
+    assert!(spool.peak_bytes() <= max);
+    assert_eq!(objects(direct.as_ref()), want);
+    assert_eq!(reg.snapshot().spool_bytes, 0);
 }

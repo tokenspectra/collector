@@ -23,7 +23,9 @@
 //! it creates, before the put returns. A window's manifest is committed
 //! only after every object it names is on disk, so a machine crash cannot
 //! keep a manifest and lose what it points at. [`open`] also takes an
-//! `s3://` URL: Amazon S3 or an S3-compatible store.
+//! `s3://` URL: Amazon S3 or an S3-compatible store. A remote store is
+//! written through a local spool ([`crate::spool`]): the sink writes the
+//! spool, and an uploader copies it out.
 //!
 //! Every put is `PutMode::Create` (`If-None-Match: *` on S3). An object that
 //! already exists with the same bytes (a re-run over the same capture) is
@@ -35,12 +37,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::prefix::PrefixStore;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, RetryConfig};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -51,6 +54,7 @@ use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, Span, Windo
 use crate::flow::{Dir, FlowId};
 use crate::manifest::{IndexFile, Totals, WindowManifest};
 use crate::source::{CapturedPacket, LinkId};
+use crate::spool::Spool;
 use crate::stats::{add, Registry};
 use crate::window::PacketRef;
 use crate::{index, mh, pack};
@@ -69,6 +73,8 @@ pub enum StoreError {
     Conflict(String),
     #[error("--store {0:?}: expected a directory or s3://bucket[/prefix]")]
     Url(String),
+    #[error("upload: {0}")]
+    Upload(String),
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +216,7 @@ pub struct StoreSink<'a> {
     bodies: HashMap<BodyKey, Vec<u8>>,
     summary: StoreSummary,
     error: Option<StoreError>,
+    spool: Option<Arc<Spool>>,
 }
 
 impl<'a> StoreSink<'a> {
@@ -231,7 +238,21 @@ impl<'a> StoreSink<'a> {
             bodies: HashMap::new(),
             summary: StoreSummary::default(),
             error: None,
+            spool: None,
         }
+    }
+
+    /// Writes into `spool` instead: each put waits for room in it, and
+    /// queues the object for the uploader once it is there.
+    pub fn spooled(
+        inner: &'a mut dyn RecordSink,
+        spool: Arc<Spool>,
+        cfg: StoreConfig,
+        reg: Option<Arc<Registry>>,
+    ) -> Self {
+        let mut sink = StoreSink::new(inner, spool.store(), cfg, reg);
+        sink.spool = Some(spool);
+        sink
     }
 
     /// Seals every window still held and reports the first error, if any.
@@ -546,8 +567,21 @@ impl<'a> StoreSink<'a> {
         Ok(rec)
     }
 
-    /// Writes `bytes` once under `key`.
+    /// Writes `bytes` once under `key`, and queues it for upload when the
+    /// store is a spool.
     fn put(&self, key: &str, bytes: Vec<u8>, kind: Kind) -> Result<(), StoreError> {
+        let len = bytes.len() as u64;
+        if let Some(spool) = &self.spool {
+            spool.wait_for_room(len)?;
+        }
+        self.put_once(key, bytes, kind)?;
+        if let Some(spool) = &self.spool {
+            spool.added(key, len);
+        }
+        Ok(())
+    }
+
+    fn put_once(&self, key: &str, bytes: Vec<u8>, kind: Kind) -> Result<(), StoreError> {
         let path = ObjectPath::from(key);
         let len = bytes.len() as u64;
         let opts = PutOptions {
@@ -563,7 +597,14 @@ impl<'a> StoreSink<'a> {
                 Ok(())
             }
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let existing = block_on(async { self.store.get(&path).await?.bytes().await })?;
+                let existing = match block_on(async { self.store.get(&path).await?.bytes().await }) {
+                    Ok(b) => b,
+                    // Uploaded out of the spool meanwhile: write it again.
+                    Err(object_store::Error::NotFound { .. }) if self.spool.is_some() => {
+                        return self.put_once(key, bytes, kind);
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 if existing[..] != bytes[..] {
                     return Err(StoreError::Conflict(key.to_string()));
                 }
@@ -770,8 +811,9 @@ impl RecordSink for StoreSink<'_> {
 }
 
 /// Runs the object store's futures. The S3 client needs a tokio runtime;
-/// one worker is enough, since the store makes one request at a time.
-fn block_on<F: Future>(f: F) -> F::Output {
+/// one worker is enough: the sink and the uploader make one request each
+/// at a time.
+pub(crate) fn block_on<F: Future>(f: F) -> F::Output {
     static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -791,6 +833,9 @@ fn block_on<F: Future>(f: F) -> F::Output {
 /// `AWS_REGION`, and for an S3-compatible store `AWS_ENDPOINT` (with
 /// `AWS_ALLOW_HTTP=true` for plain `http://`). The store must honour
 /// `If-None-Match: *` on PutObject, or objects could be overwritten.
+///
+/// A request gives up after [`REQUEST_RETRY`]: the uploader retries on its
+/// own schedule, and a run's deadline should not wait on the client's.
 pub fn open(store: &str) -> Result<Arc<dyn ObjectStore>, StoreError> {
     let Some(rest) = store.strip_prefix("s3://") else {
         std::fs::create_dir_all(store)?;
@@ -800,13 +845,29 @@ pub fn open(store: &str) -> Result<Arc<dyn ObjectStore>, StoreError> {
     if bucket.is_empty() {
         return Err(StoreError::Url(store.to_string()));
     }
-    let s3 = AmazonS3Builder::from_env().with_bucket_name(bucket).build()?;
+    let retry = RetryConfig {
+        max_retries: 3,
+        retry_timeout: REQUEST_RETRY,
+        ..RetryConfig::default()
+    };
+    let s3 = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .with_retry(retry)
+        .build()?;
     let prefix = ObjectPath::parse(prefix).map_err(|_| StoreError::Url(store.to_string()))?;
     Ok(if prefix.as_ref().is_empty() {
         Arc::new(s3)
     } else {
         Arc::new(PrefixStore::new(s3, prefix))
     })
+}
+
+/// How long one request to a remote store keeps retrying.
+pub const REQUEST_RETRY: Duration = Duration::from_secs(10);
+
+/// Whether `--store` names a remote store, written through a spool.
+pub fn is_remote(store: &str) -> bool {
+    store.starts_with("s3://")
 }
 
 /// The local object store under `dir`. Each put syncs the object and the

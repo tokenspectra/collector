@@ -257,6 +257,12 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
 - **As built (TS-26):** `{window_start}` is the window start in nanoseconds since the Unix epoch, the `window_start_ns` column; `{yyyy}/{mm}/{dd}` is its UTC date; `{site}` and `{collector}` come from `--site` and `--collector-id` (default `local`); `{link}` is the Link with every character outside `[A-Za-z0-9._-]` replaced by `_`. The CLI writes to `--store`: a directory (`LocalFileSystem`, default `<out>/store`), or `s3://bucket[/prefix]` (TS-38), Amazon S3 or an S3-compatible store, with credentials, region and endpoint from the `AWS_*` environment variables.
   - Every put is write-once: `PutMode::Create`, `If-None-Match: *` on S3. A store that ignores the header could overwrite objects; CI checks the S3 path against VersityGW.
   - A put that finds the object already there reads it back: the same bytes (a re-run over the same capture) are left alone, other bytes fail the run. Nothing is overwritten.
+- **The spool (TS-38).** The Operator runs the object store, so it is outside the protected boundary and may be down. With an `s3://` store, every object is first written to a local spool (`--spool`, default `<out>/spool`), which stays inside the boundary, exactly as to the local store: synced on each put, the window's manifest committed after its objects are there. An uploader thread copies spooled objects out in the order they were written and removes each once the store holds it.
+  - **Write-once upload.** Each upload is a `PutMode::Create` put. The same bytes already in the store count as uploaded; other bytes stop the uploader and fail the run, as a conflicting put does without a spool. Any other error is retried after a pause that doubles from 250 ms up to 30 s, for as long as it takes.
+  - **An outage delays evidence instead of ending the run.** The run goes on writing the spool; manifests are committed and shipped, naming objects the store does not hold yet.
+  - **Backpressure.** The spool holds at most `--spool-max-mib` (default 4096). A put that would pass it waits until uploads make room, so sealing windows stops and the run is held back instead of filling the disk. An object bigger than the whole spool goes in once the spool is empty.
+  - **End of a run.** The uploader has `--upload-wait-s` (default 30) to empty the spool. What is left stays on disk; the next run uploads it first, or `collector upload` does.
+  - Objects are uploaded as spooled. TS-47 adds encryption to the auditor in the uploader, between the spool and the store.
 - **L0 chunks:** one object per Link per window, zstd-compressed. If a chunk passes a size cap (1 GiB stored), split it into `-partN` objects.
   - As built (TS-38): the compressed chunk is cut into 1 GiB pieces, `{key}-part0`, `{key}-part1`, …, each a single write-once put; joined in order they are the compressed chunk. The `chunks` row keeps the whole chunk's `key`, `chunk_hash` and `stored_len`, and `parts` says how many objects hold it (1: the object at `key`).
   - Why not `put_multipart`: `object_store` (0.14) completes a multipart upload without `If-None-Match`, so it could overwrite an object. S3 single puts take up to 5 GiB.
@@ -441,3 +447,7 @@ Metrics, all prefixed `ts_collector_` (labels in brackets):
 | `capture_kept_bytes_total`, `capture_truncated_bytes_total` | Captured bytes written to chunks, and captured bytes the Capture Rate cut |
 | `store_objects_total`, `store_bytes_total` `[kind]` | Objects written and their bytes; `kind`: `chunk`, `pack`, `index` |
 | `store_existing_total` | Puts that found the same object already there (a re-run) |
+| `uploads_total`, `upload_bytes_total` | Spooled objects the uploader put to the remote store, and their bytes (TS-38) |
+| `uploads_existing_total` | Uploads that found the same bytes already in the remote store |
+| `upload_retries_total` | Upload attempts that failed and are retried: a rising count is an outage |
+| `spool_objects`, `spool_bytes` (gauges) | Objects and bytes in the spool, waiting to be uploaded |

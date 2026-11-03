@@ -32,6 +32,7 @@ pub mod ring;
 pub mod run;
 pub mod ship;
 pub mod source;
+pub mod spool;
 pub mod stats;
 pub mod store;
 mod tcp;
