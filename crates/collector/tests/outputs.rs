@@ -192,7 +192,7 @@ fn every_window_is_shipped_once_and_a_rerun_only_repeats_it() {
         run_case(&files, out.path(), store_cfg(&case));
         let n = lines(&out.path().join(LOG)).len() as u64;
         let s = ship_pending(out.path(), &url, TIMEOUT).unwrap();
-        assert_eq!((s.sent, s.pending), (n, 0), "{case}");
+        assert_eq!((s.sent, s.pending), (n, Some(0)), "{case}");
         let log_len = std::fs::metadata(out.path().join(LOG)).unwrap().len();
         let cursor = std::fs::read_to_string(out.path().join(CURSOR)).unwrap();
         assert_eq!(cursor.trim(), log_len.to_string(), "{case}");
@@ -273,7 +273,7 @@ fn shipping_resumes_where_it_stopped() {
     let first_line = log.iter().position(|&b| b == b'\n').unwrap() + 1;
     std::fs::write(out.path().join(CURSOR), format!("{first_line}\n")).unwrap();
     let s = ship_pending(out.path(), &url, TIMEOUT).unwrap();
-    assert_eq!((s.sent, s.pending), (n - 1, 0));
+    assert_eq!((s.sent, s.pending), (n - 1, Some(0)));
     assert_eq!(ingest.snapshot().0.len() as u64, n - 1);
 }
 

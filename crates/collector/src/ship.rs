@@ -110,8 +110,10 @@ impl Ingest {
     }
 
     /// POSTs one manifest line; returns the HTTP status. Gives up once
-    /// `until()` has passed; it is asked again while the response is awaited,
-    /// so a deadline that moves closer cuts the request short.
+    /// `until()` has passed; it is asked again at least every [`SLICE`]
+    /// while the address is looked up, the connection made, the request
+    /// written and the response awaited, so a deadline that moves closer
+    /// cuts the request short at any of them.
     fn post(
         &self,
         key: &str,
@@ -126,13 +128,7 @@ impl Ingest {
                 self.host, self.port
             ))),
         };
-        let addr = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(unavailable)?
-            .next()
-            .ok_or_else(|| ShipError::Unavailable(format!("{}: no address", self.host)))?;
-        let mut conn = TcpStream::connect_timeout(&addr, left()?).map_err(unavailable)?;
-        conn.set_write_timeout(Some(left()?)).map_err(unavailable)?;
+        let mut conn = self.connect(&mut left)?;
         let host = if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
         } else {
@@ -143,8 +139,19 @@ impl Ingest {
             self.path,
             body.len()
         );
-        conn.write_all(head.as_bytes()).map_err(unavailable)?;
-        conn.write_all(body).map_err(unavailable)?;
+        for mut part in [head.as_bytes(), body] {
+            while !part.is_empty() {
+                conn.set_write_timeout(Some(left()?.min(SLICE)))
+                    .map_err(unavailable)?;
+                match conn.write(part) {
+                    Ok(0) => return Err(unavailable(io::ErrorKind::WriteZero.into())),
+                    Ok(n) => part = &part[n..],
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(unavailable(e)),
+                }
+            }
+        }
         let mut resp = Vec::new();
         let mut buf = [0u8; 4096];
         while resp.len() < 64 << 10 {
@@ -168,6 +175,40 @@ impl Ingest {
         let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b).trim();
         Ok((status, body.chars().take(200).collect()))
     }
+
+    /// Looks up the ingest and connects to it on a helper thread, waiting
+    /// on it in [`SLICE`]s so that `left()` running out is noticed. A
+    /// thread given up on finishes on its own: its connect is bounded by
+    /// the time left when it started, its lookup only by the resolver.
+    fn connect(&self, left: &mut dyn FnMut() -> Result<Duration, ShipError>) -> Result<TcpStream, ShipError> {
+        let (host, port, budget) = (self.host.clone(), self.port, left()?);
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("shipper-connect".into())
+            .spawn(move || {
+                let conn = (host.as_str(), port)
+                    .to_socket_addrs()
+                    .and_then(|mut addrs| {
+                        addrs
+                            .next()
+                            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))
+                    })
+                    .and_then(|addr| TcpStream::connect_timeout(&addr, budget));
+                let _ = tx.send(conn);
+            })?;
+        loop {
+            match rx.recv_timeout(left()?.min(SLICE)) {
+                Ok(conn) => {
+                    return conn
+                        .map_err(|e| ShipError::Unavailable(format!("{}:{}: {e}", self.host, self.port)))
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(ShipError::Io(io::Error::other("shipper connect thread panicked")))
+                }
+            }
+        }
+    }
 }
 
 /// What one pass shipped.
@@ -175,8 +216,11 @@ impl Ingest {
 pub struct Shipped {
     /// Lines the ingest accepted in this pass.
     pub sent: u64,
-    /// Complete lines still unshipped after it.
-    pub pending: u64,
+    /// Complete lines still unshipped after it; `None` when the shutdown
+    /// deadline passed first. Counting means reading the rest of the log,
+    /// which could take longer than the budget allows: [`pending_lines`]
+    /// or `collector ship` counts them later.
+    pub pending: Option<u64>,
 }
 
 fn read_cursor(out: &Path) -> io::Result<u64> {
@@ -211,15 +255,20 @@ pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Sh
 }
 
 /// [`ship_pending`], stopping at the deadline `shutdown()` returns once it
-/// has one. It is asked before each line and during each request, and
-/// bounds each request's timeout. Lines left when it passes stay pending.
+/// has one. It is asked before each line and at least every [`SLICE`]
+/// during each request, and bounds each request's timeout. Lines left when
+/// it passes stay pending, uncounted: the pass returns at once rather than
+/// read the rest of the log.
 fn ship_within(
     out: &Path,
     ingest: &Ingest,
     timeout: Duration,
     shutdown: &mut dyn FnMut() -> Option<Instant>,
 ) -> Result<Shipped, ShipError> {
-    let mut shipped = Shipped::default();
+    let mut shipped = Shipped {
+        sent: 0,
+        pending: Some(0),
+    };
     let file = match File::open(out.join(LOG)) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(shipped),
@@ -239,16 +288,20 @@ fn ship_within(
     reader.seek(SeekFrom::Start(offset))?;
     let mut line = Vec::new();
     let mut result = Ok(());
-    let mut out_of_time = false;
     loop {
+        if shutdown().is_some_and(|d| Instant::now() >= d) {
+            // Out of time: leave the rest of the log unread and uncounted.
+            shipped.pending = None;
+            break;
+        }
         line.clear();
         let n = reader.read_until(b'\n', &mut line)?;
         if n == 0 || line.last() != Some(&b'\n') {
             break; // the end, or a line still being written
         }
-        if result.is_err() || out_of_time || shutdown().is_some_and(|d| Instant::now() >= d) {
-            out_of_time |= result.is_ok();
-            shipped.pending += 1;
+        if result.is_err() {
+            // Stopped at a failure: count what is left.
+            shipped.pending = shipped.pending.map(|p| p + 1);
             continue;
         }
         let body = &line[..line.len() - 1];
@@ -277,7 +330,7 @@ fn ship_within(
                 shipped.sent += 1;
             }
             Err(e) => {
-                shipped.pending += 1;
+                shipped.pending = shipped.pending.map(|p| p + 1);
                 result = Err(e);
             }
         }
@@ -352,17 +405,15 @@ fn run(
                 poll
             }
             Err(e) if e.retryable() => {
-                if backoff == poll {
+                let first = backoff == poll;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                if deadline.is_some_and(|d| Instant::now() + backoff >= d) {
+                    return Err(e);
+                }
+                if first {
                     warn!(error = %e, "manifests not shipped yet; retrying");
                 }
-                total.pending = pending_lines(out).unwrap_or(total.pending);
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-                match deadline {
-                    Some(d) if Instant::now() + backoff >= d => {
-                        return Err(e);
-                    }
-                    _ => backoff,
-                }
+                backoff
             }
             Err(e) => {
                 tracing::error!(error = %e, "shipper stopped");
@@ -390,23 +441,30 @@ pub fn pending_lines(out: &Path) -> io::Result<u64> {
     };
     let offset = read_cursor(out)?.min(file.metadata()?.len());
     file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::with_capacity(64 << 10, file);
     let mut n = 0;
-    for b in BufReader::new(file).bytes() {
-        n += u64::from(b? == b'\n');
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(n);
+        }
+        n += buf.iter().filter(|&&b| b == b'\n').count() as u64;
+        let len = buf.len();
+        reader.consume(len);
     }
-    Ok(n)
 }
 
 /// Logs the outcome of a run's shipping.
 pub fn log_outcome(res: &Result<Shipped, ShipError>, out: &Path) {
     match res {
-        Ok(s) if s.pending == 0 => info!(sent = s.sent, "manifests shipped"),
+        Ok(s) if s.pending == Some(0) => info!(sent = s.sent, "manifests shipped"),
+        // No count: reading the rest of the log could hold up the end of
+        // the run, which the shipper's budget bounds.
         Ok(s) => {
-            warn!(sent = s.sent, pending = s.pending, out = %out.display(), "manifests left in the log; ship them with `collector ship`")
+            warn!(sent = s.sent, pending = ?s.pending, out = %out.display(), "manifests left in the log; ship them with `collector ship`")
         }
         Err(e) => {
-            let pending = pending_lines(out).unwrap_or(0);
-            warn!(error = %e, pending, out = %out.display(), "manifests left in the log; ship them with `collector ship`");
+            warn!(error = %e, out = %out.display(), "manifests left in the log; ship them with `collector ship`");
         }
     }
 }
@@ -540,13 +598,14 @@ mod tests {
         let pending = pending_lines(dir.path()).unwrap();
         assert!((1..20).contains(&pending), "{pending} pending");
         if let Ok(s) = res {
-            assert_eq!((s.sent, s.pending), (20 - pending, pending));
+            assert_eq!(s.sent, 20 - pending);
+            assert!(s.pending.is_none_or(|p| p == pending), "{:?}", s.pending);
         }
 
         // A later pass ships exactly what was left.
         let ingest = slow_ingest(Some(Duration::ZERO));
         let s = ship_pending(dir.path(), &ingest, Duration::from_secs(5)).unwrap();
-        assert_eq!((s.sent, s.pending), (pending, 0));
+        assert_eq!((s.sent, s.pending), (pending, Some(0)));
     }
 
     #[test]
@@ -556,7 +615,73 @@ mod tests {
             Shipper::spawn(dir.path().to_owned(), slow_ingest(None), Duration::from_secs(1)).unwrap();
         let s = shipper.finish(Duration::ZERO);
         // The first POST may have begun before the stop; it is cut short.
-        assert!(s.map_or_else(|e| e.retryable(), |s| s.pending == 2));
+        assert!(s.map_or_else(|e| e.retryable(), |s| s.pending.is_none_or(|p| p == 2)));
         assert_eq!(pending_lines(dir.path()).unwrap(), 2);
+    }
+
+    /// A log whose first manifest is far larger than the loopback socket
+    /// buffers, then `backlog` small ones, and an ingest that accepts the
+    /// connection but never reads it: the first upload blocks part-way.
+    /// Returns the shipper once that upload is stuck.
+    fn blocked_upload(dir: &Path, backlog: u64) -> Shipper {
+        let pad = "x".repeat(32 << 20);
+        let mut log = std::io::BufWriter::new(File::create(dir.join(LOG)).unwrap());
+        writeln!(
+            log,
+            "{{\"collector\":\"c\",\"window_start_ns\":0,\"pad\":\"{pad}\"}}"
+        )
+        .unwrap();
+        for w in 1..=backlog {
+            writeln!(log, "{{\"collector\":\"c\",\"window_start_ns\":{w}}}").unwrap();
+        }
+        log.into_inner().unwrap().sync_all().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted, connected) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                held.push(conn);
+                let _ = accepted.send(());
+            }
+        });
+        let ingest = Ingest::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let shipper = Shipper::spawn(dir.to_owned(), ingest, Duration::from_secs(1)).unwrap();
+        connected.recv_timeout(Duration::from_secs(10)).unwrap();
+        std::thread::sleep(Duration::from_millis(200)); // the upload is stuck
+        shipper
+    }
+
+    #[test]
+    fn a_stop_during_a_blocked_upload_returns_within_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let shipper = blocked_upload(dir.path(), 0);
+        let t0 = Instant::now();
+        let res = shipper.finish(Duration::from_millis(100));
+        let took = t0.elapsed();
+        assert!(took < Duration::from_millis(400), "finish took {took:?}");
+        assert!(res.unwrap_err().retryable());
+        assert_eq!(pending_lines(dir.path()).unwrap(), 1);
+        assert_eq!(read_cursor(dir.path()).unwrap(), 0);
+    }
+
+    /// The same stop with a large backlog behind the stuck upload: the
+    /// shipper returns without reading the rest of the log to count it.
+    #[test]
+    fn a_stop_during_a_blocked_upload_does_not_scan_the_backlog() {
+        const BACKLOG: u64 = 5_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let shipper = blocked_upload(dir.path(), BACKLOG);
+        let t0 = Instant::now();
+        let res = shipper.finish(Duration::from_millis(100));
+        let took = t0.elapsed();
+        assert!(took < Duration::from_millis(400), "finish took {took:?}");
+        match res {
+            Ok(s) => assert_eq!((s.sent, s.pending), (0, None)),
+            Err(e) => assert!(e.retryable(), "{e}"),
+        }
+        // Every line is still there, past an unmoved cursor.
+        assert_eq!(read_cursor(dir.path()).unwrap(), 0);
+        assert_eq!(pending_lines(dir.path()).unwrap(), BACKLOG + 1);
     }
 }
