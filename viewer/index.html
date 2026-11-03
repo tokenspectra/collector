@@ -457,18 +457,27 @@ function chartGeom(pts) {
   const n = pts.length, w = CW - PAD.l - PAD.r, h = CH - PAD.t - PAD.b;
   const x = i => PAD.l + (n === 1 ? w / 2 : (i / (n - 1)) * w);
   const y = v => PAD.t + h - v * h;
-  const frac = (i, v) => chartMode === "share" ? (tot[i] ? v / tot[i] : 0) : v / max;
-  return { vals, tot, max, n, w, h, x, y, frac };
+  // Share mode always fills 100%: a window with no bytes holds the shares of the last window that had some
+  // (before the first, the first). Bytes mode shows the zero.
+  const held = tot.map((t, i) => t ? i : -1);
+  for (let i = 1; i < n; i++) if (held[i] < 0) held[i] = held[i - 1];
+  for (let i = n - 2; i >= 0; i--) if (held[i] < 0) held[i] = held[i + 1];
+  const frac = (i, key) => {
+    if (chartMode !== "share") return vals[i][key] / max;
+    const j = held[i];
+    return j >= 0 ? vals[j][key] / tot[j] : 0;
+  };
+  return { vals, tot, max, n, w, h, x, y, frac, held };
 }
 function chartSvg(id) {
   const { points: pts } = CHARTS[id];
   const g = chartGeom(pts);
-  const { vals, n, x, y, frac } = g;
+  const { n, x, y, frac } = g;
   let shapes = "";
   const base = new Array(n).fill(0);
   if (n >= 3) {
     for (const c of CLASSES) {
-      const lo = [...base], hi = base.map((b, i) => b + frac(i, vals[i][c.key]));
+      const lo = [...base], hi = base.map((b, i) => b + frac(i, c.key));
       hi.forEach((v, i) => (base[i] = v));
       const top = hi.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" L");
       const bot = lo.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).reverse().join(" L");
@@ -479,7 +488,7 @@ function chartSvg(id) {
     for (let i = 0; i < n; i++) {
       let acc = 0;
       for (const c of CLASSES) {
-        const f = frac(i, vals[i][c.key]); if (!f) continue;
+        const f = frac(i, c.key); if (!f) continue;
         shapes += `<rect x="${x(i) - bw / 2}" y="${y(acc + f)}" width="${bw}" height="${(f * g.h).toFixed(1)}" fill="var(--c-${c.key})" stroke="var(--panel)" stroke-width="1"/>`;
         acc += f;
       }
@@ -512,6 +521,7 @@ function chartHover(e) {
   tip.innerHTML = `<div><b>Window ${wsLabel(p.ws)}</b> <span class="muted">${bytes(t)}</span></div>` +
     [...CLASSES].reverse().map(c => `<div title="${c.parts.join(" + ")}"><i style="background:var(--c-${c.key})"></i>${c.label}
       <span class="num">${t ? (100 * v[c.key] / t).toFixed(1) : "0.0"}%</span> <span class="muted">${bytes(v[c.key])}</span></div>`).join("") +
+    (!t && g.held[i] >= 0 && chartMode === "share" ? `<div class="muted">no bytes; shares held from window ${wsLabel(points[g.held[i]].ws)}</div>` : "") +
     (p.alert ? `<div style="color:var(--c-red)">! ${esc(p.alert)}</div>` : "") + (p.href ? `<div class="muted">click to open</div>` : "");
   tip.hidden = false;
   const left = (g.x(i) / CW) * r.width + svg.offsetLeft;
