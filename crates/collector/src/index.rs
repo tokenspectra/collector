@@ -150,13 +150,16 @@ macro_rules! message {
             (concat!($p, ".body_len"), Int),
             (concat!($p, ".body_gap_bytes"), Int),
             (concat!($p, ".body_hash"), Str),
+            (concat!($p, ".decoded_len"), Int),
+            (concat!($p, ".decoded_hash"), Str),
+            (concat!($p, ".decode_error"), Str),
             (concat!($p, ".complete"), Bool),
         ]
     };
 }
 
-const REQUEST: [Column; 14] = message!("request");
-const RESPONSE: [Column; 14] = message!("response");
+const REQUEST: [Column; 17] = message!("request");
+const RESPONSE: [Column; 17] = message!("response");
 
 const HTTP_HEAD: &[Column] = &[
     ("flow", Str),
@@ -186,8 +189,10 @@ const WORKUNITS: &[Column] = &[
     ("response_content_type", Str),
     ("request_body_hash", Str),
     ("request_body_len", Int),
+    ("request_decoded_hash", Str),
     ("response_body_hash", Str),
     ("response_body_len", Int),
+    ("response_decoded_hash", Str),
     ("response_id", Str),
     ("response_model", Str),
     ("finish_reason", Json),

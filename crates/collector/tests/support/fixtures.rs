@@ -514,6 +514,219 @@ pub fn grpc_h2c() -> Fixture {
     }
 }
 
+pub const CODED_CHAT_REQ: &[u8] =
+    b"{\"model\":\"mock-model\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}";
+pub const CODED_CHAT_JSON: &[u8] = b"{\"id\":\"chatcmpl-gzip-0001\",\"object\":\"chat.completion\",\"created\":1800000000,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello there, friend.\"},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"total_tokens\":13}}";
+pub const CODED_STREAM_REQ: &[u8] = b"{\"model\":\"mock-model\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}";
+
+/// The SSE events of a streamed chat reply: role, four tokens, finish,
+/// `[DONE]`.
+pub fn coded_chat_events() -> Vec<Vec<u8>> {
+    let base = r#""id":"chatcmpl-gzip-0002","object":"chat.completion.chunk","created":1800000000,"model":"mock-model""#;
+    let mut out = vec![format!(
+        r#"data: {{{base},"choices":[{{"index":0,"delta":{{"role":"assistant","content":""}},"finish_reason":null}}]}}"#
+    )];
+    for t in ["Hello", " there", ",", " friend."] {
+        out.push(format!(
+            r#"data: {{{base},"choices":[{{"index":0,"delta":{{"content":"{t}"}},"finish_reason":null}}]}}"#
+        ));
+    }
+    out.push(format!(
+        r#"data: {{{base},"choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}]}}"#
+    ));
+    out.push("data: [DONE]".into());
+    out.into_iter().map(|e| format!("{e}\n\n").into_bytes()).collect()
+}
+
+/// gzip with no file name and mtime 0, as servers send it.
+pub fn gzip(b: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::default());
+    e.write_all(b).unwrap();
+    e.finish().unwrap()
+}
+
+pub fn zlib(b: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(b).unwrap();
+    e.finish().unwrap()
+}
+
+pub fn raw_deflate(b: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(b).unwrap();
+    e.finish().unwrap()
+}
+
+pub fn brotli(b: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut out = Vec::new();
+    {
+        let mut w = ::brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+        w.write_all(b).unwrap();
+    }
+    out
+}
+
+pub fn zstd(b: &[u8]) -> Vec<u8> {
+    ::zstd::encode_all(b, 3).unwrap()
+}
+
+/// A gzip bomb: 8 MiB of zeros, about 8 KiB on the wire.
+pub fn gzip_bomb() -> Vec<u8> {
+    gzip(&vec![0u8; 8 << 20])
+}
+
+/// A chat request (optionally with a coded body) as a Python client sends
+/// it: `Accept-Encoding: gzip, deflate`.
+pub fn chat_request(body: &[u8], coding: Option<&str>) -> Vec<u8> {
+    let mut head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 10.0.0.2:8000\r\nAccept-Encoding: gzip, deflate\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if let Some(c) = coding {
+        head.push_str(&format!("Content-Encoding: {c}\r\n"));
+    }
+    head.push_str("\r\n");
+    [head.as_bytes(), body].concat()
+}
+
+pub fn coded_response(content_type: &str, coding: &str, body: &[u8]) -> Vec<u8> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Encoding: {coding}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    [head.as_bytes(), body].concat()
+}
+
+/// Sends `bytes` from a or b in segments of at most `mss`, 1 ms apart.
+fn send_all(c: &mut Conn, from_a: bool, ts: u64, bytes: &[u8], mss: usize, f: &mut Vec<Frame>) -> u64 {
+    let mut t = ts;
+    for piece in bytes.chunks(mss) {
+        f.push(c.send(from_a, t, PSH | ACK, piece));
+        t += MS;
+    }
+    f.push(c.ack(!from_a, t));
+    t + MS
+}
+
+/// A non-streaming chat completion whose JSON response is gzip-coded
+/// (`Content-Length`, split across two segments).
+pub fn gzip_h1_json() -> Fixture {
+    let mut c = Conn::new(CLIENT, SERVER, 11_000, 12_000);
+    let mut f = Vec::new();
+    c.handshake(T0 + 10 * MS, &mut f);
+    send_all(
+        &mut c,
+        true,
+        T0 + 20 * MS,
+        &chat_request(CODED_CHAT_REQ, None),
+        1460,
+        &mut f,
+    );
+    let resp = coded_response("application/json", "gzip", &gzip(CODED_CHAT_JSON));
+    send_all(&mut c, false, T0 + 40 * MS, &resp, resp.len() - 40, &mut f);
+    c.close(T0 + 60 * MS, &mut f);
+    Fixture {
+        name: "gzip_h1_json",
+        files: vec![("gzip_h1_json.pcapng", f)],
+    }
+}
+
+/// A streamed chat completion, gzip-coded and chunked, the server flushing
+/// the compressor after each event, so every chunk decodes to one event.
+pub fn gzip_h1_sse() -> Fixture {
+    use std::io::Write;
+    let mut c = Conn::new(CLIENT, SERVER, 21_000, 22_000);
+    let mut f = Vec::new();
+    c.handshake(T0 + 10 * MS, &mut f);
+    send_all(
+        &mut c,
+        true,
+        T0 + 20 * MS,
+        &chat_request(CODED_STREAM_REQ, None),
+        1460,
+        &mut f,
+    );
+    let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n";
+    f.push(c.send(false, T0 + 40 * MS, PSH | ACK, head));
+    let mut gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::default());
+    let mut t = T0 + 60 * MS;
+    let chunk = |b: &[u8]| [format!("{:x}\r\n", b.len()).as_bytes(), b, b"\r\n"].concat();
+    for event in coded_chat_events() {
+        gz.write_all(&event).unwrap();
+        gz.flush().unwrap();
+        let wire = std::mem::take(gz.get_mut());
+        f.push(c.send(false, t, PSH | ACK, &chunk(&wire)));
+        t += 20 * MS;
+    }
+    let trailer = gz.finish().unwrap();
+    f.push(c.send(
+        false,
+        t,
+        PSH | ACK,
+        &[chunk(&trailer), b"0\r\n\r\n".to_vec()].concat(),
+    ));
+    f.push(c.ack(true, t + MS));
+    c.close(t + 10 * MS, &mut f);
+    Fixture {
+        name: "gzip_h1_sse",
+        files: vec![("gzip_h1_sse.pcapng", f)],
+    }
+}
+
+/// One keep-alive Flow, one exchange per case:
+/// 0. `deflate` as zlib; 1. `deflate` as raw deflate; 2. `br`; 3. `zstd`;
+/// 4. a gzip-coded request body; 5. an unknown coding (`compress`): not
+///    read; 6. a gzip bomb: decoding stops at the ratio cap, not read;
+/// 7. gzip cut short: `Content-Length` covers a stream with no trailer.
+pub fn content_codings_h1() -> Fixture {
+    let mut c = Conn::new(CLIENT, SERVER, 31_000, 32_000);
+    let mut f = Vec::new();
+    c.handshake(T0 + 10 * MS, &mut f);
+    let plain = chat_request(CODED_CHAT_REQ, None);
+    let json = "application/json";
+    let gz = gzip(CODED_CHAT_JSON);
+    let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (
+            plain.clone(),
+            coded_response(json, "deflate", &zlib(CODED_CHAT_JSON)),
+        ),
+        (
+            plain.clone(),
+            coded_response(json, "deflate", &raw_deflate(CODED_CHAT_JSON)),
+        ),
+        (
+            plain.clone(),
+            coded_response(json, "br", &brotli(CODED_CHAT_JSON)),
+        ),
+        (
+            plain.clone(),
+            coded_response(json, "zstd", &zstd(CODED_CHAT_JSON)),
+        ),
+        (
+            chat_request(&gzip(CODED_CHAT_REQ), Some("gzip")),
+            coded_response(json, "gzip", &gz),
+        ),
+        (plain.clone(), coded_response(json, "compress", &gz)),
+        (plain.clone(), coded_response(json, "gzip", &gzip_bomb())),
+        (plain, coded_response(json, "gzip", &gz[..gz.len() - 8])),
+    ];
+    let mut t = T0 + 20 * MS;
+    for (req, resp) in cases {
+        t = send_all(&mut c, true, t, &req, 1460, &mut f);
+        t = send_all(&mut c, false, t + 5 * MS, &resp, 1460, &mut f);
+        t += 10 * MS;
+    }
+    c.close(t, &mut f);
+    Fixture {
+        name: "content_codings_h1",
+        files: vec![("content_codings_h1.pcapng", f)],
+    }
+}
+
 pub fn all() -> Vec<Fixture> {
     vec![
         span_windows(),
@@ -525,6 +738,9 @@ pub fn all() -> Vec<Fixture> {
         http1_edge(),
         tls_plaintext(),
         grpc_h2c(),
+        gzip_h1_json(),
+        gzip_h1_sse(),
+        content_codings_h1(),
     ]
 }
 

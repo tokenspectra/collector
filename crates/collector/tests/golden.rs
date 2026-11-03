@@ -667,6 +667,114 @@ fn anthropic_sse_over_http1_chunked_and_h2c() {
     assert_eq!(hashes("anthropic_h1_json"), hashes("anthropic_h2c_json"));
 }
 
+fn b3(b: &[u8]) -> String {
+    collector::mh::name(&blake3::hash(b))
+}
+
+#[test]
+fn gzip_json_is_read_and_hashed_on_both_sides_of_the_coding() {
+    use collector::stats::Outcome;
+    let c = collect_files(&["gzip_h1_json.pcapng"]);
+    let [w] = c.workunits.as_slice() else {
+        panic!("{:?}", c.workunits)
+    };
+    assert_eq!(w.outcome(), Outcome::Ok);
+    assert_eq!(w.response_id.as_deref(), Some("chatcmpl-gzip-0001"));
+    assert_eq!(w.output_tokens, Some(4));
+    assert_eq!(w.finish_reason[0].finish_reason, "stop");
+    // The body hash stays on the wire bytes; the decoded hash is beside it.
+    let wire = fixtures::gzip(fixtures::CODED_CHAT_JSON);
+    assert_eq!(w.response_body_hash, Some(b3(&wire)));
+    assert_eq!(w.response_body_len, wire.len() as u64);
+    assert_eq!(w.response_decoded_hash, Some(b3(fixtures::CODED_CHAT_JSON)));
+    assert_eq!(w.request_decoded_hash, None, "the request is not coded");
+    assert_eq!(c.bodies[&b3(&wire)], wire, "kept as on the wire");
+    let resp = c.exchanges[0].response.as_ref().unwrap();
+    assert_eq!(resp.content_encoding.as_deref(), Some("gzip"));
+    assert_eq!(resp.decoded_len, Some(fixtures::CODED_CHAT_JSON.len() as u64));
+    assert_eq!(resp.decode_error, None);
+    let req = c.exchanges[0].request.as_ref().unwrap();
+    assert_eq!(
+        (req.decoded_len, &req.decoded_hash, req.decode_error),
+        (None, &None, None)
+    );
+}
+
+#[test]
+fn gzip_sse_is_framed_as_it_decodes() {
+    use collector::stats::Outcome;
+    let c = collect_files(&["gzip_h1_sse.pcapng"]);
+    let [w] = c.workunits.as_slice() else {
+        panic!("{:?}", c.workunits)
+    };
+    assert_eq!(w.outcome(), Outcome::Ok);
+    assert_eq!(w.sse_done, Some(true));
+    let plain = fixtures::coded_chat_events().concat();
+    assert_eq!(w.response_decoded_hash, Some(b3(&plain)));
+    // Event offsets and lengths count decoded bytes; each event's time is
+    // that of the chunk that carried it.
+    let events = w.sse_events.as_ref().unwrap();
+    assert_eq!(events.len(), 7);
+    assert_eq!(events.iter().map(|e| e.len).sum::<u64>(), plain.len() as u64);
+    assert!(events.windows(2).all(|p| p[0].ts_ns < p[1].ts_ns), "{events:?}");
+    let resp = c.exchanges[0].response.as_ref().unwrap();
+    assert!(resp.body_len < plain.len() as u64);
+    assert_eq!(
+        c.bodies[resp.body_hash.as_ref().unwrap()].len() as u64,
+        resp.body_len
+    );
+}
+
+#[test]
+fn every_coding_decodes_and_failures_are_errored() {
+    use collector::coding::{DecodeError, RATIO_FLOOR};
+    use collector::stats::Outcome;
+    let c = collect_files(&["content_codings_h1.pcapng"]);
+    assert_eq!(c.workunits.len(), 8);
+    let codings: Vec<_> = c
+        .exchanges
+        .iter()
+        .map(|e| e.response.as_ref().unwrap().content_encoding.clone().unwrap())
+        .collect();
+    assert_eq!(
+        codings,
+        ["deflate", "deflate", "br", "zstd", "gzip", "compress", "gzip", "gzip"]
+    );
+    let decoded = b3(fixtures::CODED_CHAT_JSON);
+    for w in &c.workunits[..5] {
+        assert_eq!(w.outcome(), Outcome::Ok, "exchange {}", w.exchange);
+        assert_eq!(w.response_id.as_deref(), Some("chatcmpl-gzip-0001"));
+        assert_eq!(w.response_decoded_hash.as_ref(), Some(&decoded));
+    }
+    // A gzip request body is read for its fields, and hashed both ways.
+    let w = &c.workunits[4];
+    assert_eq!(w.model.as_deref(), Some("mock-model"));
+    assert_eq!(
+        w.request_body_hash,
+        Some(b3(&fixtures::gzip(fixtures::CODED_CHAT_REQ)))
+    );
+    assert_eq!(w.request_decoded_hash, Some(b3(fixtures::CODED_CHAT_REQ)));
+    for (i, error, len) in [
+        (5, DecodeError::Unsupported, None),
+        (6, DecodeError::OverRatio, Some(RATIO_FLOOR)),
+        (
+            7,
+            DecodeError::Truncated,
+            Some(fixtures::CODED_CHAT_JSON.len() as u64),
+        ),
+    ] {
+        let w = &c.workunits[i];
+        assert_eq!(w.outcome(), Outcome::Errored, "exchange {i}");
+        assert!(w.response_body_hash.is_some() && w.response_decoded_hash.is_none());
+        let m = c.exchanges[i].response.as_ref().unwrap();
+        assert_eq!(
+            (m.decode_error, m.decoded_len),
+            (Some(error), len),
+            "exchange {i}"
+        );
+    }
+}
+
 #[test]
 fn health_models_and_bad_json_are_http_other() {
     let c = collect_files(&["http_other_h1.pcapng"]);

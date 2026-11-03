@@ -119,7 +119,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 **Wire Protocols (TS-29).** Each protocol is one module behind the `WireProtocol` trait, listed once in a fixed registry. Adding one changes nothing outside its module but that registry line. A protocol declares:
 - **routes:** an HTTP method and a path pattern, matched against the path without query or fragment (absolute-form targets are reduced to their path). `*` matches any run of characters other than `/`. The pattern is the record's `endpoint`;
 - **header sniffing**, optional: for each matching route, `yes` (a header only this protocol sends, e.g. `anthropic-version`), `maybe` (no evidence), or `no` (ruled out). This serves gateways and self-hosted servers that expose several APIs on one port;
-- **request reading:** whether a complete, uncoded request body of at most `max_body` is its request, and the common request fields. Saying no is body sniffing: the next claim gets the body;
+- **request reading:** whether a complete request body of at most `max_body` (after its content coding is removed) is its request, and the common request fields. Saying no is body sniffing: the next claim gets the body;
 - **response framing:** from the request and the response media type, `json`, `sse` or `ndjson`, or none (not a Workunit);
 - **a frame decoder:** frames in, common record fields and `extra` out. Protocols never see bytes.
 
@@ -128,7 +128,13 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 **Per protocol.**
 - **Ollama native (`ollama`, TS-32).** Routes `POST /api/chat`, `/api/generate`, `/api/embed`; no header sniffing (the paths are its own); the request is any JSON object. Chat and generate stream unless the request sets `"stream": false`: the response is `ndjson` (`application/x-ndjson`), the last line carrying `"done": true`; otherwise, and always for embed, it is one `json` object. `model` and `options.seed` come from the request; from the last object, `done_reason` → `finish_reason[0]`, `prompt_eval_count` → `input_tokens`, `eval_count` → `output_tokens`. Ollama sends no usage object, so `usage` is null. `extra`: `total_duration`, `load_duration`, `prompt_eval_duration`, `eval_duration` (ns, as sent), `done` (streams only: whether the `"done": true` line arrived, the NDJSON counterpart of `sse_done`) and `error`. Ollama's OpenAI-compatible `/v1/*` endpoints are claimed by OpenAI, not here; a captured fixture checks it.
 
-**Response framing** is shared, so protocols handle events, not bytes. Bodies are framed after chunked encoding is removed; a content coding hides the frames, so the response is not read.
+**Response framing** is shared, so protocols handle events, not bytes. Bodies are framed after chunked encoding is removed, then after any content coding is decoded (below).
+
+**Content codings (TS-37).** Python clients send `Accept-Encoding: gzip, deflate` by default, and proxies may compress JSON, so the Collector decodes `gzip` (and `x-gzip`, several members allowed), `deflate` (zlib as RFC 9110 says, or raw deflate as some servers send it, told apart by the first two bytes), `br` and `zstd`, on requests and responses, for every HTTP body.
+- **For parsing only.** The body hash, the stored body and `body_len` stay on the wire bytes (§6, §8). The decoded bytes feed body sniffing, the framers and the protocols, and get a second hash, `decoded_hash` (§6).
+- **As it streams.** A coded SSE or NDJSON response is decoded as it arrives, so frames keep the capture time of the bytes that carried them. `sse_events` offsets and lengths then count decoded bytes.
+- **Bomb cap.** Decoding stops when a body passes either cap, absolute or as a ratio (`DecoderConfig::decode_limits`): **64 MiB decoded per body**, and **100 decoded bytes per wire byte** once past the first **1 MiB** decoded, so small bodies that compress well are never stopped. The body is still hashed, counted and kept; it is not read, so the Workunit is `errored`, and a WARN line names the cap.
+- **When decoding stops,** the `http` row says why in `decode_error`: `unsupported` (another coding, e.g. `compress`, or more than one: `gzip, br`), `corrupt`, `truncated` (the body ended before the coded stream did), `incomplete` (the message never ended), `gap`, `over_cap`, `over_ratio`. Such a body has no `decoded_hash` and is not read.
 
 | Framing | Frames | After a gap |
 |---|---|---|
@@ -185,6 +191,7 @@ BLAKE3 everywhere, at 3.4 GiB/s per core and 10 GiB/s on 4 threads on a modest V
 | **L0 packet** | `blake3(captured bytes)` per packet, combined into a Merkle root per chunk, stored in the chunk index | Proves a single packet is in a chunk without fetching the chunk |
 | **L1 Slice** | `slice_hash[n] = blake3(slice_hash[n-1] ‖ flow_id ‖ dir ‖ stream bytes of Slice n)`, with `slice_hash[-1]` = the Flow's first-seen record | One commitment per window. The chain commits to the whole Flow so far, so long keep-alive or HTTP/2 Flows don't wait for FIN. **Gap bytes are left out and listed separately** |
 | **L2 body** | `blake3(body bytes as on the wire)`, after removing chunked encoding but before any `Content-Encoding` is decoded | Names the stored body. Never hash re-serialised JSON: it has no canonical form, and these bytes are adversarial |
+| **L2 decoded body** | `blake3(body bytes once the content coding is decoded)`, only for a coded body decoded to its end within the cap (§5): `decoded_hash` on the `http` row, `request_decoded_hash` and `response_decoded_hash` on the Workunit | Compares bytes that do not depend on the coding (e.g. with a Tap that records the decoded request). A commitment, not a name: no blob is stored under it |
 | **L2 SSE** | One hash over the whole response body (all events), not one per event | One blob per response. Event offsets and timestamps go in the record |
 | **L3 record** | `blake3(record bytes)` | Integrity of the record. Not its identity |
 
@@ -286,6 +293,7 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - **Not evidence.** It is never hashed as a body, never stored in packs, never compared with the API Tap. §6 forbids hashing re-serialised JSON.
   - **Lossy.** Event boundaries, per-event capture times (in `sse_events`), and any field the merge doesn't know are dropped. The raw body stays the source; the merged file is rebuilt from it.
   - **Deterministic.** Same body, same file, so two runs stay byte-identical (§12).
+  - **Decoded first.** A coded body is stored as on the wire; the merge decodes it (§5) before reading its events, and one that does not decode merges as incomplete.
   - Only the raw body is checked by name. A reader who doubts the merged file rebuilds it from `bodies/`.
 - **Index tables (Parquet), one set per window:**
   - `flows`: per-Flow, per-Slice metadata, verdict, buckets, Slice hash;
@@ -361,7 +369,8 @@ _As built (TS-27): 1, 2, 4 and 6 run in CI over the whole golden set, all four W
 1. **Golden files:** a set of `.pcapng` files with expected index tables and hashes, run in CI. It covers:
    - HTTP/1.1 JSON, HTTP/1.1 SSE with chunked encoding, h2c JSON and SSE;
    - a Flow spanning windows, a mid-stream start, a lost segment, a retransmit with different bytes;
-   - `/health`, a TLS Flow on the plaintext Link, a non-HTTP TCP Flow, UDP.
+   - `/health`, a TLS Flow on the plaintext Link, a non-HTTP TCP Flow, UDP;
+   - content codings (TS-37): gzip JSON, gzip SSE flushed per event, and one Flow with `deflate` (zlib and raw), `br`, `zstd`, a gzip request body, an unknown coding, a gzip bomb and a cut-off gzip stream.
 2. **Determinism:** two runs over the same files give byte-identical tables.
 3. **Live equals offline:** a live `RingSource` run and a `FileSource` run over the same dumpcap files give the same output.
 4. **Round trip:** every stored body and chunk can be fetched by hash, and verifies.
@@ -392,7 +401,7 @@ Console logs and counters for the people running a Collector (TS-28). **They are
 
 - Level: INFO by default; `-v` DEBUG, `-vv` TRACE; `-q` WARN, `-qq` ERROR. `--log-level <error|warn|info|debug|trace>` overrides the short flags, and `RUST_LOG`, when set, overrides both.
 - **ERROR:** dumpcap missing, not permitted or failing; write failures in the output; anything that ends the run.
-- **WARN:** capture drops reported by dumpcap or pcapng; a Flow that hits the reassembly buffer cap (`gap_buffer_limit`); a body over the size cap (`DecoderConfig::max_body`), hashed and counted but not read.
+- **WARN:** capture drops reported by dumpcap or pcapng; a Flow that hits the reassembly buffer cap (`gap_buffer_limit`); a body over the size cap (`DecoderConfig::max_body`), hashed and counted but not read; a coded body that passes the decode cap (§5), hashed and counted but not read.
 - **INFO:** one line when dumpcap starts, with the interface and the capture filter (`none` if unset), so a filtered run is visible (§3); one line per closed window and one summary on exit. The window line has packets, bytes, Flows (new, active, closed), Request Workunits (`ok`, `errored`, `incomplete`), the share of accounted bytes in the `workunit` bucket, the share of closed Flows that carried a Workunit, gaps, and packets/s and Mbit/s over the window length.
 - **DEBUG:** one line per Request Workunit as it is emitted: `workunit_id`, Flow, Wire Protocol, request direction, method, path, model, HTTP status, `stream`, request and response body bytes, outcome. Also each new and closed Flow (with its verdict), gaps and anomalies.
 - **TRACE:** each reassembled segment.
@@ -412,7 +421,7 @@ Metrics, all prefixed `ts_collector_` (labels in brackets):
 | `flows_active` | Flows seen and not yet closed (gauge) |
 | `flows_with_workunit_total` | Closed Flows that carried at least one Request Workunit; over `flows_total`, the share of Flows that carry Workunits |
 | `accounted_bytes_total` `[bucket, direction]` | Stream bytes per bucket (§5) and direction (`orig`, `resp`); `workunit` over the sum is the share of bandwidth that is Workunits |
-| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`, `openai_responses`, `ollama`, `anthropic`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding, a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
+| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`, `openai_responses`, `ollama`, `anthropic`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding that could not be decoded (§5), a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
 | `gaps_total`, `gap_bytes_total` | Gaps (§4) and their bytes |
 | `retransmit_bytes_total`, `retransmit_differing_bytes_total` | Retransmitted stream bytes, and those that differ from the first copy |
 | `retransmits_differing_total` | `retransmit_differs` anomalies |

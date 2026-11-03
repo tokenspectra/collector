@@ -13,6 +13,7 @@
 pub mod assembler;
 pub mod capture;
 pub mod chunk;
+pub mod coding;
 pub mod decode;
 pub mod flow;
 mod hpack;

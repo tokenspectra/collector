@@ -888,6 +888,7 @@ function vExchange(flow, n) {
     ["content_type", esc(m.content_type || "—")], ["content_encoding", esc(m.content_encoding || "—")],
     ["body", `${bytes(m.body_len)}${m.body_gap_bytes ? " " + pill(num(m.body_gap_bytes) + " gap bytes", "warn") : ""}`],
     ["body_hash", m.body_hash ? a(R.body(m.body_hash), hash(m.body_hash)) : hash(null)],
+    m.decoded_len != null || m.decode_error ? ["decoded", decodedCell(m)] : null,
     ["complete", m.complete ? pill("yes", "ok") : pill("no", "warn")],
     ["carried by", packetsFor(flow, m)],
   ]);
@@ -944,7 +945,10 @@ function vWorkunit(id) {
     ["usage", `<span class="mono">${esc(JSON.stringify(w.usage))}</span>`],
     w.extra ? ["extra", `<span class="mono">${esc(JSON.stringify(w.extra))}</span>`] : null,
     ["request body", `${a(R.body(w.request_body_hash), hash(w.request_body_hash))} ${bytes(w.request_body_len)}`],
+    w.request_decoded_hash ? ["request decoded", hash(w.request_decoded_hash)] : null,
     ["response body", `${a(R.body(w.response_body_hash), hash(w.response_body_hash))} ${bytes(w.response_body_len)}`],
+    w.response_decoded_hash ? ["response decoded", hash(w.response_decoded_hash)] : null,
+    codingNote(w),
     w.sse_events ? ["SSE events", `${w.sse_events.length}, end-of-stream marker ${w.sse_done ? "seen" : "missing"}`] : null,
     ["complete", w.complete ? pill("yes", "ok") : pill("no", "warn")],
     ["L3 record blob", rec ? `${hash(rec.hash)} in <span class="mono">${esc(rec.pack)}</span> @${rec.offset}+${rec.len}
@@ -1016,6 +1020,43 @@ async function readBody(h) {
   const f = FILES.get("bodies/" + h);
   if (!f) return null;
   return new Uint8Array(await f.arrayBuffer());
+}
+
+// Bodies are stored as on the wire, content coding kept. The Collector decodes gzip, deflate, br and zstd to
+// read them and hashes the decoded bytes too (decoded_hash); the viewer decodes them again to show them.
+function decodedCell(m) {
+  const err = m.decode_error ? " " + pill(m.decode_error, ["over_cap", "over_ratio", "corrupt"].includes(m.decode_error) ? "bad" : "warn") : "";
+  return `${m.decoded_len != null ? bytes(m.decoded_len) : "—"} ${hash(m.decoded_hash)}${err}`;
+}
+function codingNote(w) {
+  const h = D.httpByKey.get(w.flow + "#" + w.exchange);
+  const errs = ["request", "response"].map(d => h?.[d]?.decode_error && `${d} ${h[d].content_encoding}: ${h[d].decode_error}`).filter(Boolean);
+  return errs.length ? ["content coding", pill("not decoded", "bad") + " " + esc(errs.join("; "))] : null;
+}
+// The message a body was first seen as, if it has a content coding.
+function codedMsg(h) {
+  const r = (D.bodyRefs.get(h) || []).find(r => r.http[r.dir]?.content_encoding);
+  return r ? r.http[r.dir] : null;
+}
+const STREAM_FORMAT = { gzip: "gzip", "x-gzip": "gzip", deflate: "deflate", br: "brotli", zstd: "zstd" };
+async function decodeBody(wire, coding) {
+  let fmt = STREAM_FORMAT[coding.trim().toLowerCase()];
+  if (!fmt) throw new Error(`the viewer does not decode ${coding}`);
+  // deflate: zlib as the RFC says, or raw deflate; the Collector tells them apart the same way.
+  if (fmt === "deflate" && !(wire.length > 1 && (wire[0] & 15) === 8 && wire[0] >> 4 <= 7 && ((wire[0] << 8) | wire[1]) % 31 === 0)) fmt = "deflate-raw";
+  let ds;
+  try { ds = new DecompressionStream(fmt); } catch { throw new Error(`this browser cannot decode ${coding}`); }
+  return new Uint8Array(await new Response(new Blob([wire]).stream().pipeThrough(ds)).arrayBuffer());
+}
+// The body as the Wire Protocol read it: { wire, plain, msg, error }. Only a body the Collector decoded to its
+// end (decoded_hash set) is decoded here, so a bomb stopped at the cap stays coded.
+async function readPlain(h) {
+  const wire = await readBody(h);
+  const msg = wire && codedMsg(h);
+  if (!msg) return { wire, plain: wire };
+  if (!msg.decoded_hash) return { wire, plain: null, msg, error: `not decoded by the Collector: ${msg.decode_error || "unknown"}` };
+  try { return { wire, plain: await decodeBody(wire, msg.content_encoding), msg }; }
+  catch (e) { return { wire, plain: null, msg, error: e.message }; }
 }
 const utf8 = new TextDecoder("utf-8", { fatal: false });
 
@@ -1239,10 +1280,11 @@ function responseHtml(r) {
 
 async function fillBody(slot) {
   const h = slot.dataset.hash, ct = slot.dataset.ct, proto = slot.dataset.proto || null;
-  const bytesArr = await readBody(h);
-  if (!bytesArr) { slot.innerHTML = `<p class="muted">Not in the folder (bodies/ missing, or run with --no-bodies).</p>`; return; }
-  const text = utf8.decode(bytesArr);
-  const binary = /[\x00-\x08\x0e-\x1f]/.test(text.slice(0, 4096));
+  const { wire, plain, msg, error } = await readPlain(h);
+  if (!wire) { slot.innerHTML = `<p class="muted">Not in the folder (bodies/ missing, or run with --no-bodies).</p>`; return; }
+  const bytesArr = plain || wire;
+  const text = plain ? utf8.decode(bytesArr) : "";
+  const binary = !plain || /[\x00-\x08\x0e-\x1f]/.test(text.slice(0, 4096));
   const framing = binary ? "text" : framingOf(text, ct);
   const tabs = [];
   if (framing === "sse" || framing === "ndjson") {
@@ -1252,12 +1294,14 @@ async function fillBody(slot) {
       `<tr><td class="num">${i}</td><td class="mono">${esc(clip(e.data))}</td></tr>`).join("")}</table>`]);
   }
   if (framing === "json") tabs.push(["json", `<pre class="body">${esc(JSON.stringify(JSON.parse(text), null, 2))}</pre>`]);
-  tabs.push([binary ? "hex" : "raw", `<pre class="body">${binary ? hexdump(bytesArr) : esc(text)}</pre>`]);
+  if (plain || !msg) tabs.push([binary ? "hex" : msg ? "decoded" : "raw", `<pre class="body">${binary ? hexdump(bytesArr) : esc(text)}</pre>`]);
+  if (msg) tabs.push([`wire (${msg.content_encoding})`, (error ? `<p class="muted">${esc(error)}</p>` : "") + `<pre class="body">${hexdump(wire)}</pre>`]);
   const id = "b" + Math.random().toString(36).slice(2);
   slot.innerHTML = `<div class="tabs">${tabs.map(([n], i) => `<button class="${i ? "" : "on"}" data-act="tab" data-g="${id}" data-i="${i}">${n}</button>`).join("")}
-      <span style="flex:1"></span><button data-act="verify" data-hash="${h}">Verify BLAKE3</button> <span class="vout"></span></div>` +
+      <span style="flex:1"></span><button data-act="verify" data-hash="${h}">Verify BLAKE3</button> <span class="vout"></span>
+      ${plain && msg ? `<button data-act="verify-decoded" data-hash="${h}">Verify decoded BLAKE3</button> <span class="vout"></span>` : ""}</div>` +
     tabs.map(([, body], i) => `<div class="tabp" data-g="${id}" data-i="${i}" ${i ? "hidden" : ""}>${body}</div>`).join("") +
-    `<p class="note">${bytes(bytesArr.length)} · bodies/${esc(h)}</p>`;
+    `<p class="note">${bytes(wire.length)}${msg ? ` on the wire, ${esc(msg.content_encoding)}` + (plain ? ` → ${bytes(plain.length)} decoded` : "") : ""} · bodies/${esc(h)}</p>`;
 }
 function hexdump(b) {
   let out = "";
@@ -1300,8 +1344,10 @@ function bubble(role, text, extra = "") {
 
 async function fillConvo(el) {
   const { req: rh, resp: ph, ct = "", proto = "", endpoint = "" } = el.dataset;
-  const [req, resp] = await Promise.all([readBody(rh), ph ? readBody(ph) : null]);
-  if (!req) { el.innerHTML = `<p class="muted">Request body not in the folder.</p>`; return; }
+  const [rq, rs] = await Promise.all([readPlain(rh), ph ? readPlain(ph) : null]);
+  if (!rq.wire) { el.innerHTML = `<p class="muted">Request body not in the folder.</p>`; return; }
+  if (!rq.plain || (rs && !rs.plain)) { el.innerHTML = `<p class="muted">Coded body ${esc((rq.error || rs?.error) ?? "missing")}.</p>`; return; }
+  const req = rq.plain, resp = rs?.plain;
   let html = "";
   try {
     for (const t of requestTurns(JSON.parse(utf8.decode(req)), endpoint)) {
@@ -1345,6 +1391,11 @@ document.addEventListener("click", async e => {
       const b = await readBody(d.hash);
       const got = B3.mh(b);
       out.innerHTML = got === d.hash ? pill("matches its name", "ok") : pill("mismatch", "bad") + " got " + hash(got, true);
+    }
+    if (d.act === "verify-decoded") {
+      const out = act.nextElementSibling, { plain, msg } = await readPlain(d.hash);
+      const got = B3.mh(plain);
+      out.innerHTML = got === msg.decoded_hash ? pill("matches decoded_hash", "ok") : pill("mismatch", "bad") + " got " + hash(got, true);
     }
     if (d.act === "merkle") {
       const pk = (D.packetsByLw.get(d.lw) || []).slice().sort((x, y) => x.index - y.index);
