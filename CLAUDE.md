@@ -1,6 +1,6 @@
 # TokenSpectra Collector
 
-The Rust Collector, plus `viewer/index.html`, a no-build HTML viewer for its output folders. [README.md](README.md) covers the layout, the tables, running and tests; [docs/spec.md](docs/spec.md) is the spec.
+The Rust Collector, plus `viewer/index.html`, a no-build HTML viewer for its output folders. [docs/spec.md](docs/spec.md) is the spec; [README.md](README.md) is a short quick start.
 
 ## Keep the viewer in step with the Collector
 
