@@ -139,7 +139,7 @@ Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: re
 
 A request/response pair is a Request Workunit when a registered Wire Protocol claims its route, reads its request body, and accepts its response media type (spec §5). For OpenAI: `POST /v1/chat/completions`, `POST /v1/completions` or `POST /v1/responses` (the Responses API) with a JSON body, answered with `application/json`, or `text/event-stream` when the request set `"stream": true`. For Ollama native: `POST /api/chat`, `/api/generate` or `/api/embed` with a JSON object body, answered with `application/json`, or `application/x-ndjson` when the request streams (chat and generate stream unless `"stream": false`). Ollama's `/v1/*` endpoints are OpenAI's. For Anthropic: `POST /v1/messages` with an `anthropic-version` header and a JSON object body, under the same response rule. Everything else is `http_other`.
 
-**Adding a Wire Protocol** takes one module under `crates/collector/src/wire/` implementing `WireProtocol` (routes, optional header sniffing, request parsing, the response `Framing`, a frame decoder) and one line in `wire::BUILTIN`. Its fields beyond the common columns go in `extra`. `crates/collector/tests/wire_protocol.rs` registers a protocol that lives only in that test.
+**Adding a Wire Protocol** takes one module under `crates/collector/src/wire/` implementing `WireProtocol` (routes, optional header sniffing, request parsing, the response `Framing`, a frame decoder) and one line in `wire::BUILTIN`. Its fields beyond the common columns go in `extra`. `crates/collector/tests/wire_protocol.rs` registers a protocol that lives only in that test. Then teach the viewer to read it (below).
 
 The record follows the TS-15 capture record where the Link shows the field:
 
@@ -248,8 +248,11 @@ Offline, without dumpcap: `target/debug/collector -v files -w 1 -o /tmp/ts crate
 
 - Navigate Link › Flow › Slice or Exchange › Request Workunit › conversation, with packets, windows, bodies and events linked both ways.
 - Hashes show their multihash type and digest. BLAKE3 in the page checks a body against its name, a chunk's `merkle_root` against its packet hashes, and a Workunit record against its blob.
-- Stacked graphs per Link and Flow over windows: Workunit (`workunit`), Other HTTP (`http_other` + `framing`), Unexplained (`unexplained` + `gap`). These group buckets; they are not statuses.
+- Stacked graphs per Link and Flow over windows: Workunit (`workunit`), Other HTTP (`http_other` + `framing`), Unexplained (`unexplained` + `gap`). These group buckets; they are not statuses. In share mode every window fills 100%: a window with no bytes holds the shares of the last window that had some (the hover says so). Bytes mode shows the zero.
+- Conversations and the **merged** tab of a streamed body read every Wire Protocol: OpenAI Chat and Completions (SSE), the Responses API (named SSE events), Anthropic Messages (SSE content blocks), Ollama native (NDJSON, embeddings as a count), and llama.cpp `/completion` on Ollama's runner loopback. A Workunit is read in the protocol the Collector tagged it with; an `http_other` body by its shape. Thinking goes in a folded reasoning block; tool calls and errors show inline. Like `.merged.json`, this is a derived view, not evidence.
+- Each Request Workunit shows its `protocol` as a pill: in the Workunit table, on the Workunit, its exchange, its conversation and its bodies.
 - Reads the JSONL tables and `bodies/`, not the Parquet index or the stored chunks.
+- **Keep it in step with the Collector.** A change to what the Collector decodes or writes changes the viewer in the same PR: a new Wire Protocol is an entry in `FORMATS` (its `id` is the `protocol` tag) and its request shape in `requestTurns`; a new or renamed table column, bucket or `extra` field is shown where its table is. Check it on the protocol's fixtures with `collector files`.
 
 ## Tests
 
