@@ -125,6 +125,9 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 
 **Precedence is deterministic.** The claims on a request are ordered by header evidence (`yes` before `maybe`), then route specificity (more literal characters first, so an exact path beats a pattern), then registry order. The request body goes to each claim in that order; the first that reads it owns the exchange. The OpenAI module is first in the registry.
 
+**Per protocol.**
+- **Ollama native (`ollama`, TS-32).** Routes `POST /api/chat`, `/api/generate`, `/api/embed`; no header sniffing (the paths are its own); the request is any JSON object. Chat and generate stream unless the request sets `"stream": false`: the response is `ndjson` (`application/x-ndjson`), the last line carrying `"done": true`; otherwise, and always for embed, it is one `json` object. `model` and `options.seed` come from the request; from the last object, `done_reason` → `finish_reason[0]`, `prompt_eval_count` → `input_tokens`, `eval_count` → `output_tokens`. Ollama sends no usage object, so `usage` is null. `extra`: `total_duration`, `load_duration`, `prompt_eval_duration`, `eval_duration` (ns, as sent), `done` (streams only: whether the `"done": true` line arrived, the NDJSON counterpart of `sse_done`) and `error`. Ollama's OpenAI-compatible `/v1/*` endpoints are claimed by OpenAI, not here; a captured fixture checks it.
+
 **Response framing** is shared, so protocols handle events, not bytes. Bodies are framed after chunked encoding is removed; a content coding hides the frames, so the response is not read.
 
 | Framing | Frames | After a gap |
@@ -137,7 +140,23 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 - Lines longer than 16 MiB are dropped, not truncated. An SSE event that loses a field line this way is dropped whole (a comment line loses nothing). Either way the frame counts as lost, so the Workunit is `errored` (§14). An NDJSON body's last line may lack its newline.
 - When response bytes arrive before the request body is read (a server that answers early), they are held, up to `max_body`, and replayed once a protocol owns the exchange.
 
-**The common record** (`workunits`, §8) stays compatible with TS-15 and is the same for every protocol: `protocol` (the protocol's id), `endpoint`, `model`, `stream`, `status`, timing, body hashes and byte counts, `finish_reason` per choice index, `usage` as sent with `input_tokens` and `output_tokens` read from it when the protocol reports them, `complete`. `seed`, `n`, `response_id`, `response_model` are filled where the protocol has them. `sse_events` and `sse_done` are set for `sse` framing only; `sse_done` means the protocol's end-of-stream marker arrived (`data: [DONE]` for OpenAI). Protocol-specific fields go in `extra`, one JSON object built from the protocol's own typed struct, `null` when empty, never new top-level columns.
+**The common record** (`workunits`, §8) stays compatible with TS-15 and is the same for every protocol: `protocol` (the protocol's id), `endpoint`, `model`, `stream`, `status`, timing, body hashes and byte counts, `finish_reason` per choice index, `usage` as sent with `input_tokens` and `output_tokens` read from it when the protocol reports them, `complete`. `seed`, `n`, `response_id`, `response_model` are filled where the protocol has them. `sse_events` and `sse_done` are set for `sse` framing only; `sse_done` means the protocol's end-of-stream marker arrived (`data: [DONE]` for OpenAI, `message_stop` for Anthropic). Protocol-specific fields go in `extra`, one JSON object built from the protocol's own typed struct, `null` when empty, never new top-level columns.
+
+**OpenAI Responses** (`openai_responses`, TS-30). Route `POST /v1/responses` with a JSON body; the response is `application/json`, or `sse` when the request set `stream: true`. Retrieval (`GET /v1/responses/{id}`) and cancel are `http_other`. A stream is named events whose `data` is a JSON object with a matching `type`. The decoder only reads the events that carry a `response` object (`response.created`, `response.in_progress` and the terminal ones), plus `error`; the last one wins. Ollama (0.40) serves the same route and events.
+- `model`, `stream` from the request; it has no `seed` or `n`. `response_id`, `response_model` and `usage` come from the response object; `input_tokens` and `output_tokens` are read from `usage`.
+- `finish_reason[0]`: the API has no per-choice finish reason, so this is why the response ended. For an `incomplete` response it is `incomplete_details.reason` (e.g. `max_output_tokens`); otherwise it is the final status (`completed`, `failed`, `cancelled`). A `queued` or `in_progress` response has none.
+- `sse_done`: `response.completed`, `response.incomplete`, `response.failed` or `error` arrived.
+- Outcome (§14): a stream is `ok` only when it ends in `response.completed` or `response.incomplete`. `incomplete` (e.g. `max_output_tokens`, recorded as the finish reason) is a whole, readable response, like a Chat Completions `finish_reason: length`. A stream with no terminal event, and a failure in band behind HTTP 200 (`response.failed`, an `error` event, or a response object with status `failed`), is `errored`. A gap makes it `incomplete` first.
+- `extra`: `status` (the last status), `error_code` (`error.code` of a failed response, an `error` event or an error body, else its `type`), `previous_response_id`, `service_tier`.
+- An error body (`{"error": {...}}`, e.g. a 404 for an unknown model) is read: an `ok` Workunit with a `4xx` status and no finish reason.
+
+**Anthropic Messages** (`anthropic`, TS-31; [API reference](https://docs.anthropic.com/en/api/messages)). Route `POST /v1/messages`, claimed only with an `anthropic-version` header (`yes`; without it, `no`, so the exchange is `http_other`). Every SDK and Anthropic's own examples send the header, and it tells Anthropic traffic apart on a gateway that also serves OpenAI paths. `/v1/messages/count_tokens` and `/v1/messages/batches` are not Workunits. The request body must be a JSON object; the response is `application/json`, or `sse` when the request set `stream: true`. A JSON body is a `message`, or an `error` object on a non-2xx status. A stream is named events, each `data` repeating its name as `type`: `message_start` (id, model, input usage), `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta` (`stop_reason`, cumulative usage), `message_stop`, `ping`, and `error`, which can arrive behind HTTP 200 and ends the stream. Unknown event types are skipped, since the API adds new ones.
+- `model`, `stream` from the request; it has no `seed` or `n`. `response_id`, `response_model` from the message.
+- `finish_reason[0]`: `stop_reason` (`end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, ...).
+- `usage`: `message_start`'s usage with each `message_delta`'s fields laid over it, since the delta counts are cumulative (a `null` does not erase a count). `input_tokens`, `output_tokens` are read from it; as the API reports them, `input_tokens` leaves out cached prompt tokens.
+- `sse_done`: `message_stop` arrived.
+- Outcome (§14): `done` is set only by `message_stop`, so only a stream that reaches it is `ok`, whatever its `stop_reason` (`max_tokens` is a whole response, recorded as the finish reason). A stream that ends cleanly without `message_stop`, and one with an in-band `error` event behind HTTP 200, are counted as not read, so they are `errored`; a gap makes the Workunit `incomplete` first. An error body on a non-2xx status is read: an `ok` Workunit with that status and `error_type` set. A whole JSON body of any other `type` (the API names every stream event, so an unnamed frame is a body) is not read, so it is `errored`.
+- `extra`: `cache_creation_input_tokens`, `cache_read_input_tokens`, `stop_sequence`, and `error_type` (`error.type` of an error body or event, e.g. `overloaded_error`).
 
 **Byte accounting.** For each Flow, direction and Slice, every stream byte falls in exactly one bucket:
 
@@ -311,6 +330,14 @@ Transport follows TS-15:
 - a shipper POSTs to the control plane's ingest, deduplicated by window and Collector;
 - offline runs use the same ingest path.
 
+**As built (TS-27):**
+- **Manifest:** one JSON object per sealed window, written once its chunks, pack and index tables are in the store: `site`, `collector`, `window_start_ns`, `window_ns`, `links`, `chunks` (the window's `chunks` rows: key, chunk hash, Merkle root, counts), `pack` (key, or null), `index` (per table: key and row count), and `totals` (packets, wire bytes, kept and truncated bytes, Flow rows, exchanges, Request Workunits, events, blobs). Object keys, not rows: the control plane reads the tables from the store. Every field comes from the capture, so the manifest is deterministic (§3); capture drops are left out, since live and offline report them differently.
+- **Log:** `<out>/manifests.jsonl`, one manifest per line, each synced to disk before the run goes on. A manifest is appended only once every object it names is synced (the local store runs with fsync), and a new log's directory entry is synced before its first line. Only ever appended to, across runs too; a partial last line from a crash is cut off by the next run before it appends.
+- **Shipper:** with `--ingest http://host:port/path`, a thread POSTs each complete line past its cursor, one request per window, body as logged, with `Idempotency-Key: {collector}/{window_start_ns}`. The cursor (`<out>/manifests.shipped`, a byte offset) moves only past lines the ingest accepted, so each line is sent at least once.
+  - Any 2xx is accepted: a first copy, or a repeat of the same bytes. 408, 429, 5xx and connection errors are retried with backoff. At the end of a run the shipper has `--ship-wait-s` in all: the deadline is checked before each POST and bounds each request's socket waits, and lines not shipped by then stay pending. Any other status stops the shipper: a 409 means the ingest holds that window with other bytes, the same rule as a store put (§8).
+  - Lines left over stay in the log; `collector ship` sends them later.
+  - v1 speaks plain `http://`, like the Tap (Settled 6).
+
 **Cross-check with the API Tap.**
 - The API Tap (TS-15) records "the client request as received". The Collector sees the same request on the Link.
 - The two must have equal request-body hashes. A mismatch is an Observation contradiction for the Classifier.
@@ -328,6 +355,8 @@ Transport follows TS-15:
 Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in Wireshark (Slice pcapng), and later the Flow/Slice drill-down in the Console.
 
 ## 12. Acceptance (proposal)
+
+_As built (TS-27): 1, 2, 4 and 6 run in CI over the whole golden set, all four Wire Protocols included; 2 compares whole output directories, object store and manifest log included. 3 runs end to end with `tools/live_e2e.sh`, which needs capture rights, over a mixed workload from the capture harness. 5 needs a real Tap._
 
 1. **Golden files:** a set of `.pcapng` files with expected index tables and hashes, run in CI. It covers:
    - HTTP/1.1 JSON, HTTP/1.1 SSE with chunked encoding, h2c JSON and SSE;
@@ -383,7 +412,7 @@ Metrics, all prefixed `ts_collector_` (labels in brackets):
 | `flows_active` | Flows seen and not yet closed (gauge) |
 | `flows_with_workunit_total` | Closed Flows that carried at least one Request Workunit; over `flows_total`, the share of Flows that carry Workunits |
 | `accounted_bytes_total` `[bucket, direction]` | Stream bytes per bucket (§5) and direction (`orig`, `resp`); `workunit` over the sum is the share of bandwidth that is Workunits |
-| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding, a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
+| `workunits_total` `[protocol, outcome, http_class]` | Request Workunits. `protocol`: the Wire Protocol's id (`openai`, `openai_responses`, `ollama`, `anthropic`); every built-in protocol is listed, at zero until seen. `outcome`: `ok` (both messages complete, no gap, response read), `incomplete` (a gap, or the Flow ended mid-message), `errored` (complete, but the protocol could not read the response: a body or frame that isn't its JSON, a content coding, a dropped line, or over the size cap). `http_class`: `2xx`, `4xx`, `5xx`, `none` |
 | `gaps_total`, `gap_bytes_total` | Gaps (§4) and their bytes |
 | `retransmit_bytes_total`, `retransmit_differing_bytes_total` | Retransmitted stream bytes, and those that differ from the first copy |
 | `retransmits_differing_total` | `retransmit_differs` anomalies |

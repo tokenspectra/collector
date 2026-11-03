@@ -1,0 +1,6 @@
+{"flow":"lo|tcp|127.0.0.1:18031|127.0.0.1:48840|0","dir":"orig","stream_off":0,"len":568,"window_start_ns":1793639200000000000,"index":3,"pkt_off":66,"ts_ns":1793639200092494451}
+{"flow":"lo|tcp|127.0.0.1:18031|127.0.0.1:48840|0","dir":"orig","stream_off":568,"len":89,"window_start_ns":1793639200000000000,"index":5,"pkt_off":66,"ts_ns":1793639200092565183}
+{"flow":"lo|tcp|127.0.0.1:18031|127.0.0.1:48840|0","dir":"resp","stream_off":0,"len":378,"window_start_ns":1793639200000000000,"index":7,"pkt_off":66,"ts_ns":1793639200097406220}
+{"flow":"lo|tcp|127.0.0.1:18031|127.0.0.1:48840|0","dir":"orig","stream_off":657,"len":568,"window_start_ns":1793639200000000000,"index":9,"pkt_off":66,"ts_ns":1793639200112620807}
+{"flow":"lo|tcp|127.0.0.1:18031|127.0.0.1:48840|0","dir":"orig","stream_off":1225,"len":89,"window_start_ns":1793639200000000000,"index":10,"pkt_off":66,"ts_ns":1793639200112681540}
+{"flow":"lo|tcp|127.0.0.1:18031|127.0.0.1:48840|0","dir":"resp","stream_off":378,"len":234,"window_start_ns":1793639200000000000,"index":12,"pkt_off":66,"ts_ns":1793639200112996530}

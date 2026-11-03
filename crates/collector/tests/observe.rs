@@ -93,6 +93,11 @@ fn final_counters_equal_the_tables() {
             .collect::<BTreeSet<_>>()
             .len() as u64;
         let mut workunits = [[0u64; 4]; 3];
+        // Every built-in protocol is listed, at zero until seen.
+        let mut by_protocol: BTreeMap<&str, [[u64; 4]; 3]> = collector::wire::BUILTIN
+            .iter()
+            .map(|p| (p.id(), [[0; 4]; 3]))
+            .collect();
         for w in &c.workunits {
             let o = Outcome::ALL.iter().position(|o| *o == w.outcome()).unwrap();
             let h = HttpClass::ALL
@@ -100,6 +105,7 @@ fn final_counters_equal_the_tables() {
                 .position(|h| *h == HttpClass::of(w.status))
                 .unwrap();
             workunits[o][h] += 1;
+            by_protocol.get_mut(w.protocol).unwrap()[o][h] += 1;
         }
         let gaps: Vec<_> = c.events.iter().filter(|e| e.kind.is_gap()).collect();
 
@@ -124,13 +130,7 @@ fn final_counters_equal_the_tables() {
             "{case}: buckets sum to the total"
         );
         assert_eq!(s.workunits(), workunits, "{case}");
-        // Every Workunit here is OpenAI's.
-        assert_eq!(
-            s.workunits_by_protocol.keys().collect::<Vec<_>>(),
-            [&"openai"],
-            "{case}"
-        );
-        assert_eq!(s.workunits_by_protocol["openai"], workunits, "{case}");
+        assert_eq!(s.workunits_by_protocol, by_protocol, "{case}");
         assert_eq!(s.workunits_total(), c.workunits.len() as u64, "{case}");
         assert_eq!(
             s.workunits_with(Outcome::Incomplete),

@@ -228,11 +228,15 @@ let FILES = new Map(); // relative path -> File
 
 // Integers of 16+ digits (ns timestamps) exceed 2^53: keep them as strings.
 const BIG = /([:\[,]\s*)(-?\d{16,})(?=\s*[,\]}])/g;
+// A capture stopped mid-write can end in a truncated line: skip lines that do
+// not parse and count them in `rows.skipped`, so one bad line cannot hide the rest.
 function parseJsonl(text) {
   const rows = [];
+  rows.skipped = 0;
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
-    const r = JSON.parse(line.replace(BIG, '$1"$2"'));
+    let r;
+    try { r = JSON.parse(line.replace(BIG, '$1"$2"')); } catch { rows.skipped++; continue; }
     Object.defineProperty(r, "_raw", { value: line, enumerable: false });
     rows.push(r);
   }
@@ -271,16 +275,19 @@ async function loadFiles(files, name) {
   FILES = files;
   const t = {};
   const missing = [];
+  const skipped = {};
   for (const tb of TABLES) {
     const f = files.get(tb + ".jsonl");
     if (!f) { missing.push(tb + ".jsonl"); t[tb] = []; continue; }
     t[tb] = parseJsonl(await f.text());
+    if (t[tb].skipped) skipped[tb + ".jsonl"] = t[tb].skipped;
   }
   if (missing.length === TABLES.length) {
     alert("No Collector JSONL tables found in this folder.");
     return;
   }
   D = index(t, name, missing);
+  D.skipped = skipped;
   buildTree();
   if (location.hash && location.hash !== "#/") route(); else go("#/");
 }
@@ -670,6 +677,8 @@ function vHome() {
   const wus = t.workunits.length;
   let out = `<h2>${esc(D.name)}</h2><div class="sub">Collector output · ${D.windows.length} windows from ${esc(iso(D.windows[0]))}</div>`;
   if (D.missing.length) out += `<p class="note">Missing tables: ${D.missing.map(esc).join(", ")}</p>`;
+  const bad = Object.entries(D.skipped || {});
+  if (bad.length) out += `<p class="note">Skipped unparsable lines (capture cut off mid-write?): ${bad.map(([f, n]) => `${esc(f)} ×${n}`).join(", ")}</p>`;
   out += tiles([
     [D.links.length, "Links"], [D.flowsById.size, "Flows"], [num(t.flows.length), "Slices"],
     [num(t.http.length), "HTTP exchanges"], [wus, "Request Workunits"], [num(t.packets.length), "packets"],

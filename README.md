@@ -14,7 +14,7 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 ## In short
 
 - **Input:** live capture (dumpcap ring buffer, read as each file closes) or `.pcap`/`.pcapng` files, through one deterministic parser.
-- **Layers:** L0 pcapng chunks → L1 Flows (TCP reassembly) → L2 HTTP/1.1, HTTP/2 → L3 Wire Protocols (OpenAI today; one module each) → Request Workunits.
+- **Layers:** L0 pcapng chunks → L1 Flows (TCP reassembly) → L2 HTTP/1.1, HTTP/2 → L3 Wire Protocols (OpenAI and Anthropic today; one module each) → Request Workunits.
 - **Every Flow gets a protocol verdict and byte accounting,** whether a Wire Protocol claims it or not.
 - **Hashing:** BLAKE3, written as multihashes (`f1e20…`, spec §6), over 100% of payload: chunks, Flow streams per Slice, bodies.
 - **Storage:** write-once objects through the `object_store` crate (local FS for the PoC, S3-compatible later): compressed chunks, packs, Parquet index tables. Reads by hash go through the control plane and are verified.
@@ -26,6 +26,9 @@ The spec lives here; the rest of the design is in the main repo. Read them befor
 - Stage 3 (TS-28): console logging with verbosity levels, and one counter registry read by the window log line, an on-demand snapshot and Prometheus `/metrics` (spec §14).
 - Stage 4 (TS-26): BLAKE3 packet hashes and a Merkle root per chunk, the Slice hash chain, the Capture Rate cut, and the object store: zstd pcapng chunks, packs and Parquet index tables (spec §6–8).
 - Stage 5 (TS-29): a generic Wire Protocol layer: the `WireProtocol` trait and registry, shared SSE and NDJSON framing, OpenAI Chat Completions and legacy Completions ported onto it (spec §5).
+- Stage 6 (TS-32): the Ollama native Wire Protocol: `/api/chat`, `/api/generate` (NDJSON or JSON) and `/api/embed`.
+- Stage 6 (TS-31): the Anthropic Messages API Wire Protocol (spec §5).
+- Stage 7 (TS-27): outputs to the control plane: a manifest per window, an append-only manifest log and a shipper to the ingest (spec §11); end-to-end acceptance over every Wire Protocol and a live run; the throughput benchmark.
 
 Implementation is tracked in Multica.
 
@@ -45,12 +48,16 @@ Implementation is tracked in Multica.
 | `wire` | §5 | The `WireProtocol` trait, the registry (`wire::BUILTIN`) and matching precedence |
 | `wire::framing` | §5 | Response framing shared by every protocol: SSE (data-only and named events), NDJSON, whole JSON |
 | `wire::openai` | §5 | The OpenAI Wire Protocol: Chat Completions and legacy Completions |
+| `wire::ollama` | §5 | The Ollama native Wire Protocol: `/api/chat`, `/api/generate`, `/api/embed` |
+| `wire::anthropic` | §5 | The Anthropic Messages API Wire Protocol |
 | `output` | | JSON Lines tables (below) |
 | `chunk` | §6, §8 | L0 chunks as pcapng, written byte for byte; the Merkle root over a chunk's packet hashes |
 | `capture` | §7 | The Capture Rate cut: which packets a chunk keeps in full, the keyed draw per Workunit |
 | `pack` | §8 | Packs: one zstd frame per item, plus a zstd seekable seek table |
 | `index` | §8 | Index tables as Parquet, one fixed schema per table |
-| `store` | §6–8 | `StoreSink`: holds each window, then writes its chunks, pack and index through `object_store`, write-once |
+| `store` | §6–8 | `StoreSink`: holds each window, then writes its chunks, pack and index through `object_store`, write-once, and hands on the window's manifest |
+| `manifest` | §11 | `WindowManifest`, and the append-only manifest log `manifests.jsonl` |
+| `ship` | §11 | The shipper: POSTs each logged manifest to the ingest, resuming from `manifests.shipped` |
 | `stats`, `observe` | §14 | The counter registry, its snapshot table and `/metrics`; `StatsSink`, which counts and logs every record on its way to the real sink and forwards it unchanged |
 
 ### Tables
@@ -83,6 +90,15 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start_ns}/{table}.parquet
 - **Index:** the eight tables above as Parquet, one fixed schema per table.
 - Every put is create-only. Re-running over the same capture into the same store leaves identical objects alone; an object with other bytes fails the run.
 - `--site` and `--collector-id` (default `local`) fill the key prefix.
+
+### Manifests and shipping (spec §11)
+
+When a window is sealed, after its objects are written and synced to disk, its manifest is appended to `<out>/manifests.jsonl` and synced to disk: site, Collector, window, Links, the window's `chunks` rows, its pack key, each index table's key and row count, and totals (packets, wire bytes, kept and truncated bytes, Flow rows, exchanges, Request Workunits, events, blobs). Like every other output it comes from the capture only, so two runs write the same lines.
+
+- **The log is the source of truth** and is only appended to, across runs too. A crash mid-write leaves a partial last line, which the next run cuts off before appending.
+- **`--ingest http://host:port/path`** starts a shipper: it POSTs each new line as the window is sealed, with `Idempotency-Key: <collector>/<window_start_ns>`. Any 2xx is accepted; 408, 429, 5xx and connection errors are retried with backoff. At the end of the run the shipper gets `--ship-wait-s` (default 30) in all: it checks the budget before each POST and while waiting on a response, so a slow ingest can't hold the run past it, and lines it didn't get to stay pending. Any other status (409: the ingest holds that window with other bytes) stops the shipper.
+- **`manifests.shipped`** holds how far the log has shipped, as a byte offset. It is the shipper's state, not an output. Without `--ingest`, or with lines left over, `collector ship --ingest <url> <out>` sends the rest.
+- The ingest deduplicates by Collector and window, so a re-run over the same capture only repeats what it holds. `tools/mock_ingest.py` is a stand-in for it (the control-plane Store is out of scope here).
 
 ### Capture Rate (spec §7)
 
@@ -121,7 +137,7 @@ Every HTTP body that has a `body_hash` is kept as `<out>/bodies/<body_hash>`: re
 
 ### Request Workunits
 
-A request/response pair is a Request Workunit when a registered Wire Protocol claims its route, reads its request body, and accepts its response media type (spec §5). For OpenAI: `POST /v1/chat/completions` or `POST /v1/completions` with a JSON body, answered with `application/json`, or `text/event-stream` when the request set `"stream": true`. Everything else is `http_other`.
+A request/response pair is a Request Workunit when a registered Wire Protocol claims its route, reads its request body, and accepts its response media type (spec §5). For OpenAI: `POST /v1/chat/completions`, `POST /v1/completions` or `POST /v1/responses` (the Responses API) with a JSON body, answered with `application/json`, or `text/event-stream` when the request set `"stream": true`. For Ollama native: `POST /api/chat`, `/api/generate` or `/api/embed` with a JSON object body, answered with `application/json`, or `application/x-ndjson` when the request streams (chat and generate stream unless `"stream": false`). Ollama's `/v1/*` endpoints are OpenAI's. For Anthropic: `POST /v1/messages` with an `anthropic-version` header and a JSON object body, under the same response rule. Everything else is `http_other`.
 
 **Adding a Wire Protocol** takes one module under `crates/collector/src/wire/` implementing `WireProtocol` (routes, optional header sniffing, request parsing, the response `Framing`, a frame decoder) and one line in `wire::BUILTIN`. Its fields beyond the common columns go in `extra`. `crates/collector/tests/wire_protocol.rs` registers a protocol that lives only in that test.
 
@@ -133,13 +149,13 @@ The record follows the TS-15 capture record where the Link shows the field:
 | received / completed timestamps | `received_ts_ns`, `completed_ts_ns` | capture time of the first request byte and the last response byte |
 | `model`, `stream` | `model`, `stream` | from the request body; also `seed`, `n` |
 | client request as received | `request_body_hash`, `request_body_len` | BLAKE3 of the body as on the wire (chunked encoding removed, content coding kept): the cross-check key with the API Tap (spec §11) |
-| | `protocol`, `endpoint` | the Wire Protocol's id (`openai`) and the route pattern the request matched |
+| | `protocol`, `endpoint` | the Wire Protocol's id (`openai`, `openai_responses`, `ollama`, `anthropic`) and the route pattern the request matched |
 | `finish_reason` | `finish_reason` | per choice index, from the JSON body or the stream's frames |
-| `usage` | `usage`, `input_tokens`, `output_tokens` | `usage` as sent; the token counts read from it when the protocol reports them (OpenAI: `prompt_tokens`, `completion_tokens`) |
+| `usage` | `usage`, `input_tokens`, `output_tokens` | `usage` as sent; the token counts read from it when the protocol reports them (OpenAI: `prompt_tokens`, `completion_tokens`; Anthropic: `input_tokens`, `output_tokens`). Ollama sends no usage object: `usage` is `null`, the counts are `prompt_eval_count` and `eval_count`, and `finish_reason` is `done_reason` |
 | | `response_body_hash`, `response_id`, `response_model`, `status` | |
-| | `sse_events`, `sse_done` | each event's body offset, length and capture time; whether `data: [DONE]` arrived. One hash covers the whole SSE body (spec §6) |
+| | `sse_events`, `sse_done` | each event's body offset, length and capture time; whether the protocol's end-of-stream marker arrived (OpenAI `data: [DONE]`, Anthropic `message_stop`). One hash covers the whole SSE body (spec §6) |
 | | `complete` | both messages reached their end with no gap |
-| | `extra` | protocol-specific fields as one JSON object, `null` when there are none (always for OpenAI) |
+| | `extra` | protocol-specific fields as one JSON object, `null` when there are none (always for OpenAI). Anthropic: cache token counts, `stop_sequence`, `error_type`. Ollama: `total_duration`, `load_duration`, `prompt_eval_duration`, `eval_duration` (ns), `done` (streams only: the `"done": true` line arrived) and `error` |
 | `manifest_id`, `upstream`, forwarded request, token ids, logprobs, `scorable` | | not on the Link: the API Tap's side |
 
 A body with a gap has `body_hash: null`. A request body that is incomplete, has a gap, uses a content coding or exceeds `DecoderConfig::max_body` (16 MiB) cannot be checked as JSON, so its pair is `http_other`.
@@ -177,7 +193,7 @@ python3 tools/llm_traffic.py --stream --count 5 --interval 10
 
 When the script ends, wait one window and press Ctrl-C in terminal 1. Then open `viewer/index.html` in the browser, choose `ts-captures-demo/`, and go to **Request Workunits › conversation**.
 
-- `tools/llm_traffic.py` speaks `POST /v1/chat/completions`: the only endpoints the Collector decodes as Request Workunits are that and `/v1/completions`. Flags: `--model`, `--host` (e.g. `http://localhost:8000` for vLLM), `--stream`, `--multiturn`, `--count`, `--seed`; see `--help`.
+- `tools/llm_traffic.py` speaks `POST /v1/chat/completions`, or the Responses API `POST /v1/responses` with `--api responses` (Ollama serves both; they decode as OpenAI). Ollama's native `/api/chat`, `/api/generate` and `/api/embed` decode as `ollama`. Flags: `--api`, `--model`, `--host` (e.g. `http://localhost:8000` for vLLM), `--stream`, `--multiturn`, `--count`, `--seed`; see `--help`.
 - Ollama also talks to its own llama.cpp runner on a random loopback port (`/completion`, `/tokenize`, `/health`). That shows up as `http_other`; the viewer still rebuilds its conversation from the templated prompt.
 - `ts-captures*` is gitignored. Bodies hold the prompts and replies in plaintext.
 
@@ -196,7 +212,8 @@ sg wireshark -c "cargo run -- ring -i lo -w 10 -t 60"
 - If dumpcap is missing, not runnable (not in the `wireshark` group) or fails (e.g. unknown interface), `ring` exits non-zero with a message saying which, and how to fix it. `files` never needs dumpcap.
 - `--no-bodies`: keep hashes only, no `bodies/` or `by-exchange/` directory.
 - `collector views <out>`: rebuild `by-exchange/` from `http.jsonl` and `bodies/`.
-- Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter).
+- Other short flags: `-w/--window-s`, `-i/--interface`, `-t/--duration-s`, `-f/--filter` (dumpcap's capture filter), `-B/--buffer-mib` (dumpcap's kernel buffer; raise it if dumpcap reports drops on bursty traffic).
+- `--ingest <url>` ships each window's manifest as it is sealed; `collector ship --ingest <url> <out>` ships what a run left in its log (above).
 
 ### Logs and stats (spec §14)
 
@@ -242,10 +259,12 @@ cargo test --workspace
 
 - **Golden files:** `crates/collector/tests/fixtures/*.pcapng`, with expected tables in `tests/golden/<case>/`. After an intended output change: `UPDATE_GOLDEN=1 cargo test -p collector --test golden`, then review the diff. Three kinds of fixture:
   - **Captured OpenAI traffic** (`openai_h1_json`, `openai_h1_sse`, `openai_h2c_json`, `openai_h2c_sse`, `http_other_h1`): the official OpenAI Python SDK (and httpx for `/health`, `/v1/models` and a malformed body) against a mock OpenAI-compatible server, over HTTP/1.1 and h2c, captured with dumpcap. See below.
+  - **Captured Anthropic traffic** (`anthropic_h1_json`, `anthropic_h1_sse`, `anthropic_h2c_json`, `anthropic_h2c_sse`): the official Anthropic Python SDK against the same mock's `/v1/messages`, over HTTP/1.1 and h2c. Each JSON case adds a 400 error body; each SSE case adds a 200 stream cut off by an `error` event after the first token.
   - **Synthetic** fixtures, built packet by packet in `tests/support/fixtures.rs` and written by `cargo run -p collector --example gen_fixtures`: edge cases a live run can't produce on demand (lost segment, retransmit with different bytes, mid-stream start, Flows spanning windows, UDP, non-HTTP TCP, a TLS Flow on the plaintext Link, gRPC over h2c, HTTP/1.1 pipelining and a request whose response lands in the next window).
   - `dumpcap_keepalive-*`: real dumpcap ring files of a keep-alive Flow whose SYN predates the capture.
 - **Store** (`tests/store.rs`): every body, Workunit record and chunk is fetched by hash and verifies; each chunk's packets match the `packets` table and its Merkle root; Slice hashes are recomputed from the streams; two runs write byte-identical stores, and a re-run finds every object already there; an object with other bytes is never overwritten; a Capture Rate of 0 truncates exactly the Workunit packets and changes no table but `chunks`; the alarm cap; Parquet holds the same rows as the JSONL tables.
 - **Wire Protocols** (`tests/wire_protocol.rs`): a protocol defined only in the test, registered with one line, decodes NDJSON and named-SSE Workunits, wins a shared path by header and falls through to OpenAI on a body it cannot read, resumes NDJSON framing after a lost segment, and fills `protocol`, the token counts, `extra` and the `protocol` metric label. Framing unit tests split SSE (both styles) and NDJSON across segments and gaps.
+- **Anthropic outcomes** (`tests/anthropic.rs`): streams built packet by packet. Only one that reaches `message_stop` is `ok`, a `max_tokens` stop included; a clean end without `message_stop`, or an in-band `error` event, is `errored`; a gap is `incomplete`; a JSON body that is neither a `message` nor an `error` is `errored`.
 - **Logs and stats** (`tests/observe.rs`): the registry's final counters equal what the tables say, bytes by bucket sum to every Flow's bytes, `/metrics` is scraped and parsed, a `-v` run over every golden case logs one DEBUG line per expected Workunit, `SIGUSR1` prints the snapshot during a ring run, and runs at `-qq` and at `-vv` with metrics write identical output trees. The keypress snapshot needs a terminal, so it is in the smoke test above.
 - Besides the expected tables, the tests check that every body with a `body_hash` is kept under its hash, that every `by-exchange/` link resolves to a body matching its name, and that `--no-bodies` changes no table. They also check that buckets sum to each Flow's bytes in every fixture, that two runs are byte-identical, and that corrupted payloads never panic the parsers or break the accounting.
 - **Capturing the protocol fixtures again** (only when the mock or the scenarios change; CI never captures). Needs [uv](https://docs.astral.sh/uv/) and dumpcap; Python dependencies are pinned in the scripts:
@@ -255,9 +274,27 @@ cargo test --workspace
   sg wireshark -c "uv run fixtures/capture/capture.py openai_h2c_sse"   # one scenario
   ```
 
-  `fixtures/capture/mock_server.py` serves HTTP/1.1 and h2c on loopback; each Wire Protocol adds its routes in its own module (`mock_openai.py`) and its scenarios in another (`capture_openai.py`), plus one line in each script's list. It serves fixed bodies, so only client headers and timing vary between captures. A small vLLM model would add realism, but the mock needs no GPU and keeps bodies fixed.
+  `fixtures/capture/mock_server.py` serves HTTP/1.1 and h2c on loopback; each Wire Protocol adds its routes in its own module (`mock_openai.py`, `mock_anthropic.py`, `mock_ollama.py`, which only the workload uses: the Ollama fixtures come from a real Ollama) and its scenarios in another (`capture_openai.py`, `capture_anthropic.py`), plus one line in each script's list. It serves fixed bodies, so only client headers and timing vary between captures. A small vLLM model would add realism, but the mock needs no GPU and keeps bodies fixed.
+- **Outputs, end to end** (`tests/outputs.rs`), over every golden case, all four Wire Protocols included: each window's manifest names chunks that are fetched and verify, a pack and index tables that exist with the row counts given, and its totals add up to the tables; every window ships to a mock ingest once and a second run only repeats it; a window with other bytes is refused with 409 and stays in the log; shipping resumes from the cursor; two runs give byte-identical output directories (tables, bodies, `by-exchange/`, the object store and the manifest log); and the CLI ships as it runs.
 - **Live equals offline:** needs capture rights, so it is skipped unless enabled:
 
   ```sh
   sg wireshark -c "TS_LIVE_DUMPCAP=1 cargo test -p collector --test live -- --nocapture"
+  ```
+
+  End to end, over the mixed workload: `tools/live_e2e.sh` runs `collector ring` on `lo` while `fixtures/capture/workload.py` drives OpenAI Chat and Completions, OpenAI Responses, Anthropic and Ollama (the mock, plus a trickle to a real local Ollama if one listens), streaming and not, over HTTP/1.1 and h2c, with non-LLM noise (HTTP downloads, opaque TCP, UDP). It then runs `collector files` over the ring files dumpcap closed, and requires identical output directories and a mock ingest that took every offline manifest as a repeat of a live one:
+
+  ```sh
+  sg wireshark -c "tools/live_e2e.sh ../e2e 200"   # 200 s of traffic, about 1.5 GB of capture
+  ```
+- **Throughput:** `tools/bench.py <files>` runs the release binary over a capture and reports bytes, packets and Request Workunits per CPU-second (the pipeline is one thread, so per core) and each run's own peak RSS, with and without `--no-bodies`. Point `--out-dir` at a real disk: store objects are fsynced, which costs nothing on tmpfs. Over the ring files `live_e2e.sh` leaves in `<work>/ring/`:
+
+  ```sh
+  python3 tools/bench.py ../e2e/ring/*.pcapng
+  ```
+- **PR diff size:** CI's `PR diff size` job posts a sticky comment with the production lines a PR changes: files under `src/`, with test files and inline `#[cfg(test)]` modules stripped from both sides, so fixtures and golden tables don't count. It is informational, never a gate. Locally:
+
+  ```sh
+  scripts/pr-diff-stats.py origin/main HEAD
+  scripts/pr-diff-stats.py --self-test
   ```

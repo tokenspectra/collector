@@ -394,6 +394,171 @@ fn openai_sse_over_http1_chunked_and_h2c() {
     }
 }
 
+fn responses_extra(w: &collector::decode::WorkunitRecord, key: &str) -> serde_json::Value {
+    w.extra.as_ref().unwrap()[key].clone()
+}
+
+#[test]
+fn openai_responses_json_over_http1_and_h2c() {
+    for (name, http) in [
+        ("openai_responses_h1_json", HttpVersion::Http1),
+        ("openai_responses_h2c_json", HttpVersion::Http2),
+    ] {
+        let c = collect_files(&[&format!("{name}.pcapng")]);
+        assert_eq!(
+            bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),
+            0,
+            "{name}"
+        );
+        assert_eq!(c.workunits.len(), 2, "{name}");
+        for w in &c.workunits {
+            assert_eq!(
+                (w.protocol, w.endpoint, w.http),
+                ("openai_responses", "/v1/responses", http)
+            );
+            assert!(w.complete && !w.stream && w.status == 200, "{name}");
+            assert_eq!(w.outcome(), collector::stats::Outcome::Ok, "{name}");
+            assert_eq!(w.model.as_deref(), Some("mock-model"));
+            assert_eq!(w.response_id.as_deref(), Some("resp_mock_0001"));
+            assert!(w.sse_events.is_none() && w.seed.is_none());
+            assert_eq!(w.input_tokens, Some(9));
+        }
+        let (full, cut) = (&c.workunits[0], &c.workunits[1]);
+        assert_eq!(full.output_tokens, Some(4));
+        assert_eq!(full.finish_reason[0].finish_reason, "completed");
+        assert_eq!(responses_extra(full, "status"), "completed");
+        assert_eq!(cut.output_tokens, Some(2));
+        assert_eq!(cut.finish_reason[0].finish_reason, "max_output_tokens");
+        assert_eq!(responses_extra(cut, "status"), "incomplete");
+        assert_eq!(responses_extra(cut, "previous_response_id"), "resp_mock_0000");
+    }
+}
+
+#[test]
+fn openai_responses_sse_over_http1_chunked_and_h2c() {
+    for name in ["openai_responses_h1_sse", "openai_responses_h2c_sse"] {
+        let c = collect_files(&[&format!("{name}.pcapng")]);
+        assert_eq!(c.workunits.len(), 2, "{name}");
+        let (full, cut) = (&c.workunits[0], &c.workunits[1]);
+        for w in [full, cut] {
+            assert!(w.stream && w.complete && w.sse_done == Some(true), "{name}");
+            assert_eq!(w.outcome(), collector::stats::Outcome::Ok, "{name}");
+            assert_eq!(w.protocol, "openai_responses");
+            let events = w.sse_events.as_ref().unwrap();
+            assert_eq!(events.iter().map(|e| e.len).sum::<u64>(), w.response_body_len);
+        }
+        // created, in_progress, item and part added, four deltas, text, part
+        // and item done, completed.
+        assert_eq!(full.sse_events.as_ref().unwrap().len(), 12, "{name}");
+        assert_eq!(cut.sse_events.as_ref().unwrap().len(), 10, "{name}");
+        assert_eq!((full.input_tokens, full.output_tokens), (Some(9), Some(4)));
+        assert_eq!(full.finish_reason[0].finish_reason, "completed");
+        assert_eq!(cut.finish_reason[0].finish_reason, "max_output_tokens");
+        assert_eq!(
+            bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),
+            0,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn openai_responses_errors_are_workunits() {
+    let c = collect_files(&["openai_responses_error_h1.pcapng"]);
+    assert_eq!(c.workunits.len(), 2);
+    let (missing, failed) = (&c.workunits[0], &c.workunits[1]);
+    // A 404 JSON error body is read: an `ok` Workunit with a 4xx status.
+    assert_eq!((missing.status, missing.complete), (404, true));
+    assert_eq!(missing.outcome(), collector::stats::Outcome::Ok);
+    assert!(missing.finish_reason.is_empty() && missing.response_id.is_none());
+    assert_eq!(responses_extra(missing, "error_code"), "model_not_found");
+    // A stream that ends in response.failed: a failure in band behind
+    // HTTP 200, so `errored`.
+    assert!(failed.stream && failed.complete && failed.sse_done == Some(true));
+    assert_eq!(failed.outcome(), collector::stats::Outcome::Errored);
+    assert_eq!(failed.finish_reason[0].finish_reason, "failed");
+    assert_eq!(responses_extra(failed, "error_code"), "server_error");
+    assert_eq!(responses_extra(failed, "status"), "failed");
+}
+
+/// Real Ollama: streamed chat and generate are NDJSON, `"stream": false`
+/// and embed are one JSON object, and an unknown model is a JSON error.
+#[test]
+fn ollama_native_ndjson_and_json() {
+    let c = collect_files(&["ollama_native.pcapng"]);
+    assert!(c.flows.iter().all(|f| f.verdict == Some(Verdict::Http1)));
+    assert_eq!(bytes_where(&c, |b| b.unexplained + b.gap + b.http_other), 0);
+    let got: Vec<(&str, bool, u16, Option<&str>)> = c
+        .workunits
+        .iter()
+        .map(|w| (w.endpoint, w.stream, w.status, w.response_content_type.as_deref()))
+        .collect();
+    let (nd, json) = (Some("application/x-ndjson"), Some("application/json"));
+    assert_eq!(
+        got,
+        [
+            ("/api/chat", true, 200, nd),
+            ("/api/generate", true, 200, nd),
+            ("/api/chat", false, 200, json),
+            ("/api/generate", false, 200, json),
+            ("/api/embed", false, 200, json),
+            ("/api/chat", false, 404, json),
+        ]
+    );
+    for w in &c.workunits {
+        assert_eq!(w.protocol, "ollama");
+        assert!(w.complete && w.outcome() == collector::stats::Outcome::Ok);
+        assert_eq!(w.response_model, w.model.clone().filter(|_| w.status == 200));
+        // NDJSON is not SSE, and Ollama sends no usage object.
+        assert_eq!((w.sse_events.as_ref(), w.sse_done, &w.usage), (None, None, &None));
+    }
+    for w in &c.workunits[..4] {
+        assert_eq!(w.model.as_deref(), Some("qwen2.5:0.5b"));
+        assert_eq!((w.input_tokens, w.output_tokens), (Some(32), Some(8)));
+        assert_eq!(w.finish_reason[0].finish_reason, "length");
+        let x = w.extra.as_ref().unwrap();
+        assert!(x["total_duration"].as_u64().unwrap() >= x["eval_duration"].as_u64().unwrap());
+        // `done` is reported for streams only.
+        assert_eq!(
+            x["done"],
+            if w.stream {
+                serde_json::json!(true)
+            } else {
+                serde_json::Value::Null
+            }
+        );
+    }
+    let embed = &c.workunits[4];
+    assert_eq!((embed.input_tokens, embed.output_tokens), (Some(5), None));
+    assert!(embed.finish_reason.is_empty());
+    assert_eq!(
+        c.workunits[5].extra.as_ref().unwrap()["error"],
+        "model 'no-such-model' not found"
+    );
+}
+
+/// Ollama's OpenAI-compatible `/v1/*` endpoints are the OpenAI protocol's.
+#[test]
+fn ollama_openai_compatible_endpoints_decode_as_openai() {
+    let c = collect_files(&["ollama_openai_compat.pcapng"]);
+    assert_eq!(bytes_where(&c, |b| b.unexplained + b.gap + b.http_other), 0);
+    let got: Vec<(&str, &str, bool)> = c
+        .workunits
+        .iter()
+        .map(|w| (w.protocol, w.endpoint, w.stream))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("openai", "/v1/chat/completions", false),
+            ("openai", "/v1/chat/completions", true),
+        ]
+    );
+    assert!(c.workunits.iter().all(|w| w.complete && w.response_id.is_some()));
+    assert_eq!(c.workunits[0].output_tokens, Some(8));
+    assert_eq!(c.workunits[1].sse_done, Some(true));
+}
+
 /// The same bodies sent over HTTP/1.1 and h2c hash the same: body hashes
 /// cover the bytes, not the framing around them.
 #[test]
@@ -407,10 +572,99 @@ fn body_hashes_do_not_depend_on_framing() {
     };
     assert_eq!(hashes("openai_h1_json"), hashes("openai_h2c_json"));
     assert_eq!(hashes("openai_h1_sse"), hashes("openai_h2c_sse"));
+    assert_eq!(
+        hashes("openai_responses_h1_json"),
+        hashes("openai_responses_h2c_json")
+    );
+    assert_eq!(
+        hashes("openai_responses_h1_sse"),
+        hashes("openai_responses_h2c_sse")
+    );
     let h = hashes("openai_h1_json");
     assert!(h
         .iter()
         .all(|(a, b)| a.as_ref().unwrap().starts_with("f1e20") && b.is_some()));
+}
+
+#[test]
+fn anthropic_json_over_http1_and_h2c() {
+    for name in ["anthropic_h1_json", "anthropic_h2c_json"] {
+        let c = collect_files(&[&format!("{name}.pcapng")]);
+        assert_eq!(
+            bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),
+            0,
+            "{name}"
+        );
+        assert_eq!(c.workunits.len(), 2, "{name}");
+        for w in &c.workunits {
+            assert_eq!((w.protocol, w.endpoint), ("anthropic", "/v1/messages"));
+            assert!(w.complete && !w.stream && w.sse_events.is_none(), "{name}");
+            assert_eq!(w.outcome(), collector::stats::Outcome::Ok, "{name}");
+            assert_eq!((&w.seed, &w.n), (&None, &None));
+        }
+        let ok = &c.workunits[0];
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.response_id.as_deref(), Some("msg_mock_0001"));
+        assert_eq!(ok.response_model.as_deref(), Some("mock-model"));
+        assert_eq!(ok.finish_reason[0].finish_reason, "end_turn");
+        assert_eq!((ok.input_tokens, ok.output_tokens), (Some(9), Some(4)));
+        let extra = ok.extra.as_ref().unwrap();
+        assert_eq!(extra["cache_read_input_tokens"], 6);
+        assert_eq!(extra["cache_creation_input_tokens"], 0);
+        // An error body is still the protocol's: status and error type.
+        let err = &c.workunits[1];
+        assert_eq!(err.status, 400);
+        assert!(err.finish_reason.is_empty() && err.usage.is_none());
+        assert_eq!(err.extra.as_ref().unwrap()["error_type"], "invalid_request_error");
+    }
+}
+
+#[test]
+fn anthropic_sse_over_http1_chunked_and_h2c() {
+    for name in ["anthropic_h1_sse", "anthropic_h2c_sse"] {
+        let c = collect_files(&[&format!("{name}.pcapng")]);
+        assert_eq!(c.workunits.len(), 2, "{name}");
+        let ok = &c.workunits[0];
+        assert!(ok.stream && ok.complete && ok.sse_done == Some(true), "{name}");
+        assert_eq!(ok.outcome(), collector::stats::Outcome::Ok, "{name}");
+        // message_start, content_block_start, ping, four deltas,
+        // content_block_stop, message_delta, message_stop.
+        let events = ok.sse_events.as_ref().unwrap();
+        assert_eq!(events.len(), 10, "{name}");
+        assert_eq!(events.iter().map(|e| e.len).sum::<u64>(), ok.response_body_len);
+        assert!(events.windows(2).all(|w| w[0].ts_ns < w[1].ts_ns));
+        assert_eq!(ok.finish_reason[0].finish_reason, "end_turn");
+        // message_delta's cumulative output count replaces message_start's.
+        assert_eq!((ok.input_tokens, ok.output_tokens), (Some(9), Some(4)));
+        assert_eq!(ok.extra.as_ref().unwrap()["cache_read_input_tokens"], 6);
+
+        // An `error` event after the first token: the HTTP exchange is whole,
+        // but the message never stopped, so it is `errored`.
+        let cut = &c.workunits[1];
+        assert_eq!((cut.status, cut.complete), (200, true), "{name}");
+        assert_eq!(cut.sse_done, Some(false));
+        assert_eq!(cut.sse_events.as_ref().unwrap().len(), 5);
+        assert!(cut.finish_reason.is_empty());
+        assert_eq!(cut.output_tokens, Some(1));
+        assert_eq!(cut.extra.as_ref().unwrap()["error_type"], "overloaded_error");
+        assert_eq!(cut.outcome(), collector::stats::Outcome::Errored, "{name}");
+
+        assert_eq!(
+            bytes_where(&c, |b| b.unexplained + b.gap + b.http_other),
+            0,
+            "{name}"
+        );
+        assert!(bytes_where(&c, |b| b.framing) > 0);
+    }
+    let hashes = |name: &str| -> Vec<Option<String>> {
+        collect_files(&[&format!("{name}.pcapng")])
+            .workunits
+            .iter()
+            .map(|w| w.response_body_hash.clone())
+            .collect()
+    };
+    assert_eq!(hashes("anthropic_h1_sse"), hashes("anthropic_h2c_sse"));
+    assert_eq!(hashes("anthropic_h1_json"), hashes("anthropic_h2c_json"));
 }
 
 #[test]
@@ -619,11 +873,16 @@ fn bodies_are_kept_by_hash_unless_opted_out() {
         kept_any |= bodies.iter().any(|(_, b)| !b.is_empty());
 
         // Only the blobs are missing: every other table is the same, and the
-        // pack holds the same Workunit records, without bodies.
+        // pack holds the same Workunit records, without bodies. The manifests
+        // count the blobs, so they differ too.
         let (without, none) = tables_and_bodies(&mut FileSource::new(fixture_paths(&names)), false);
         assert!(none.is_empty(), "{case}");
-        let not_blobs =
-            |t: &Files| -> Files { t.iter().filter(|(n, _)| n != "blobs.jsonl").cloned().collect() };
+        let not_blobs = |t: &Files| -> Files {
+            t.iter()
+                .filter(|(n, _)| n != "blobs.jsonl" && n != collector::manifest::LOG)
+                .cloned()
+                .collect()
+        };
         assert_eq!(not_blobs(&without), not_blobs(&tables), "{case}");
         let records = |t: &Files, kind: &str| -> Vec<String> {
             let blobs = &t.iter().find(|(n, _)| n == "blobs.jsonl").unwrap().1;

@@ -6,13 +6,14 @@
 
 Serves HTTP/1.1 and cleartext HTTP/2 (h2c, prior knowledge) on one port:
 a connection that starts with the HTTP/2 preface is HTTP/2. The transport
-here is shared; each protocol module (mock_openai.py, ...) only lists its
+here is shared; each protocol module (mock_openai.py, mock_anthropic.py, ...) only lists its
 routes in `ROUTES`, mapping (method, path) to a handler that takes the
 request body and lowercase headers and returns a mock_common.Reply. A new
 protocol adds its module and one line to PROTOCOLS. GET /health is served
 for every protocol.
 
     uv run fixtures/capture/mock_server.py --port 18000
+    uv run fixtures/capture/mock_server.py --tokens 64 --event-gap 0.002   # for workload.py
 """
 
 import argparse
@@ -23,11 +24,15 @@ import h2.config
 import h2.connection
 import h2.events
 
+import mock_anthropic
+import mock_common
+import mock_ollama
 import mock_openai
+import mock_openai_responses
 from mock_common import Reply
 
 # One line per Wire Protocol. Earlier modules win a (method, path) clash.
-PROTOCOLS = [mock_openai]
+PROTOCOLS = [mock_openai, mock_openai_responses, mock_anthropic, mock_ollama]
 
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # Delay between stream frames, so each one leaves in its own TCP segment.
@@ -140,15 +145,24 @@ async def handle(reader, writer):
             await serve_h2(first, reader, writer)
         else:
             await serve_h1(first, reader, writer)
+    except ConnectionError:
+        pass  # the client went away
     finally:
         writer.close()
 
 
 async def main():
+    global EVENT_GAP_S
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18000)
+    ap.add_argument("--tokens", type=int, help="tokens per reply, repeating the fixed ones (default: the 4 fixed)")
+    ap.add_argument("--event-gap", type=float, default=EVENT_GAP_S, help="seconds between stream frames")
     args = ap.parse_args()
+    EVENT_GAP_S = args.event_gap
+    if args.tokens:
+        fixed = list(mock_common.TOKENS)
+        mock_common.TOKENS[:] = [fixed[i % len(fixed)] for i in range(args.tokens)]
     server = await asyncio.start_server(handle, args.host, args.port)
     print(f"listening on {args.host}:{args.port}", flush=True)
     async with server:

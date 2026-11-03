@@ -902,6 +902,8 @@ mod tests {
         assert!(text.contains("ts_collector_capture_packets_total{cut=\"truncated\"} 0\n"));
         assert!(text.contains("ts_collector_store_objects_total{kind=\"chunk\"} 0\n"));
         // + capture and store: 3 scalars, packets by cut, objects and bytes by kind.
-        assert_eq!(samples, 3 * 7 + 2 + 5 * 2 + 3 * 4 + 8 + 1 + 3 + 2 + 2 * 3);
+        // Workunits: outcome by HTTP class, for every built-in protocol.
+        let workunits = 3 * 4 * crate::wire::BUILTIN.len();
+        assert_eq!(samples, 3 * 7 + 2 + 5 * 2 + workunits + 8 + 1 + 3 + 2 + 2 * 3);
     }
 }
