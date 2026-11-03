@@ -119,6 +119,7 @@ fn manifests_name_every_object_and_sum_to_the_tables() {
                 collector::store::fetch_chunk(
                     &object_store::local::LocalFileSystem::new_with_prefix(&store).unwrap(),
                     key,
+                    1,
                 )
                 .unwrap_or_else(|e| panic!("{case}: {key}: {e}"));
                 chunks.push(c.clone());

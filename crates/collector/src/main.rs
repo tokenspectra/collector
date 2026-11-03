@@ -3,7 +3,6 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -42,10 +41,11 @@ struct Cli {
     /// Serve Prometheus metrics at http://<addr>/metrics, e.g. 127.0.0.1:9464.
     #[arg(long, global = true)]
     metrics_addr: Option<String>,
-    /// Object store root for L0 chunks, packs and Parquet index tables
-    /// [default: <out>/store].
+    /// Object store for L0 chunks, packs and Parquet index tables: a
+    /// directory, or s3://bucket[/prefix] with credentials and endpoint
+    /// from the AWS_* environment variables [default: <out>/store].
     #[arg(long, global = true)]
-    store: Option<PathBuf>,
+    store: Option<String>,
     /// The control plane's ingest, e.g. http://127.0.0.1:8090/ingest/windows:
     /// each window's manifest is POSTed there as the window is sealed.
     /// Without it, manifests stay in <out>/manifests.jsonl for `collector ship`.
@@ -272,9 +272,11 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Err("--capture-rate below 1 needs --capture-key: the draw must be unpredictable".into());
     }
     std::fs::create_dir_all(&out)?;
-    let store_dir = cli.store.clone().unwrap_or_else(|| out.join("store"));
-    std::fs::create_dir_all(&store_dir)?;
-    let object_store = Arc::new(collector::store::local(&store_dir)?);
+    let store_url = cli
+        .store
+        .clone()
+        .unwrap_or_else(|| out.join("store").display().to_string());
+    let object_store = collector::store::open(&store_url)?;
     let registry = Registry::new();
     if let Some(addr) = &cli.metrics_addr {
         let bound = serve_metrics(addr.as_str(), registry.clone())
@@ -314,7 +316,7 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let stored = store.finish()?;
     sink.finish()?;
     info!(
-        store = %store_dir.display(),
+        store = %store_url,
         chunks = stored.chunks,
         packs = stored.packs,
         index_files = stored.index_files,

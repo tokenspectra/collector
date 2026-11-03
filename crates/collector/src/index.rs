@@ -218,6 +218,7 @@ const CHUNKS: &[Column] = &[
     ("truncated_bytes", Int),
     ("pcapng_len", Int),
     ("stored_len", Int),
+    ("parts", Int),
 ];
 
 const BLOBS: &[Column] = &[

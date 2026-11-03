@@ -254,10 +254,12 @@ packs/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}.pack          # L2 bodi
 index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
 ```
 
-- **As built (TS-26):** `{window_start}` is the window start in nanoseconds since the Unix epoch, the `window_start_ns` column; `{yyyy}/{mm}/{dd}` is its UTC date; `{site}` and `{collector}` come from `--site` and `--collector-id` (default `local`); `{link}` is the Link with every character outside `[A-Za-z0-9._-]` replaced by `_`. The CLI writes to a `LocalFileSystem` at `--store` (default `<out>/store`).
+- **As built (TS-26):** `{window_start}` is the window start in nanoseconds since the Unix epoch, the `window_start_ns` column; `{yyyy}/{mm}/{dd}` is its UTC date; `{site}` and `{collector}` come from `--site` and `--collector-id` (default `local`); `{link}` is the Link with every character outside `[A-Za-z0-9._-]` replaced by `_`. The CLI writes to `--store`: a directory (`LocalFileSystem`, default `<out>/store`), or `s3://bucket[/prefix]` (TS-38), Amazon S3 or an S3-compatible store, with credentials, region and endpoint from the `AWS_*` environment variables.
+  - Every put is write-once: `PutMode::Create`, `If-None-Match: *` on S3. A store that ignores the header could overwrite objects; CI checks the S3 path against VersityGW.
   - A put that finds the object already there reads it back: the same bytes (a re-run over the same capture) are left alone, other bytes fail the run. Nothing is overwritten.
-- **L0 chunks:** one object per Link per window, zstd-compressed. If a chunk passes a size cap (e.g. 1 GiB), split it into `-partN` objects. _Not built yet: v1 writes one object per chunk with a single put, since `put_multipart` cannot be write-once (no `PutMode::Create`)._
-  - Big objects use `put_multipart` (5 MiB–5 GiB parts, ≤ 10,000 parts; research §4).
+- **L0 chunks:** one object per Link per window, zstd-compressed. If a chunk passes a size cap (1 GiB stored), split it into `-partN` objects.
+  - As built (TS-38): the compressed chunk is cut into 1 GiB pieces, `{key}-part0`, `{key}-part1`, …, each a single write-once put; joined in order they are the compressed chunk. The `chunks` row keeps the whole chunk's `key`, `chunk_hash` and `stored_len`, and `parts` says how many objects hold it (1: the object at `key`).
+  - Why not `put_multipart`: `object_store` (0.14) completes a multipart upload without `If-None-Match`, so it could overwrite an object. S3 single puts take up to 5 GiB.
   - The name includes the chunk hash, so a chunk can be checked from its name alone.
 - **Packs:** L2 bodies and L3 records are KB-sized, and object stores charge per request. One pack per window holds many items:
   - each item is a separate zstd frame;
@@ -300,7 +302,7 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - `packets`: chunk, packet index, timestamp, Flow, direction, stream offset, captured and original length, packet hash;
   - `workunits`: L3 records;
   - `blobs`: hash → pack location.
-  - As built (TS-26), also `segments`, `events` and `http`, the same tables as the local JSONL, and `chunks`: one row per L0 chunk with its key, chunk hash, Merkle root, packet count and the Capture Rate's kept and truncated bytes.
+  - As built (TS-26), also `segments`, `events` and `http`, the same tables as the local JSONL, and `chunks`: one row per L0 chunk with its key, chunk hash, Merkle root, packet count and the Capture Rate's kept and truncated bytes, and (TS-38) the number of `parts` it is stored in.
   - Each table has a fixed schema, so a column keeps its type in every window. Nested records are flattened (`orig_stats.packets` → `orig_stats_packets`). Values the Operator sends as arbitrary JSON (`usage`, `seed`, `n`), and lists, are JSON text. Every column is optional.
   - A row goes in the window it belongs to (a packet's, a Slice's) while that window is held; otherwise, and for `http`, `workunits` and pack items, in the newest window held when it is written.
 - **Local view.** `bodies/` and `by-exchange/` stay beside the tables as the local view; packs are the store.
