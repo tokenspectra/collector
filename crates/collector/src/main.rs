@@ -350,6 +350,10 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         registry.clone(),
         cli.log_format == LogFormat::Json,
         dumpcap_pid,
+        spooled.as_ref().map(|(spool, _)| {
+            let spool = spool.clone();
+            Box::new(move || spool.stop()) as Box<dyn Fn() + Send>
+        }),
     ) {
         Ok(t) => {
             tracing::debug!(
@@ -383,7 +387,18 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         decoder_cfg,
         &mut StatsSink::new(&mut store, registry.clone()),
     )?;
-    let stored = store.finish()?;
+    let stored = store.finish();
+    // The uploader gets its time even when the run failed: what is
+    // spooled is evidence all the same.
+    if let Some((_, uploader)) = spooled {
+        let uploaded = uploader.finish(Duration::from_secs(cli.upload_wait_s));
+        if let Ok(u) = &uploaded {
+            log_uploaded(u);
+        }
+        stored.as_ref().map_err(|e| e.to_string())?;
+        uploaded?;
+    }
+    let stored = stored?;
     sink.finish()?;
     info!(
         store = %store_url,
@@ -392,9 +407,6 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         index_files = stored.index_files,
         "object store written"
     );
-    if let Some((_, uploader)) = spooled {
-        log_uploaded(&uploader.finish(Duration::from_secs(cli.upload_wait_s))?);
-    }
     // Views for people, derived from the tables and bodies just written.
     if !cli.no_bodies {
         collector::views::write(&out)?;

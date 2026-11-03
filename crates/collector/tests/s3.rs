@@ -28,7 +28,8 @@ use collector::output::JsonlSink;
 use collector::spool::{Spool, Uploader};
 use collector::stats::Registry;
 use collector::store::{fetch_blob, fetch_chunk, BlobKind, BlobRecord, StoreConfig, StoreSink};
-use collector::{mh, AssemblerConfig, DecoderConfig, FileSource};
+use collector::{mh, AssemblerConfig, CapturedPacket, DecoderConfig, FileSource, PacketSource, SourceError};
+
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
@@ -74,6 +75,13 @@ fn objects(store: &dyn ObjectStore) -> BTreeMap<String, Vec<u8>> {
         }
         out
     })
+}
+
+/// The objects in a spool directory: its files but the lock.
+fn spooled(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = tree(dir);
+    files.remove(collector::spool::LOCK);
+    files
 }
 
 /// Every file under `dir`, by relative path.
@@ -322,10 +330,19 @@ fn run_spooled(
     spool: Arc<Spool>,
     reg: Arc<Registry>,
 ) -> Result<(), collector::store::StoreError> {
+    run_spooled_from(&mut FileSource::new(fixture_paths(names)), out, spool, reg)
+}
+
+fn run_spooled_from(
+    source: &mut dyn PacketSource,
+    out: &Path,
+    spool: Arc<Spool>,
+    reg: Arc<Registry>,
+) -> Result<(), collector::store::StoreError> {
     let mut sink = JsonlSink::create(out).unwrap();
     let mut stored = StoreSink::spooled(&mut sink, spool, StoreConfig::new(WINDOW_NS), Some(reg));
     collector::run::run(
-        &mut FileSource::new(fixture_paths(names)),
+        source,
         WINDOW_NS,
         AssemblerConfig::default(),
         DecoderConfig::default(),
@@ -375,9 +392,11 @@ fn an_outage_delays_the_objects_without_ending_the_run() {
     assert_eq!((done.objects, done.left), (0, want.len() as u64));
     assert!(reg.snapshot().upload_retries > 0);
     assert!(objects(direct.as_ref()).is_empty());
-    assert_eq!(tree(spool_dir.path()), want, "the spool holds every object");
+    assert_eq!(spooled(spool_dir.path()), want, "the spool holds every object");
 
-    // The next run (or `collector upload`) finds them on disk.
+    // The next run (or `collector upload`) finds them on disk, once this
+    // one has let go of the spool.
+    drop(spool);
     proxy.set_up(true);
     let spool = Spool::open(spool_dir.path(), u64::MAX, None).unwrap();
     assert_eq!(spool.pending().0, want.len() as u64);
@@ -388,7 +407,7 @@ fn an_outage_delays_the_objects_without_ending_the_run() {
     assert_eq!((done.objects, done.left), (want.len() as u64, 0));
     assert_eq!(objects(direct.as_ref()), want);
     assert!(
-        tree(spool_dir.path()).is_empty(),
+        spooled(spool_dir.path()).is_empty(),
         "uploaded objects leave the spool"
     );
 }
@@ -428,4 +447,78 @@ fn a_full_spool_holds_the_run_back() {
     assert!(spool.peak_bytes() <= max);
     assert_eq!(objects(direct.as_ref()), want);
     assert_eq!(reg.snapshot().spool_bytes, 0);
+}
+
+/// Stands in for the dumpcap ring: hands out its files' packets, then
+/// waits for more input until it is stopped, as `RingSource` waits for
+/// dumpcap's next file until dumpcap exits.
+struct Live {
+    files: FileSource,
+    stopped: Arc<AtomicBool>,
+}
+
+impl PacketSource for Live {
+    fn next(&mut self) -> Option<Result<CapturedPacket, SourceError>> {
+        if let Some(p) = self.files.next() {
+            return Some(p);
+        }
+        while !self.stopped.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+}
+
+/// A live run held back by a full spool while the store is down still
+/// stops when asked: the wait for room ends, the run reports it, and the
+/// uploader gets its deadline. Windows not sealed are still in the input:
+/// running it again once the store is back fills the store completely.
+#[test]
+fn a_stop_ends_a_live_run_held_back_by_a_full_spool() {
+    let Some((proxy, through, direct)) = s3_behind_proxy("stop") else {
+        return;
+    };
+    let want = local_objects(&SPAN);
+    let total: u64 = want.values().map(|v| v.len() as u64).sum();
+    let max = want.values().map(Vec::len).max().unwrap() as u64;
+    assert!(total > max);
+
+    let (out, spool_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let reg = Registry::new();
+    let spool = Spool::open(spool_dir.path(), max, Some(reg.clone())).unwrap();
+    let uploader = Uploader::spawn(spool.clone(), through.clone()).unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let run = {
+        let (spool, reg, out) = (spool.clone(), reg.clone(), out.path().to_path_buf());
+        let mut live = Live {
+            files: FileSource::new(fixture_paths(&SPAN)),
+            stopped: stopped.clone(),
+        };
+        std::thread::spawn(move || run_spooled_from(&mut live, &out, spool, reg))
+    };
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!run.is_finished(), "held back by the full spool");
+
+    // What the stop signal does in `ring`: dumpcap ends, the spool stops
+    // waiting.
+    let asked = std::time::Instant::now();
+    stopped.store(true, Ordering::SeqCst);
+    spool.stop();
+    let err = run.join().unwrap().unwrap_err().to_string();
+    assert!(err.contains("stopped with the spool full"), "{err}");
+    let done = uploader.finish(Duration::from_secs(1)).unwrap();
+    assert!(asked.elapsed() < Duration::from_secs(10), "{:?}", asked.elapsed());
+    assert!(done.left > 0 && done.left_bytes <= max);
+    assert!(spool.peak_bytes() <= max);
+    drop(spool);
+
+    // Run the input again with the store back: everything arrives.
+    proxy.set_up(true);
+    let again = tempfile::tempdir().unwrap();
+    let spool = Spool::open(spool_dir.path(), u64::MAX, None).unwrap();
+    let uploader = Uploader::spawn(spool.clone(), through).unwrap();
+    run_spooled(&SPAN, again.path(), spool, Registry::new()).unwrap();
+    let done = uploader.finish(Duration::from_secs(60)).unwrap();
+    assert_eq!(done.left, 0);
+    assert_eq!(objects(direct.as_ref()), want);
 }

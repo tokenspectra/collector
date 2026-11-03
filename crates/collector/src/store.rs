@@ -75,6 +75,9 @@ pub enum StoreError {
     Url(String),
     #[error("upload: {0}")]
     Upload(String),
+    /// [`crate::spool::Spool::stop`] with the spool full.
+    #[error("stopped with the spool full ({0} bytes) and the store unreachable; windows not sealed are still in the input, to run again")]
+    Stopped(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -570,14 +573,14 @@ impl<'a> StoreSink<'a> {
     /// Writes `bytes` once under `key`, and queues it for upload when the
     /// store is a spool.
     fn put(&self, key: &str, bytes: Vec<u8>, kind: Kind) -> Result<(), StoreError> {
-        let len = bytes.len() as u64;
-        if let Some(spool) = &self.spool {
-            spool.wait_for_room(len)?;
-        }
+        let Some(spool) = &self.spool else {
+            return self.put_once(key, bytes, kind);
+        };
+        // Room first, then the synced write, then the queue; a failed put
+        // frees its room.
+        let room = spool.reserve(bytes.len() as u64)?;
         self.put_once(key, bytes, kind)?;
-        if let Some(spool) = &self.spool {
-            spool.added(key, len);
-        }
+        room.commit(key);
         Ok(())
     }
 
