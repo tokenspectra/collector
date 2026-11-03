@@ -75,6 +75,7 @@
   .pill.warn { color: var(--warn); border-color: currentColor; }
   .hash { cursor: copy; white-space: nowrap; }
   .hash .mono { word-break: break-all; white-space: normal; }
+  .pill.proto { color: var(--ink); background: var(--hover); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 10px; }
   .pill.mh { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 10px; color: var(--link); border-color: currentColor; }
   .muted { color: var(--muted); }
 
@@ -104,6 +105,7 @@
   .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 4px; }
   .msg.user { border-left: 3px solid var(--link); }
   .msg.asst { border-left: 3px solid var(--ok); }
+  .msg.err { border-left: 3px solid var(--bad); }
   details.msg summary { cursor: pointer; }
   .msg pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; font-size: 13px; }
   .note { color: var(--muted); font-size: 12px; margin: 6px 0; }
@@ -410,6 +412,9 @@ function hash(h, full) {
   return `<span class="hash" title="${esc(h)}\nclick to copy the multihash" onclick="navigator.clipboard?.writeText('${esc(h)}')">${tag} <span class="mono">${esc(shown)}</span></span>`;
 }
 const pill = (t, cls = "") => `<span class="pill ${cls}">${esc(t)}</span>`;
+// The Wire Protocol the Collector tagged a Workunit with (workunits.protocol): what decoded it, not a status.
+const protoPill = p => p ? `<span class="pill proto" title="Wire Protocol: ${esc(FORMAT_LABEL[p] ?? p)}">${esc(p)}</span>` : "";
+const wuOf = h => h?.workunit_id ? D.wuById.get(h.workunit_id) : null;
 function verdictPill(v) {
   if (!v) return pill("no payload");
   return pill(v, { http1: "ok", http2: "ok", tls: "warn", opaque: "bad", grpc: "warn" }[v] || "");
@@ -789,7 +794,7 @@ function vFlow(id) {
 function exchangeTable(list, showFlow) {
   return `<table><tr>${showFlow ? "<th>Flow</th>" : ""}<th>#</th><th>request</th><th>bucket</th><th>received</th><th class="num">req body</th><th class="num">resp body</th><th>type</th></tr>` +
     list.map(h => `<tr class="click" data-href="${R.exchange(h.flow, h.exchange)}">${showFlow ? `<td class="mono">${flowLabel(h.flow)}</td>` : ""}
-      <td>${h.exchange}</td><td class="mono">${exLabel(h)}</td><td>${pill(h.bucket, h.bucket === "workunit" ? "ok" : "")}</td>
+      <td>${h.exchange}</td><td class="mono">${exLabel(h)}</td><td>${pill(h.bucket, h.bucket === "workunit" ? "ok" : "")} ${protoPill(wuOf(h)?.protocol)}</td>
       <td>${time(h.request?.first_ts_ns ?? h.response?.first_ts_ns)}</td>
       <td class="num">${bytes(h.request?.body_len)}</td><td class="num">${bytes(h.response?.body_len)}</td>
       <td class="mono">${esc(h.response?.content_type || "")}</td></tr>`).join("") + `</table>`;
@@ -878,20 +883,19 @@ function vExchange(flow, n) {
   ]);
   let out = `<h2 class="mono">${exLabel(h)}</h2><div class="sub">Exchange ${n} on ${a(R.flow(flow), flowLabel(flow))} · ${esc(h.http)}${h.h2_stream != null ? " stream " + h.h2_stream : ""}</div>`;
   out += kv([["bucket", pill(h.bucket, h.bucket === "workunit" ? "ok" : "")],
-    ["Workunit", h.workunit_id ? a(R.workunit(h.workunit_id), hash(h.workunit_id)) : "—"],
+    ["Workunit", h.workunit_id ? a(R.workunit(h.workunit_id), hash(h.workunit_id)) + " " + protoPill(wuOf(h)?.protocol) : "—"],
     ["interim responses", h.interim_responses], ["reset", h.reset ? pill("yes", "warn") : "no"]]);
   out += `<div style="display:flex;gap:24px;flex-wrap:wrap"><div><h3>Request</h3>${msg(h.request, "request")}</div><div><h3>Response</h3>${msg(h.response, "response")}</div></div>`;
-  if (isChat(h)) out += `<h3>Conversation</h3><div class="convo" data-req="${h.request.body_hash}" data-resp="${h.response?.body_len ? h.response.body_hash || "" : ""}"
-      data-sse="${(h.response?.content_type || "").includes("event-stream") ? 1 : 0}"><p class="muted">Reading bodies…</p></div>`;
+  if (isChat(h)) out += `<h3>Conversation</h3>` + exConvoSlot(h);
   if (h.request?.body_hash && h.request.body_len) out += `<h3>Request body</h3>` + bodySlot(h.request.body_hash, h.request.content_type);
-  if (h.response?.body_hash && h.response.body_len) out += `<h3>Response body</h3>` + bodySlot(h.response.body_hash, h.response.content_type);
+  if (h.response?.body_hash && h.response.body_len) out += `<h3>Response body</h3>` + bodySlot(h.response.body_hash, h.response.content_type, wuOf(h)?.protocol);
   return out;
 }
 // An exchange that likely carries a chat: a JSON POST to a completion-style endpoint.
 function isChat(h) {
   const q = h.request;
   return !!(q?.body_hash && q.body_len && q.method === "POST" && (q.content_type || "").includes("json") &&
-    /complet|chat|generate|messages|responses/.test(q.target || ""));
+    /complet|chat|generate|messages|responses|embed/.test(q.target || ""));
 }
 function packetsFor(flow, m) {
   const segs = (D.segmentsByFlow.get(flow) || []).filter(s => s.dir === m.dir && s.stream_off < m.stream_end && s.stream_off + s.len > m.stream_start);
@@ -902,11 +906,11 @@ function packetsFor(flow, m) {
 }
 
 function wuTable(list) {
-  return `<table><tr><th>workunit_id</th><th>endpoint</th><th>model</th><th>stream</th><th>received</th><th class="num">duration</th><th class="num">tokens in/out</th><th>finish</th><th>complete</th></tr>` +
-    list.map(w => `<tr class="click" data-href="${R.workunit(w.workunit_id)}"><td>${hash(w.workunit_id)}</td><td class="mono">${esc(w.endpoint)}</td>
-      <td>${esc(w.model)}</td><td>${w.stream ? "SSE" : "JSON"}</td><td>${time(w.received_ts_ns)}</td>
+  return `<table><tr><th>workunit_id</th><th>protocol</th><th>endpoint</th><th>model</th><th>stream</th><th>received</th><th class="num">duration</th><th class="num">tokens in/out</th><th>finish</th><th>complete</th></tr>` +
+    list.map(w => `<tr class="click" data-href="${R.workunit(w.workunit_id)}"><td>${hash(w.workunit_id)}</td><td>${protoPill(w.protocol)}</td><td class="mono">${esc(w.endpoint)}</td>
+      <td>${esc(w.model)}</td><td>${w.stream ? ((w.response_content_type || "").includes("ndjson") ? "NDJSON" : "SSE") : "JSON"}</td><td>${time(w.received_ts_ns)}</td>
       <td class="num">${w.completed_ts_ns ? (Number(BigInt(w.completed_ts_ns) - BigInt(w.received_ts_ns)) / 1e9).toFixed(2) + "s" : "—"}</td>
-      <td class="num">${num(w.usage?.prompt_tokens)} / ${num(w.usage?.completion_tokens)}</td>
+      <td class="num">${num(w.input_tokens ?? w.usage?.prompt_tokens)} / ${num(w.output_tokens ?? w.usage?.completion_tokens)}</td>
       <td>${esc((w.finish_reason || []).map(f => f.finish_reason).join(", "))}</td><td>${w.complete ? pill("yes", "ok") : pill("no", "warn")}</td></tr>`).join("") + `</table>`;
 }
 function vWorkunits() { return `<h2>Request Workunits</h2><div class="sub">${D.workunits.length} on the Link</div>` + wuTable(D.workunits); }
@@ -918,6 +922,7 @@ function vWorkunit(id) {
   let out = `<h2>Request Workunit</h2><div class="sub">${hash(id, true)}</div>`;
   out += kv([
     ["exchange", a(R.exchange(w.flow, w.exchange), `Exchange ${w.exchange}`) + " on " + a(R.flow(w.flow), flowLabel(w.flow))],
+    ["protocol", w.protocol ? `${protoPill(w.protocol)} ${esc(FORMAT_LABEL[w.protocol] ?? "")}` : "—"],
     ["endpoint", `<span class="mono">${esc(w.endpoint)}</span> · ${esc(w.http)}`],
     ["model / response_model", `${esc(w.model)} / ${esc(w.response_model)}`],
     ["stream, seed, n", `${w.stream} · ${esc(w.seed ?? "null")} · ${esc(w.n ?? "null")}`],
@@ -925,17 +930,19 @@ function vWorkunit(id) {
     ["status", `${esc(w.status)} ${esc(w.response_content_type)}`],
     ["response_id", `<span class="mono">${esc(w.response_id)}</span>`],
     ["finish_reason", esc(JSON.stringify(w.finish_reason))],
+    ["tokens in / out", `${num(w.input_tokens)} / ${num(w.output_tokens)}`],
     ["usage", `<span class="mono">${esc(JSON.stringify(w.usage))}</span>`],
+    w.extra ? ["extra", `<span class="mono">${esc(JSON.stringify(w.extra))}</span>`] : null,
     ["request body", `${a(R.body(w.request_body_hash), hash(w.request_body_hash))} ${bytes(w.request_body_len)}`],
     ["response body", `${a(R.body(w.response_body_hash), hash(w.response_body_hash))} ${bytes(w.response_body_len)}`],
-    w.sse_events ? ["SSE events", `${w.sse_events.length}, [DONE] ${w.sse_done ? "seen" : "missing"}`] : null,
+    w.sse_events ? ["SSE events", `${w.sse_events.length}, end-of-stream marker ${w.sse_done ? "seen" : "missing"}`] : null,
     ["complete", w.complete ? pill("yes", "ok") : pill("no", "warn")],
     ["L3 record blob", rec ? `${hash(rec.hash)} in <span class="mono">${esc(rec.pack)}</span> @${rec.offset}+${rec.len}
        <button data-act="record" data-wu="${id}">Verify record hash</button> <span id="rec-out"></span>` : '<span class="muted">not in blobs yet</span>'],
   ]);
-  out += `<h3>Conversation</h3><div class="convo" data-req="${w.request_body_hash}" data-resp="${w.response_body_hash}" data-sse="${w.stream ? 1 : 0}"><p class="muted">Reading bodies…</p></div>`;
+  out += `<h3>Conversation</h3>` + convoSlot(w.request_body_hash, w.response_body_hash, w.response_content_type, w.protocol, w.endpoint);
   out += `<h3>Request body</h3>` + bodySlot(w.request_body_hash, "application/json");
-  out += `<h3>Response body</h3>` + bodySlot(w.response_body_hash, w.response_content_type);
+  out += `<h3>Response body</h3>` + bodySlot(w.response_body_hash, w.response_content_type, w.protocol);
   return out;
 }
 
@@ -956,11 +963,11 @@ function vBody(h) {
   let out = `<h2>Body</h2><div class="sub">${hash(h, true)}</div>`;
   out += kv([
     ["referenced by", refs.map(r => `${esc(r.dir)} of ${a(R.exchange(r.http.flow, r.http.exchange), exLabel(r.http))}` +
-      (r.http.workunit_id ? " · " + a(R.workunit(r.http.workunit_id), "Workunit") : "")).join("<br>") || "—"],
+      (r.http.workunit_id ? " · " + a(R.workunit(r.http.workunit_id), "Workunit") + " " + protoPill(wuOf(r.http)?.protocol) : "")).join("<br>") || "—"],
     ["local file", FILES.has("bodies/" + h) ? `<span class="mono">bodies/${esc(h)}</span>` : '<span class="muted">not in folder</span>'],
     b ? ["pack", `<span class="mono">store/${esc(b.pack)}</span> @${b.offset}+${b.len} (decoded ${bytes(b.raw_len)})`] : null,
   ]);
-  out += `<h3>Contents</h3>` + bodySlot(h, ct);
+  out += `<h3>Contents</h3>` + bodySlot(h, ct, refs[0] && wuOf(refs[0].http)?.protocol);
   return out;
 }
 
@@ -974,10 +981,9 @@ function vConvo(flow, n) {
   const h = D.httpByKey.get(flow + "#" + n);
   if (!h || !isChat(h)) return `<p>No conversation in this exchange.</p>`;
   const w = h.workunit_id && D.wuById.get(h.workunit_id);
-  return `<h2>Conversation</h2><div class="sub">${a(R.exchange(flow, n), exLabel(h))}${w ? " · " + a(R.workunit(w.workunit_id), "Request Workunit") + " · " + esc(w.model) : " · " + pill(h.bucket)}</div>
+  return `<h2>Conversation</h2><div class="sub">${a(R.exchange(flow, n), exLabel(h))}${w ? " · " + a(R.workunit(w.workunit_id), "Request Workunit") + " " + protoPill(w.protocol) + " · " + esc(w.model) : " · " + pill(h.bucket)}</div>
     <p class="note">Rebuilt from the bodies as captured on the Link. Turns from a templated prompt and merged SSE text are derived views; the raw bodies are the evidence.</p>
-    <div class="convo" data-req="${h.request.body_hash}" data-resp="${h.response?.body_len ? h.response.body_hash || "" : ""}"
-      data-sse="${(h.response?.content_type || "").includes("event-stream") ? 1 : 0}"><p class="muted">Reading bodies…</p></div>`;
+  ` + exConvoSlot(h);
 }
 function vEvents() {
   return `<h2>Events</h2><div class="sub">Gaps and anomalies the reassembler saw</div>` +
@@ -985,8 +991,16 @@ function vEvents() {
 }
 
 /* ===================== Bodies: lazy read, verify, render ===================== */
-function bodySlot(h, ct) {
-  return `<div class="bodyslot" data-hash="${h}" data-ct="${esc(ct || "")}"><p class="muted">Reading…</p></div>`;
+function bodySlot(h, ct, proto) {
+  return `<div class="bodyslot" data-hash="${h}" data-ct="${esc(ct || "")}" data-proto="${esc(proto || "")}"><p class="muted">Reading…</p></div>`;
+}
+function convoSlot(req, resp, ct, proto, endpoint) {
+  return `<div class="convo" data-req="${esc(req)}" data-resp="${esc(resp || "")}" data-ct="${esc(ct || "")}" data-proto="${esc(proto || "")}"
+    data-endpoint="${esc(endpoint || "")}"><p class="muted">Reading bodies…</p></div>`;
+}
+function exConvoSlot(h) {
+  const w = wuOf(h);
+  return convoSlot(h.request.body_hash, h.response?.body_len ? h.response.body_hash : "", h.response?.content_type, w?.protocol, w?.endpoint ?? h.request.target);
 }
 async function readBody(h) {
   const f = FILES.get("bodies/" + h);
@@ -1002,38 +1016,232 @@ function sseEvents(text) {
     return { raw: e, data, json };
   });
 }
-// Joined text of a streamed response: OpenAI chunks (choices[].delta) or llama.cpp /completion (content).
-function sseMerged(evs) {
-  let content = "", reasoning = "";
-  for (const e of evs) {
-    const j = e.json; if (!j) continue;
-    if (Array.isArray(j.choices)) for (const c of j.choices) {
-      content += c.delta?.content ?? c.text ?? "";
-      reasoning += c.delta?.reasoning ?? c.delta?.reasoning_content ?? "";
-    } else if (typeof j.content === "string") content += j.content;
+function ndjsonLines(text) {
+  return text.split(/\r?\n/).filter(l => l.trim()).map(l => {
+    let json = null; try { json = JSON.parse(l); } catch {}
+    return { raw: l, data: l, json };
+  });
+}
+// How a body is framed: "sse", "ndjson", "json" or "text", from its media type, else its bytes.
+function framingOf(text, ct = "") {
+  if (ct.includes("event-stream") || /^(data|event):/.test(text)) return "sse";
+  if (ct.includes("ndjson")) return "ndjson";
+  try { JSON.parse(text); return "json"; } catch {}
+  const lines = ndjsonLines(text);
+  return lines.length > 1 && lines.every(l => l.json && typeof l.json === "object") ? "ndjson" : "text";
+}
+function framesOf(text, framing) {
+  if (framing === "sse") return sseEvents(text);
+  if (framing === "ndjson") return ndjsonLines(text);
+  if (framing === "json") return [{ raw: text, data: text, json: JSON.parse(text) }];
+  return [];
+}
+
+/* ===================== Wire formats: derived views ===================== */
+// Turns bodies into readable turns, for the conversation and the merged tab. Derived and lossy: the raw bodies
+// are the evidence. One entry per Wire Protocol the Collector tags (workunits.protocol), plus llama.cpp's
+// /completion, which Ollama's runner speaks on loopback (http_other, so it is only ever sniffed).
+
+const clip = (s, n = 300) => s.length > n ? s.slice(0, n) + "…" : s;
+const jsonText = v => typeof v === "string" ? v : JSON.stringify(v);
+function errText(e) { return typeof e === "string" ? e : [e?.type ?? e?.code, e?.message].filter(Boolean).join(": ") || JSON.stringify(e); }
+
+// A message's content in any API's shape: a string, or an array of parts/blocks (OpenAI content parts,
+// Responses input/output parts, Anthropic blocks). Thinking goes to reasoning; tool calls and other blocks
+// become one bracketed line each.
+function blocksText(c) {
+  if (c == null) return { text: "", reasoning: "" };
+  if (typeof c === "string") return { text: c, reasoning: "" };
+  if (!Array.isArray(c)) return { text: JSON.stringify(c, null, 2), reasoning: "" };
+  const text = [], reasoning = [];
+  for (const b of c) {
+    if (typeof b === "string") { text.push(b); continue; }
+    switch (b?.type) {
+      case "text": case "input_text": case "output_text": text.push(b.text ?? ""); break;
+      case "refusal": text.push("[refusal] " + (b.refusal ?? b.text ?? "")); break;
+      case "thinking": reasoning.push(b.thinking ?? ""); break;
+      case "redacted_thinking": reasoning.push("[redacted thinking]"); break;
+      case "reasoning_text": case "summary_text": reasoning.push(b.text ?? ""); break;
+      case "tool_use": case "server_tool_use": text.push(`[${b.type} ${b.name}] ${jsonText(b.input)}`); break;
+      case "tool_result": case "web_search_tool_result":
+        text.push(`[${b.type} ${b.tool_use_id ?? ""}]${b.is_error ? " error" : ""}\n` + blocksText(b.content).text); break;
+      case "image": case "image_url": case "input_image": case "document": case "input_file": case "input_audio":
+        text.push(`[${b.type}]`); break;
+      default: text.push(typeof b?.text === "string" ? b.text : `[${b?.type ?? "block"}] ` + clip(JSON.stringify(b)));
+    }
   }
-  return { content, reasoning };
+  return { text: text.join("\n"), reasoning: reasoning.join("\n") };
+}
+// OpenAI (arguments as a JSON string) and Ollama (arguments as an object) tool calls.
+const toolCallsText = calls => (calls || []).map(c => `[call ${c.function?.name ?? c.name ?? ""}] ${jsonText(c.function?.arguments ?? c.arguments ?? "")}`).join("\n");
+
+// A Responses API item: an input item in a request, or an output item in a response.
+function responsesItem(it) {
+  if (typeof it === "string") return { role: "user", text: it };
+  switch (it?.type ?? "message") {
+    case "message": { const b = blocksText(it.content); return { role: it.role, text: b.text, reasoning: b.reasoning }; }
+    case "reasoning": return { role: "assistant", text: "", reasoning: blocksText([...(it.summary || []), ...(it.content || [])]).reasoning };
+    case "function_call": return { role: "assistant", text: `[call ${it.name}] ${it.arguments}` };
+    case "function_call_output": return { role: "tool", text: `[output ${it.call_id}]\n${jsonText(it.output)}` };
+    default: return { role: it.role ?? it.type, text: clip(JSON.stringify(it)) };
+  }
+}
+
+// The turns a request body sends: OpenAI Chat and Completions, Responses, Anthropic Messages, Ollama
+// chat/generate/embed and llama.cpp /completion.
+function requestTurns(q, endpoint = "") {
+  const t = [];
+  const add = (role, c) => { const b = blocksText(c); t.push({ role, text: b.text, reasoning: b.reasoning }); };
+  if (q.system != null) add("system", q.system);                         // Anthropic; Ollama /api/generate
+  if (typeof q.instructions === "string") add("system", q.instructions);  // Responses
+  for (const m of Array.isArray(q.messages) ? q.messages : []) {
+    const b = blocksText(m.content);
+    const reasoning = [b.reasoning, m.thinking, m.reasoning, m.reasoning_content].filter(s => typeof s === "string" && s).join("\n");
+    t.push({ role: m.role, text: [b.text, toolCallsText(m.tool_calls)].filter(Boolean).join("\n"), reasoning });
+  }
+  if (q.input != null) {
+    if (/embed/.test(endpoint)) for (const s of [].concat(q.input)) t.push({ role: "input", text: jsonText(s) });
+    else if (Array.isArray(q.input)) for (const it of q.input) t.push(responsesItem(it));
+    else add("user", q.input);
+  }
+  for (const p of [].concat(q.prompt ?? [])) if (typeof p === "string") t.push(...promptTurns(p));
+  return t;
+}
+
+// What a response's frames add up to. parts: per choice index, the joined text and reasoning.
+function newAcc() { return { parts: new Map(), stops: [], notes: [], error: null }; }
+function put(acc, i, field, s) {
+  if (!s) return;
+  let p = acc.parts.get(i ?? 0);
+  if (!p) acc.parts.set(i ?? 0, p = { text: "", reasoning: "" });
+  p[field] += s;
+}
+function responsesStatus(acc, r) {
+  if (r?.status && r.status !== "completed") acc.stops.push(r.status + (r.incomplete_details?.reason ? ` (${r.incomplete_details.reason})` : ""));
+  if (r?.error) acc.error = errText(r.error);
+}
+
+// detect(j): does this frame (a whole JSON body, an SSE event or an NDJSON line) look like the format?
+// frame(acc, j): adds one frame. A whole body is just its only frame.
+const FORMATS = [
+  {
+    id: "anthropic", label: "Anthropic Messages",
+    detect: j => j.type === "message" || /^(message_|content_block_)/.test(j.type ?? ""),
+    frame(acc, j) {
+      switch (j.type) {
+        case "message": { const b = blocksText(j.content); put(acc, 0, "text", b.text); put(acc, 0, "reasoning", b.reasoning);
+          if (j.stop_reason) acc.stops.push(j.stop_reason); break; }
+        case "content_block_start": { const cb = j.content_block || {};
+          if (cb.type === "tool_use" || cb.type === "server_tool_use") put(acc, 0, "text", `\n[${cb.type} ${cb.name}] `);
+          else if (cb.type === "redacted_thinking") put(acc, 0, "reasoning", "[redacted thinking]\n");
+          put(acc, 0, "text", cb.text); put(acc, 0, "reasoning", cb.thinking); break; }
+        case "content_block_delta": { const d = j.delta || {};
+          put(acc, 0, "text", d.text ?? d.partial_json); put(acc, 0, "reasoning", d.thinking); break; }
+        case "message_delta": if (j.delta?.stop_reason) acc.stops.push(j.delta.stop_reason); break;
+      }
+    },
+  },
+  {
+    id: "openai_responses", label: "OpenAI Responses",
+    detect: j => j.object === "response" || /^response\./.test(j.type ?? ""),
+    frame(acc, j) {
+      if (j.object === "response") {
+        for (const it of j.output || []) { const r = responsesItem(it); put(acc, 0, "text", r.text && r.text + "\n"); put(acc, 0, "reasoning", r.reasoning); }
+        return responsesStatus(acc, j);
+      }
+      switch (j.type) {
+        case "response.output_text.delta": case "response.refusal.delta": case "response.function_call_arguments.delta":
+          put(acc, 0, "text", j.delta); break;
+        case "response.reasoning_text.delta": case "response.reasoning_summary_text.delta": put(acc, 0, "reasoning", j.delta); break;
+        case "response.output_item.added": if (j.item?.type === "function_call") put(acc, 0, "text", `\n[call ${j.item.name}] `); break;
+        case "response.completed": case "response.incomplete": case "response.failed": responsesStatus(acc, j.response); break;
+        case "error": acc.error = errText(j); break;
+      }
+    },
+  },
+  {
+    id: "openai", label: "OpenAI Chat / Completions",
+    detect: j => Array.isArray(j.choices),
+    frame(acc, j) {
+      for (const c of j.choices || []) {
+        const d = c.delta ?? c.message ?? {};
+        put(acc, c.index, "text", blocksText(d.content).text || c.text);
+        put(acc, c.index, "reasoning", d.reasoning ?? d.reasoning_content);
+        for (const tc of d.tool_calls || []) {
+          if (tc.function?.name) put(acc, c.index, "text", `\n[call ${tc.function.name}] `);
+          put(acc, c.index, "text", tc.function?.arguments);
+        }
+        if (c.finish_reason) acc.stops.push((j.choices.length > 1 ? `#${c.index} ` : "") + c.finish_reason);
+      }
+    },
+  },
+  {
+    id: "ollama", label: "Ollama native",
+    detect: j => "done" in j || "embeddings" in j || ("model" in j && (typeof j.response === "string" || typeof j.message === "object")),
+    frame(acc, j) {
+      const m = j.message || {};
+      put(acc, 0, "text", m.content ?? j.response); put(acc, 0, "reasoning", m.thinking ?? j.thinking);
+      put(acc, 0, "text", toolCallsText(m.tool_calls));
+      if (Array.isArray(j.embeddings)) acc.notes.push(`${j.embeddings.length} embedding${j.embeddings.length === 1 ? "" : "s"} × ${j.embeddings[0]?.length ?? 0} dims`);
+      if (j.done_reason) acc.stops.push(j.done_reason);
+    },
+  },
+  {
+    id: "llamacpp", label: "llama.cpp /completion",
+    detect: j => typeof j.content === "string" && !("type" in j),
+    frame(acc, j) { put(acc, 0, "text", j.content); if (j.stop && j.stop_type) acc.stops.push(j.stop_type); },
+  },
+];
+const FORMAT_LABEL = Object.fromEntries(FORMATS.map(f => [f.id, f.label]));
+
+// Reads a response body in its Wire Protocol (the Collector's tag), or the first format whose shape it has.
+function readResponse(text, ct, proto) {
+  const framing = framingOf(text, ct), frames = framesOf(text, framing);
+  const objs = frames.map(f => f.json).filter(j => j && typeof j === "object" && !Array.isArray(j));
+  const fmt = FORMATS.find(f => f.id === proto) ?? FORMATS.find(f => objs.slice(0, 5).some(j => f.detect(j)));
+  const acc = newAcc();
+  for (const j of objs) {
+    if (j.error && !acc.error) acc.error = errText(j.error); // OpenAI, Anthropic, Ollama and Responses error bodies
+    fmt?.frame(acc, j);
+  }
+  const turns = [...acc.parts].sort((a, b) => a[0] - b[0]).map(([i, p]) => ({
+    role: "assistant", text: p.text.trim(), reasoning: p.reasoning.trim(), choice: acc.parts.size > 1 ? i : null }));
+  return { framing, frames, fmt, turns, stops: acc.stops, notes: acc.notes, error: acc.error };
+}
+// One line on how a response was read, and where it ended.
+function responseSummary(r) {
+  const n = r.frames.length, unit = r.framing === "sse" ? "SSE event" : r.framing === "ndjson" ? "NDJSON line" : null;
+  return [r.fmt ? r.fmt.label : "unknown format", unit && `merged from ${num(n)} ${unit}${n === 1 ? "" : "s"}`,
+    r.stops.length && "stop: " + [...new Set(r.stops)].join(", "), ...r.notes].filter(Boolean).join(" · ");
+}
+function responseHtml(r) {
+  let html = "";
+  for (const t of r.turns) {
+    const s = splitThought(t.text), reasoning = [t.reasoning, s.reasoning].filter(Boolean).join("\n");
+    const role = "assistant" + (t.choice != null ? ` · choice ${t.choice}` : "");
+    if (reasoning) html += `<details class="msg"><summary class="role">${esc(role)} · reasoning (${num(reasoning.length)} chars)</summary><pre>${esc(reasoning)}</pre></details>`;
+    html += bubble("assistant", s.content, t.choice != null ? ` · choice ${t.choice}` : "");
+  }
+  if (r.error) html += `<div class="msg err"><div class="role">error</div><pre>${esc(r.error)}</pre></div>`;
+  if (!r.turns.length && !r.error && !r.notes.length) html += `<p class="muted">No text in this response.</p>`;
+  return html;
 }
 
 async function fillBody(slot) {
-  const h = slot.dataset.hash, ct = slot.dataset.ct;
+  const h = slot.dataset.hash, ct = slot.dataset.ct, proto = slot.dataset.proto || null;
   const bytesArr = await readBody(h);
   if (!bytesArr) { slot.innerHTML = `<p class="muted">Not in the folder (bodies/ missing, or run with --no-bodies).</p>`; return; }
   const text = utf8.decode(bytesArr);
-  const isSse = ct.includes("event-stream") || /^data:/.test(text);
-  let pretty = null;
-  if (!isSse) { try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {} }
   const binary = /[\x00-\x08\x0e-\x1f]/.test(text.slice(0, 4096));
+  const framing = binary ? "text" : framingOf(text, ct);
   const tabs = [];
-  if (isSse) {
-    const evs = sseEvents(text), m = sseMerged(evs);
-    tabs.push(["merged", `<p class="note">Derived view: the joined content of ${evs.length} events. Not evidence; the raw body is.</p>` +
-      (m.reasoning ? `<div class="msg"><div class="role">reasoning</div><pre>${esc(m.reasoning)}</pre></div>` : "") +
-      `<div class="msg"><div class="role">content</div><pre>${esc(m.content)}</pre></div>`]);
-    tabs.push(["events", `<table><tr><th class="num">#</th><th>data</th></tr>${evs.slice(0, 2000).map((e, i) =>
-      `<tr><td class="num">${i}</td><td class="mono">${esc(e.data.length > 300 ? e.data.slice(0, 300) + "…" : e.data)}</td></tr>`).join("")}</table>`]);
+  if (framing === "sse" || framing === "ndjson") {
+    const r = readResponse(text, ct, proto);
+    tabs.push(["merged", `<p class="note">Derived view: ${esc(responseSummary(r))}. Not evidence; the raw body is.</p>` + responseHtml(r)]);
+    tabs.push([framing === "sse" ? "events" : "lines", `<table><tr><th class="num">#</th><th>data</th></tr>${r.frames.slice(0, 2000).map((e, i) =>
+      `<tr><td class="num">${i}</td><td class="mono">${esc(clip(e.data))}</td></tr>`).join("")}</table>`]);
   }
-  if (pretty) tabs.push(["json", `<pre class="body">${esc(pretty)}</pre>`]);
+  if (framing === "json") tabs.push(["json", `<pre class="body">${esc(JSON.stringify(JSON.parse(text), null, 2))}</pre>`]);
   tabs.push([binary ? "hex" : "raw", `<pre class="body">${binary ? hexdump(bytesArr) : esc(text)}</pre>`]);
   const id = "b" + Math.random().toString(36).slice(2);
   slot.innerHTML = `<div class="tabs">${tabs.map(([n], i) => `<button class="${i ? "" : "on"}" data-act="tab" data-g="${id}" data-i="${i}">${n}</button>`).join("")}
@@ -1060,10 +1268,10 @@ function promptTurns(p) {
     /<\|start_header_id\|>(\w+)<\|end_header_id\|>\n*([\s\S]*?)(?:<\|eot_id\|>|$)/g,
   ];
   for (const re of pats) {
-    const turns = [...p.matchAll(re)].map(m => ({ role: m[1], content: m[2].trim() })).filter(t => t.content);
+    const turns = [...p.matchAll(re)].map(m => ({ role: m[1], text: m[2].trim() })).filter(t => t.text);
     if (turns.length) return turns;
   }
-  return [{ role: "prompt", content: p }];
+  return [{ role: "prompt", text: p }];
 }
 // Split model "thinking" channels out of generated text.
 function splitThought(text) {
@@ -1072,43 +1280,28 @@ function splitThought(text) {
     .replace(/<think>([\s\S]*?)(?:<\/think>|$)/g, (_, r) => { reasoning += r; return ""; });
   return { content: content.trim(), reasoning: reasoning.trim() };
 }
-const bubble = (role, text, extra = "") =>
-  `<div class="msg ${role === "user" ? "user" : role === "assistant" || role === "model" ? "asst" : ""}"><div class="role">${esc(role)}${extra}</div><pre>${esc(text)}</pre></div>`;
+// A long system prompt starts folded, so the turns stay readable.
+function bubble(role, text, extra = "") {
+  const cls = role === "user" ? "user" : role === "assistant" || role === "model" ? "asst" : "";
+  if (role === "system" && text.length > 1500)
+    return `<details class="msg"><summary class="role">${esc(role)}${extra} (${num(text.length)} chars)</summary><pre>${esc(text)}</pre></details>`;
+  return `<div class="msg ${cls}"><div class="role">${esc(role)}${extra}</div><pre>${esc(text)}</pre></div>`;
+}
 
 async function fillConvo(el) {
-  const [req, resp] = await Promise.all([readBody(el.dataset.req), el.dataset.resp ? readBody(el.dataset.resp) : null]);
+  const { req: rh, resp: ph, ct = "", proto = "", endpoint = "" } = el.dataset;
+  const [req, resp] = await Promise.all([readBody(rh), ph ? readBody(ph) : null]);
   if (!req) { el.innerHTML = `<p class="muted">Request body not in the folder.</p>`; return; }
   let html = "";
   try {
-    const q = JSON.parse(utf8.decode(req));
-    for (const m of q.messages || []) {
-      const c = typeof m.content === "string" ? m.content
-        : Array.isArray(m.content) ? m.content.map(p => p.text ?? JSON.stringify(p)).join("\n") : JSON.stringify(m.content, null, 2);
-      html += bubble(m.role, c);
+    for (const t of requestTurns(JSON.parse(utf8.decode(req)), endpoint)) {
+      if (t.reasoning) html += `<details class="msg"><summary class="role">${esc(t.role)} · reasoning (${num(t.reasoning.length)} chars)</summary><pre>${esc(t.reasoning)}</pre></details>`;
+      if (t.text) html += bubble(t.role, t.text);
     }
-    if (typeof q.prompt === "string") for (const t of promptTurns(q.prompt)) html += bubble(t.role, t.content);
   } catch { html += `<p class="muted">Request body is not JSON.</p>`; }
   if (!resp) { el.innerHTML = html + `<p class="muted">No response body.</p>`; return; }
-  try {
-    const text = utf8.decode(resp);
-    const show = (role, content, reasoning, extra) => {
-      const s = splitThought(content || "");
-      const r = [reasoning, s.reasoning].filter(Boolean).join("\n");
-      if (r) html += `<details class="msg"><summary class="role">${esc(role)} · reasoning (${num(r.length)} chars)</summary><pre>${esc(r)}</pre></details>`;
-      html += bubble(role, s.content, extra);
-    };
-    if (el.dataset.sse === "1" || /^data:/.test(text)) {
-      const evs = sseEvents(text), m = sseMerged(evs);
-      show("assistant", m.content, m.reasoning, ` · merged from ${evs.length} SSE events`);
-    } else {
-      const r = JSON.parse(text);
-      if (Array.isArray(r.choices)) for (const c of r.choices) {
-        const msg = c.message || {};
-        show(msg.role || "assistant", msg.content ?? c.text ?? "", msg.reasoning || msg.reasoning_content, ` · choice ${c.index} · ${esc(c.finish_reason)}`);
-      } else if (typeof r.content === "string") show("assistant", r.content, "", "");
-      else html += `<p class="muted">Response is not a completion.</p>`;
-    }
-  } catch { html += `<p class="muted">Response body did not parse.</p>`; }
+  const r = readResponse(utf8.decode(resp), ct, proto || null);
+  html += `<p class="note">${esc(responseSummary(r))}</p>` + responseHtml(r);
   el.innerHTML = html;
 }
 

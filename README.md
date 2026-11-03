@@ -249,6 +249,8 @@ Offline, without dumpcap: `target/debug/collector -v files -w 1 -o /tmp/ts crate
 - Navigate Link › Flow › Slice or Exchange › Request Workunit › conversation, with packets, windows, bodies and events linked both ways.
 - Hashes show their multihash type and digest. BLAKE3 in the page checks a body against its name, a chunk's `merkle_root` against its packet hashes, and a Workunit record against its blob.
 - Stacked graphs per Link and Flow over windows: Workunit (`workunit`), Other HTTP (`http_other` + `framing`), Unexplained (`unexplained` + `gap`). These group buckets; they are not statuses.
+- Conversations and the **merged** tab of a streamed body read every Wire Protocol: OpenAI Chat and Completions (SSE), the Responses API (named SSE events), Anthropic Messages (SSE content blocks), Ollama native (NDJSON, embeddings as a count), and llama.cpp `/completion` on Ollama's runner loopback. A Workunit is read in the protocol the Collector tagged it with; an `http_other` body by its shape. Thinking goes in a folded reasoning block; tool calls and errors show inline. Like `.merged.json`, this is a derived view, not evidence.
+- Each Request Workunit shows its `protocol` as a pill: in the Workunit table, on the Workunit, its exchange, its conversation and its bodies.
 - Reads the JSONL tables and `bodies/`, not the Parquet index or the stored chunks.
 
 ## Tests
