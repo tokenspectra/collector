@@ -20,6 +20,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::coding::{self, Encoding};
 use crate::mh;
 use crate::output::BODIES;
 use crate::wire::framing::{Framer, Framing};
@@ -101,6 +102,10 @@ pub fn link_exchange(out: &Path, row: &Value) -> io::Result<Summary> {
         summary.links += 1;
         if role == "response" && row["bucket"] == "workunit" && ext == "sse" && is_openai(row) {
             let body = std::fs::read(bodies.join(hash))?;
+            // Stored as on the wire; a body that does not decode merges as
+            // no events, so it reads as incomplete.
+            let encoding = Encoding::of(m["content_encoding"].as_str());
+            let body = coding::decode_all(encoding, &body, coding::Limits::default()).unwrap_or_default();
             let mut merged = serde_json::to_vec_pretty(&merge_sse(&body))?;
             merged.push(b'\n');
             std::fs::write(dir.join(format!("{exchange}.response.merged.json")), merged)?;

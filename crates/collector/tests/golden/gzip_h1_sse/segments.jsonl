@@ -1,0 +1,10 @@
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","stream_off":0,"len":230,"window_start_ns":1800000000000000000,"index":3,"pkt_off":54,"ts_ns":1800000000020000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":0,"len":104,"window_start_ns":1800000000000000000,"index":5,"pkt_off":54,"ts_ns":1800000000040000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":104,"len":166,"window_start_ns":1800000000000000000,"index":6,"pkt_off":54,"ts_ns":1800000000060000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":270,"len":39,"window_start_ns":1800000000000000000,"index":7,"pkt_off":54,"ts_ns":1800000000080000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":309,"len":36,"window_start_ns":1800000000000000000,"index":8,"pkt_off":54,"ts_ns":1800000000100000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":345,"len":30,"window_start_ns":1800000000000000000,"index":9,"pkt_off":54,"ts_ns":1800000000120000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":375,"len":40,"window_start_ns":1800000000000000000,"index":10,"pkt_off":54,"ts_ns":1800000000140000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":415,"len":38,"window_start_ns":1800000000000000000,"index":11,"pkt_off":54,"ts_ns":1800000000160000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":453,"len":22,"window_start_ns":1800000000000000000,"index":12,"pkt_off":54,"ts_ns":1800000000180000000}
+{"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"resp","stream_off":475,"len":20,"window_start_ns":1800000000000000000,"index":13,"pkt_off":54,"ts_ns":1800000000200000000}

@@ -20,12 +20,14 @@
 //! bucket. Rows stay in capture order per Flow. The Decoder reports
 //! verdicts and buckets; it never assigns a status.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use serde::Serialize;
 
 use crate::assembler::{EventRecord, FlowSink, PacketRecord, SegmentRecord, SliceRecord};
+use crate::coding::{self, DecodeError, Decoding, Encoding};
 use crate::flow::{Dir, FlowId, FlowKind};
 use crate::http::{Head, HeadReply, Lab, Out, StartLine};
 use crate::http1::{parse_request_line, parse_status_line, H1};
@@ -50,6 +52,8 @@ pub struct DecoderConfig {
     pub keep_bodies: bool,
     /// The Wire Protocols requests are matched against (spec §5).
     pub protocols: Protocols,
+    /// How far a body under a content coding may decode (spec §6).
+    pub decode_limits: coding::Limits,
 }
 
 impl Default for DecoderConfig {
@@ -58,6 +62,7 @@ impl Default for DecoderConfig {
             max_body: 16 << 20,
             keep_bodies: true,
             protocols: Protocols::default(),
+            decode_limits: coding::Limits::default(),
         }
     }
 }
@@ -174,6 +179,13 @@ pub struct MessageRecord {
     /// BLAKE3 of the body as a multihash (`f1e20…`, spec §6); `null` when
     /// part of it was never captured.
     pub body_hash: Option<String>,
+    /// Under a content coding: the body's bytes once decoded, and their
+    /// BLAKE3, set only when decoding reached the end of the coded stream.
+    /// `null` with no content coding (`body_hash` covers the bytes read).
+    pub decoded_len: Option<u64>,
+    pub decoded_hash: Option<String>,
+    /// Why the coded body was not decoded to its end.
+    pub decode_error: Option<DecodeError>,
     /// The message reached its declared end.
     pub complete: bool,
 }
@@ -227,8 +239,12 @@ pub struct WorkunitRecord {
     /// The request body hash, for the cross-check with the API Tap.
     pub request_body_hash: Option<String>,
     pub request_body_len: u64,
+    /// BLAKE3 of the decoded request body, under a content coding.
+    pub request_decoded_hash: Option<String>,
     pub response_body_hash: Option<String>,
     pub response_body_len: u64,
+    /// BLAKE3 of the decoded response body, under a content coding.
+    pub response_decoded_hash: Option<String>,
     pub response_id: Option<String>,
     pub response_model: Option<String>,
     pub finish_reason: Vec<wire::FinishReason>,
@@ -585,7 +601,11 @@ impl Ledger {
 struct Body {
     len: u64,
     gap: u64,
+    /// Over the wire bytes: the body hash.
     hasher: blake3::Hasher,
+    /// Removes the content coding, when there is one. Everything below sees
+    /// the decoded bytes.
+    decoding: Option<Decoding>,
     /// Kept for JSON parsing, up to the configured limit.
     keep: bool,
     buf: Vec<u8>,
@@ -611,11 +631,12 @@ struct Pending {
 }
 
 impl Body {
-    fn new(keep: bool) -> Self {
+    fn new(keep: bool, decoding: Option<Decoding>) -> Self {
         Body {
             len: 0,
             gap: 0,
             hasher: blake3::Hasher::new(),
+            decoding,
             keep,
             buf: Vec::new(),
             over_limit: false,
@@ -624,9 +645,30 @@ impl Body {
         }
     }
 
-    fn push(&mut self, data: &[u8], ts: u64, max: usize) {
+    /// More wire bytes; returns them as the protocol reads them, decoded.
+    fn push<'d>(&mut self, data: &'d [u8], ts: u64, max: usize) -> Cow<'d, [u8]> {
         self.len += data.len() as u64;
         self.hasher.update(data);
+        let plain = match &mut self.decoding {
+            None => Cow::Borrowed(data),
+            Some(d) => Cow::Owned(d.push(data)),
+        };
+        self.take(&plain, ts, max);
+        plain
+    }
+
+    /// The body reached its declared end: the last decoded bytes.
+    fn end(&mut self, ts: u64, max: usize) -> Vec<u8> {
+        let Some(d) = &mut self.decoding else {
+            return Vec::new();
+        };
+        let tail = d.finish();
+        self.take(&tail, ts, max);
+        tail
+    }
+
+    /// Keeps decoded bytes for JSON parsing and replay.
+    fn take(&mut self, data: &[u8], ts: u64, max: usize) {
         if self.keep && !self.over_limit {
             if self.buf.len() + data.len() <= max {
                 self.buf.extend_from_slice(data);
@@ -652,6 +694,9 @@ impl Body {
     fn gap(&mut self, len: u64) {
         self.len += len;
         self.gap += len;
+        if let Some(d) = &mut self.decoding {
+            d.gap();
+        }
         if let Some(p) = &mut self.pending {
             p.pieces.push(Held::Gap(len));
         }
@@ -659,6 +704,21 @@ impl Body {
 
     fn hash(&self) -> Option<String> {
         (self.gap == 0).then(|| mh::name(&self.hasher.finalize()))
+    }
+
+    fn decoded_hash(&self) -> Option<String> {
+        self.decoding.as_ref().and_then(Decoding::hash)
+    }
+
+    /// Every byte the protocol reads is here: no content coding, or one
+    /// decoded to its end.
+    fn plain(&self) -> bool {
+        self.decoding.as_ref().is_none_or(Decoding::done)
+    }
+
+    /// Decoding has not stopped on bad bytes, a cap or an unknown coding.
+    fn decodable(&self) -> bool {
+        self.decoding.as_ref().is_none_or(|d| !d.failed())
     }
 }
 
@@ -695,15 +755,11 @@ impl Msg {
             body_len: self.body.len,
             body_gap_bytes: self.body.gap,
             body_hash: self.body.hash(),
+            decoded_len: self.body.decoding.as_ref().and_then(Decoding::decoded_len),
+            decoded_hash: self.body.decoded_hash(),
+            decode_error: self.body.decoding.as_ref().and_then(Decoding::error),
             complete: self.complete && self.body.gap == 0,
         }
-    }
-
-    /// No content coding, or `identity`.
-    fn identity(&self) -> bool {
-        self.head
-            .header_str("content-encoding")
-            .is_none_or(|c| c.is_empty() || c.eq_ignore_ascii_case("identity"))
     }
 }
 
@@ -745,8 +801,8 @@ impl Exchange {
         let Some(framing) = p.response_framing(endpoint, request, resp.head.media_type().as_deref()) else {
             return;
         };
-        // A content coding hides the frames.
-        let framer = (framing.is_stream() && resp.identity())
+        // A coding that cannot be decoded hides the frames.
+        let framer = (framing.is_stream() && resp.body.decodable())
             .then(|| Framer::new(framing))
             .flatten();
         let mut reader = Reader {
@@ -784,7 +840,8 @@ impl Exchange {
 /// A response on its way through its protocol's framer and decoder.
 struct Reader {
     framing: Framing,
-    /// `None` for a whole JSON body, or a stream under a content coding.
+    /// `None` for a whole JSON body, or a stream under a coding that
+    /// cannot be decoded.
     framer: Option<Framer>,
     decoder: Box<dyn ResponseDecoder>,
     /// SSE events, for the record.
@@ -795,7 +852,9 @@ struct Reader {
 
 impl Reader {
     fn push(&mut self, data: &[u8], ts: u64) {
-        let Some(f) = &mut self.framer else { return };
+        let Some(f) = self.framer.as_mut().filter(|_| !data.is_empty()) else {
+            return;
+        };
         let mut out = Vec::new();
         f.push(data, ts, &mut out);
         self.take(out);
@@ -1187,6 +1246,19 @@ impl FlowState {
                     "body over the size cap: hashed and counted, not read as JSON"
                 );
             }
+            if let Some(e @ (DecodeError::OverCap | DecodeError::OverRatio)) =
+                m.body.decoding.as_ref().and_then(Decoding::error)
+            {
+                tracing::warn!(
+                    flow = %self.id,
+                    exchange = ex.seq,
+                    dir = %crate::stats::dir_str(m.dir),
+                    body_bytes = m.body.len,
+                    decoded_bytes = m.body.decoding.as_ref().and_then(Decoding::decoded_len).unwrap_or(0),
+                    cap = e.as_str(),
+                    "decoded body over the cap: hashed and counted, decoding stopped"
+                );
+            }
             if m.body.stored {
                 let key = BodyKey {
                     flow: self.id.clone(),
@@ -1205,12 +1277,12 @@ impl FlowState {
         let framing = reader.as_ref().map(|r| r.framing);
         // A JSON response is read whole; a stream was read frame by frame.
         let streamed = reader.as_ref().is_some_and(|r| r.framer.is_some());
-        let read = streamed
+        let read = (streamed && resp.body.decodable())
             || (framing == Some(Framing::Json)
                 && resp.done
                 && resp.body.gap == 0
                 && !resp.body.over_limit
-                && resp.identity());
+                && resp.body.plain());
         let (response, events, lost) = match reader {
             Some(mut r) => {
                 if !streamed && read {
@@ -1247,8 +1319,10 @@ impl FlowState {
             response_content_type: resp.head.media_type(),
             request_body_hash: req.body.hash(),
             request_body_len: req.body.len,
+            request_decoded_hash: req.body.decoded_hash(),
             response_body_hash: resp.body.hash(),
             response_body_len: resp.body.len,
+            response_decoded_hash: resp.body.decoded_hash(),
             response_id: response.id,
             response_model: response.model,
             finish_reason: response.finish_reason,
@@ -1300,7 +1374,7 @@ fn classify(ex: &mut Exchange, grpc: bool, req_closed: bool, resp_closed: bool) 
         if !req.done {
             return (req_closed || ex.reset).then_some(Bucket::HttpOther);
         }
-        let readable = req.complete && req.body.gap == 0 && !req.body.over_limit && req.identity();
+        let readable = req.complete && req.body.gap == 0 && !req.body.over_limit && req.body.plain();
         // Body sniffing: the first claim that reads the body owns it.
         let owner = readable
             .then(|| {
@@ -1354,6 +1428,8 @@ impl Ctx<'_> {
     }
 
     fn new_msg(&self, start: u64, ts: u64, head: Head, keep: bool) -> Msg {
+        let encoding = Encoding::of(head.header_str("content-encoding").as_deref());
+        let decoding = Decoding::of(encoding, self.cfg.decode_limits);
         Msg {
             dir: self.dir,
             start,
@@ -1363,7 +1439,7 @@ impl Ctx<'_> {
             head,
             body: Body {
                 stored: self.cfg.keep_bodies,
-                ..Body::new(keep)
+                ..Body::new(keep, decoding)
             },
             done: false,
             complete: false,
@@ -1472,7 +1548,7 @@ impl Out for Ctx<'_> {
         let Some(m) = (if client { ex.req.as_mut() } else { ex.resp.as_mut() }) else {
             return;
         };
-        m.body.push(data, ts, self.cfg.max_body);
+        let plain = m.body.push(data, ts, self.cfg.max_body);
         m.last_ts = ts;
         if m.body.stored && !data.is_empty() {
             let key = BodyKey {
@@ -1484,7 +1560,7 @@ impl Out for Ctx<'_> {
         }
         if !client {
             if let Some(r) = &mut ex.reader {
-                r.push(data, ts);
+                r.push(&plain, ts);
             }
         }
     }
@@ -1517,14 +1593,20 @@ impl Out for Ctx<'_> {
         let Some(id) = self.f.exchange_of(self.dir, stream) else {
             return;
         };
+        let max = self.cfg.max_body;
+        let mut tail = Vec::new();
         if let Some(m) = self.msg(stream) {
             m.end = Some(end);
             m.last_ts = m.last_ts.max(ts);
             m.done = true;
             m.complete = complete;
+            if complete {
+                tail = m.body.end(ts, max);
+            }
         }
         if complete && !self.is_client() {
             if let Some(r) = self.f.exchanges.get_mut(&id).and_then(|e| e.reader.as_mut()) {
+                r.push(&tail, ts);
                 r.finish(ts);
             }
         }
