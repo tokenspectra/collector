@@ -11,3 +11,5 @@ The viewer is how people read a capture, so it must understand everything the Co
 - **New or renamed table, column, bucket, verdict or `extra` field:** show it where its table is shown (the Workunit, exchange, Flow and Slice pages, the stacked graphs' `CLASSES`).
 
 Check it with `collector files -o /tmp/x <fixture>.pcapng` on the protocol's fixtures, then open the folder in the viewer: the conversation and the body's **merged** tab must show the reply text, and the Workunit must show its protocol pill. Derived views (merged text, conversations) are never evidence; the raw bodies are.
+
+`node viewer/check.mjs` (run in CI) renders body slots with a stub DOM: captured values such as headers must reach `innerHTML` only through `esc`, and new rendering of Operator bytes gets a check there.

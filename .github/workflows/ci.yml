@@ -21,6 +21,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+      # The viewer has no build; this runs its body rendering in Node with a stub DOM.
+      - run: node viewer/check.mjs
 
   # Reports how much production code the PR touches: files under `src/`,
   # source extensions only, test files and inline `#[cfg(test)]` modules

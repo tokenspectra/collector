@@ -1033,14 +1033,20 @@ function codingNote(w) {
   const errs = ["request", "response"].map(d => h?.[d]?.decode_error && `${d} ${h[d].content_encoding}: ${h[d].decode_error}`).filter(Boolean);
   return errs.length ? ["content coding", pill("not decoded", "bad") + " " + esc(errs.join("; "))] : null;
 }
+// The codings a Content-Encoding header names, as the Collector reads it (coding::Encoding::of): lowercased,
+// `identity` and empty tokens dropped, so `identity` alone means no coding.
+function codingsOf(header) {
+  return String(header ?? "").split(",").map(c => c.trim().toLowerCase()).filter(c => c && c !== "identity");
+}
 // The message a body was first seen as, if it has a content coding.
 function codedMsg(h) {
-  const r = (D.bodyRefs.get(h) || []).find(r => r.http[r.dir]?.content_encoding);
+  const r = (D.bodyRefs.get(h) || []).find(r => codingsOf(r.http[r.dir]?.content_encoding).length);
   return r ? r.http[r.dir] : null;
 }
 const STREAM_FORMAT = { gzip: "gzip", "x-gzip": "gzip", deflate: "deflate", br: "brotli", zstd: "zstd" };
 async function decodeBody(wire, coding) {
-  let fmt = STREAM_FORMAT[coding.trim().toLowerCase()];
+  const codings = codingsOf(coding);
+  let fmt = codings.length === 1 && Object.hasOwn(STREAM_FORMAT, codings[0]) ? STREAM_FORMAT[codings[0]] : null;
   if (!fmt) throw new Error(`the viewer does not decode ${coding}`);
   // deflate: zlib as the RFC says, or raw deflate; the Collector tells them apart the same way.
   if (fmt === "deflate" && !(wire.length > 1 && (wire[0] & 15) === 8 && wire[0] >> 4 <= 7 && ((wire[0] << 8) | wire[1]) % 31 === 0)) fmt = "deflate-raw";
@@ -1297,7 +1303,7 @@ async function fillBody(slot) {
   if (plain || !msg) tabs.push([binary ? "hex" : msg ? "decoded" : "raw", `<pre class="body">${binary ? hexdump(bytesArr) : esc(text)}</pre>`]);
   if (msg) tabs.push([`wire (${msg.content_encoding})`, (error ? `<p class="muted">${esc(error)}</p>` : "") + `<pre class="body">${hexdump(wire)}</pre>`]);
   const id = "b" + Math.random().toString(36).slice(2);
-  slot.innerHTML = `<div class="tabs">${tabs.map(([n], i) => `<button class="${i ? "" : "on"}" data-act="tab" data-g="${id}" data-i="${i}">${n}</button>`).join("")}
+  slot.innerHTML = `<div class="tabs">${tabs.map(([n], i) => `<button class="${i ? "" : "on"}" data-act="tab" data-g="${id}" data-i="${i}">${esc(n)}</button>`).join("")}
       <span style="flex:1"></span><button data-act="verify" data-hash="${h}">Verify BLAKE3</button> <span class="vout"></span>
       ${plain && msg ? `<button data-act="verify-decoded" data-hash="${h}">Verify decoded BLAKE3</button> <span class="vout"></span>` : ""}</div>` +
     tabs.map(([, body], i) => `<div class="tabp" data-g="${id}" data-i="${i}" ${i ? "hidden" : ""}>${body}</div>`).join("") +
