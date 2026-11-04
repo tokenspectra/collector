@@ -39,7 +39,7 @@ fn s3(test: &str) -> Option<Arc<dyn ObjectStore>> {
     };
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let url = format!("{}/{test}-{nanos}", base.trim_end_matches('/'));
-    Some(collector::store::open(&url).expect("S3 store"))
+    Some(collector::store::open(&url, None).expect("S3 store"))
 }
 
 fn rt() -> tokio::runtime::Runtime {

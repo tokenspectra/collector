@@ -42,10 +42,16 @@ struct Cli {
     #[arg(long, global = true)]
     metrics_addr: Option<String>,
     /// Object store for L0 chunks, packs and Parquet index tables: a
-    /// directory, or s3://bucket[/prefix] with credentials and endpoint
-    /// from the AWS_* environment variables [default: <out>/store].
+    /// directory, or s3://bucket[/prefix] with its endpoint from
+    /// --s3-endpoint or AWS_ENDPOINT (required) and credentials from the
+    /// AWS_* environment variables [default: <out>/store].
     #[arg(long, global = true)]
     store: Option<String>,
+    /// With an s3:// store: its endpoint, e.g. https://s3.eu-west-1.amazonaws.com
+    /// or http://127.0.0.1:9000; overrides AWS_ENDPOINT. One of the two is
+    /// required: there is no default endpoint.
+    #[arg(long, global = true)]
+    s3_endpoint: Option<String>,
     /// The control plane's ingest, e.g. http://127.0.0.1:8090/ingest/windows:
     /// each window's manifest is POSTed there as the window is sealed.
     /// Without it, manifests stay in <out>/manifests.jsonl for `collector ship`.
@@ -209,6 +215,16 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut dumpcap_pid = None;
     let ingest = cli.ingest.as_deref().map(Ingest::parse).transpose()?;
+    // An s3:// store without a named endpoint refuses to start, before
+    // capture begins or anything is written.
+    let s3_endpoint = match cli.store.as_deref() {
+        Some(s) if s.starts_with("s3://") => Some(collector::store::s3_endpoint(
+            cli.s3_endpoint.as_deref(),
+            std::env::var("AWS_ENDPOINT").ok().as_deref(),
+        )?),
+        _ => None,
+    };
+    let s3_endpoint = s3_endpoint.as_deref();
     let (mut source, window_s, out): (Box<dyn PacketSource>, u32, PathBuf) = match cli.cmd {
         Cmd::Files { window_s, out, files } => (Box::new(FileSource::new(files)), window_s, out),
         Cmd::Views { out } => {
@@ -276,7 +292,7 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .store
         .clone()
         .unwrap_or_else(|| out.join("store").display().to_string());
-    let object_store = collector::store::open(&store_url)?;
+    let object_store = collector::store::open(&store_url, s3_endpoint)?;
     let registry = Registry::new();
     if let Some(addr) = &cli.metrics_addr {
         let bound = serve_metrics(addr.as_str(), registry.clone())
