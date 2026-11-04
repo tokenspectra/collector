@@ -353,3 +353,70 @@ fn the_cli_ships_to_the_ingest() {
     let (again, accepted, duplicates, conflicts) = ingest.snapshot();
     assert_eq!((again, accepted, duplicates, conflicts), (held, n, n, 0));
 }
+
+/// The CLI with an `s3://` store and the AWS variables that could name an
+/// endpoint cleared, so a test sets exactly what it means to.
+fn cli_s3(out: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_collector"));
+    for var in ["AWS_ENDPOINT", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"] {
+        cmd.env_remove(var);
+    }
+    cmd.env("AWS_ACCESS_KEY_ID", "test")
+        .env("AWS_SECRET_ACCESS_KEY", "test")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_ALLOW_HTTP", "true")
+        .args(["--store", "s3://evidence/site", "--upload-wait-s", "0"])
+        .args(["files", "-o"])
+        .arg(out)
+        .args(fixture_paths(&["openai_h1_json.pcapng"]));
+    cmd
+}
+
+/// An `s3://` store with no endpoint named refuses to start (TS-38): no
+/// fallback to AWS's default endpoint, and nothing is written. The SDK's
+/// own `AWS_ENDPOINT_URL_S3` does not count as naming one.
+#[test]
+fn an_s3_store_without_an_endpoint_refuses_to_start() {
+    for sdk_only in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut cmd = cli_s3(&out);
+        if sdk_only {
+            cmd.env("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:1");
+        }
+        let run = cmd.output().unwrap();
+        let log = String::from_utf8_lossy(&run.stdout);
+        assert!(!run.status.success(), "{log}");
+        assert!(log.contains("needs its endpoint"), "{log}");
+        assert!(!out.exists(), "nothing written before the refusal");
+    }
+}
+
+/// With an endpoint named, the run starts and its log names the endpoint.
+/// It is unreachable here, so the objects stay in the spool.
+#[test]
+fn the_s3_endpoint_is_named_in_the_startup_log() {
+    for (flag, env) in [
+        (Some("http://127.0.0.1:1"), None),
+        (None, Some("http://127.0.0.1:2")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = cli_s3(&dir.path().join("out"));
+        if let Some(f) = flag {
+            cmd.args(["--s3-endpoint", f]);
+        }
+        if let Some(e) = env {
+            cmd.env("AWS_ENDPOINT", e);
+        }
+        let run = cmd.output().unwrap();
+        let log = String::from_utf8_lossy(&run.stdout);
+        assert!(run.status.success(), "{log}");
+        let named = flag.or(env).unwrap();
+        assert!(
+            log.lines()
+                .any(|l| l.contains("object store: S3") && l.contains(&format!("endpoint=\"{named}\""))),
+            "{log}"
+        );
+        assert!(dir.path().join("out/spool").exists());
+    }
+}

@@ -39,13 +39,14 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::prefix::PrefixStore;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, RetryConfig};
 use serde::Serialize;
 use serde_json::Value;
+use tracing::info;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use crate::capture::{CaptureConfig, Class};
@@ -75,6 +76,8 @@ pub enum StoreError {
     Url(String),
     #[error("upload: {0}")]
     Upload(String),
+    #[error("{0}")]
+    Endpoint(String),
     /// [`crate::spool::Spool::stop`] with the spool full.
     #[error("stopped with the spool full ({0} bytes) and the store unreachable; windows not sealed are still in the input, to run again")]
     Stopped(u64),
@@ -831,15 +834,21 @@ pub(crate) fn block_on<F: Future>(f: F) -> F::Output {
 /// The store `--store` names: `s3://bucket[/prefix]`, or a local directory,
 /// created if missing ([`local`]).
 ///
-/// S3 settings come from the environment, as for the AWS CLI:
+/// The endpoint must be given: `endpoint` (`--s3-endpoint`), else
+/// `AWS_ENDPOINT` ([`s3_endpoint`]). Without either an `s3://` store is
+/// refused; the Collector never falls back to AWS's default endpoint, so
+/// evidence cannot leave for a store nobody named. The endpoint chosen is
+/// logged, and pinned: no other `AWS_*` variable can move it.
+///
+/// Other S3 settings come from the environment, as for the AWS CLI:
 /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
-/// `AWS_REGION`, and for an S3-compatible store `AWS_ENDPOINT` (with
-/// `AWS_ALLOW_HTTP=true` for plain `http://`). The store must honour
-/// `If-None-Match: *` on PutObject, or objects could be overwritten.
+/// `AWS_REGION`, and `AWS_ALLOW_HTTP=true` for a plain `http://` endpoint.
+/// The store must honour `If-None-Match: *` on PutObject, or objects could
+/// be overwritten.
 ///
 /// A request gives up after [`REQUEST_RETRY`]: the uploader retries on its
 /// own schedule, and a run's deadline should not wait on the client's.
-pub fn open(store: &str) -> Result<Arc<dyn ObjectStore>, StoreError> {
+pub fn open(store: &str, endpoint: Option<&str>) -> Result<Arc<dyn ObjectStore>, StoreError> {
     let Some(rest) = store.strip_prefix("s3://") else {
         std::fs::create_dir_all(store)?;
         return Ok(Arc::new(local(Path::new(store))?));
@@ -848,6 +857,7 @@ pub fn open(store: &str) -> Result<Arc<dyn ObjectStore>, StoreError> {
     if bucket.is_empty() {
         return Err(StoreError::Url(store.to_string()));
     }
+    let endpoint = s3_endpoint(endpoint, std::env::var("AWS_ENDPOINT").ok().as_deref())?;
     let retry = RetryConfig {
         max_retries: 3,
         retry_timeout: REQUEST_RETRY,
@@ -855,14 +865,40 @@ pub fn open(store: &str) -> Result<Arc<dyn ObjectStore>, StoreError> {
     };
     let s3 = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
+        // Both keys: `AWS_ENDPOINT_URL_S3` would otherwise win over it.
+        .with_config(AmazonS3ConfigKey::Endpoint, &endpoint)
+        .with_config(AmazonS3ConfigKey::S3Endpoint, &endpoint)
         .with_retry(retry)
         .build()?;
     let prefix = ObjectPath::parse(prefix).map_err(|_| StoreError::Url(store.to_string()))?;
+    info!(store, endpoint, "object store: S3");
     Ok(if prefix.as_ref().is_empty() {
         Arc::new(s3)
     } else {
         Arc::new(PrefixStore::new(s3, prefix))
     })
+}
+
+/// The S3 endpoint to use: `flag` (`--s3-endpoint`), else `env`
+/// (`AWS_ENDPOINT`). Fails when neither is given, or the one given is not
+/// an `http://` or `https://` URL with a host: there is no default.
+pub fn s3_endpoint(flag: Option<&str>, env: Option<&str>) -> Result<String, StoreError> {
+    let given = flag.or(env).map(str::trim).filter(|e| !e.is_empty());
+    let Some(endpoint) = given else {
+        return Err(StoreError::Endpoint(
+            "an s3:// store needs its endpoint: --s3-endpoint or AWS_ENDPOINT; there is no default".into(),
+        ));
+    };
+    let host = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+    match host {
+        Some(h) if !h.is_empty() && !endpoint.contains(char::is_whitespace) => Ok(endpoint.to_string()),
+        _ => Err(StoreError::Endpoint(format!(
+            "S3 endpoint {endpoint:?}: expected http://host[:port] or https://host[:port]"
+        ))),
+    }
 }
 
 /// How long one request to a remote store keeps retrying.
@@ -1130,6 +1166,34 @@ mod tests {
         assert_eq!(safe(".."), "_");
         assert_eq!(safe(""), "_");
         assert_eq!(date_path(1_793_619_416_000_000_000), "2026/11/02");
+    }
+
+    /// An s3:// store has no default endpoint: one must be named.
+    #[test]
+    fn the_s3_endpoint_is_required() {
+        for (flag, env) in [(None, None), (Some(""), None), (None, Some("  "))] {
+            let err = s3_endpoint(flag, env).unwrap_err().to_string();
+            assert!(err.contains("needs its endpoint"), "{err}");
+        }
+        for bad in [
+            "s3.amazonaws.com",
+            "ftp://x",
+            "https://",
+            "http:///bucket",
+            "https://a b",
+        ] {
+            assert!(s3_endpoint(Some(bad), None).is_err(), "{bad}");
+        }
+        let e = |flag, env| s3_endpoint(flag, env).unwrap();
+        assert_eq!(e(Some("http://127.0.0.1:7070"), None), "http://127.0.0.1:7070");
+        assert_eq!(
+            e(None, Some("https://s3.eu-west-1.amazonaws.com")),
+            "https://s3.eu-west-1.amazonaws.com"
+        );
+        assert_eq!(e(Some("http://flag:1"), Some("http://env:2")), "http://flag:1");
+        // `open` checks it before building any client.
+        let err = open("s3://bucket", Some("nope")).err().unwrap().to_string();
+        assert!(err.contains("expected http://host"), "{err}");
     }
 
     #[test]

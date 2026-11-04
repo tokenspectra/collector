@@ -211,7 +211,7 @@ pub fn run_stored(
     reg: Option<std::sync::Arc<Registry>>,
 ) {
     // The store the CLI writes through, fsync included.
-    let store = collector::store::open(&out.join("store").display().to_string()).expect("local store");
+    let store = collector::store::open(&out.join("store").display().to_string(), None).expect("local store");
     run_into(source, out, store, cfg, store_cfg, reg).expect("store");
 }
 

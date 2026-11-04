@@ -54,7 +54,7 @@ fn s3_url(test: &str) -> Option<String> {
 
 /// A fresh, empty store under its own prefix.
 fn s3(test: &str) -> Option<Arc<dyn ObjectStore>> {
-    Some(collector::store::open(&s3_url(test)?).expect("S3 store"))
+    Some(collector::store::open(&s3_url(test)?, None).expect("S3 store"))
 }
 
 fn rt() -> tokio::runtime::Runtime {
@@ -302,7 +302,7 @@ impl Proxy {
 /// start with) and directly, or `None` when no S3 store is configured.
 fn s3_behind_proxy(test: &str) -> Option<(Proxy, Store, Store)> {
     let url = s3_url(test)?;
-    let direct = collector::store::open(&url).expect("S3 store");
+    let direct = collector::store::open(&url, None).expect("S3 store");
     let (bucket, prefix) = url["s3://".len()..].split_once('/').unwrap();
     let endpoint = std::env::var("AWS_ENDPOINT").expect("the proxy needs AWS_ENDPOINT");
     let proxy = Proxy::start(&endpoint);
