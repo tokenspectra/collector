@@ -751,7 +751,8 @@ function vWindow(l, ws) {
   let out = `<h2>Window ${wsLabel(ws)} on ${esc(l)}</h2><div class="sub">${esc(iso(ws))} · window_start_ns ${esc(ws)}</div>`;
   if (c) {
     out += `<h3>L0 chunk</h3>` + kv([
-      ["key", `<span class="mono">store/${esc(c.key)}</span>`],
+      ["key", `<span class="mono">store/${esc(c.key)}</span>` +
+        (c.parts > 1 ? ` <span class="muted">in ${num(c.parts)} parts, <span class="mono">-part0</span> to <span class="mono">-part${esc(c.parts - 1)}</span>, joined in order</span>` : "")],
       ["chunk_hash", hash(c.chunk_hash, true)],
       ["merkle_root", hash(c.merkle_root, true) + ` <button data-act="merkle" data-lw="${esc(l + "@" + ws)}">Recompute from packets</button> <span id="merkle-out"></span>`],
       ["packets", `${num(c.packets)} (${num(c.truncated_packets)} truncated)`],

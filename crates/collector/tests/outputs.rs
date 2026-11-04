@@ -119,6 +119,7 @@ fn manifests_name_every_object_and_sum_to_the_tables() {
                 collector::store::fetch_chunk(
                     &object_store::local::LocalFileSystem::new_with_prefix(&store).unwrap(),
                     key,
+                    1,
                 )
                 .unwrap_or_else(|e| panic!("{case}: {key}: {e}"));
                 chunks.push(c.clone());
@@ -351,4 +352,120 @@ fn the_cli_ships_to_the_ingest() {
     assert_eq!(pending_lines(out.path()).unwrap(), 0);
     let (again, accepted, duplicates, conflicts) = ingest.snapshot();
     assert_eq!((again, accepted, duplicates, conflicts), (held, n, n, 0));
+}
+
+/// The CLI with an `s3://` store and the AWS variables that could name an
+/// endpoint cleared, so a test sets exactly what it means to.
+fn cli_s3(out: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_collector"));
+    for var in ["AWS_ENDPOINT", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"] {
+        cmd.env_remove(var);
+    }
+    cmd.env("AWS_ACCESS_KEY_ID", "test")
+        .env("AWS_SECRET_ACCESS_KEY", "test")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_ALLOW_HTTP", "true")
+        .args(["--store", "s3://evidence/site", "files", "-o"])
+        .arg(out)
+        .args(fixture_paths(&["openai_h1_json.pcapng"]));
+    cmd
+}
+
+/// An S3 endpoint that accepts every request with 200 and records each
+/// request line.
+fn mock_s3() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut w = conn;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut len = 0;
+                    loop {
+                        let mut h = String::new();
+                        if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            if k.eq_ignore_ascii_case("content-length") {
+                                len = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    let mut body = vec![0; len];
+                    if r.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    log.lock().unwrap().push(line.trim_end().to_string());
+                    let ok = "HTTP/1.1 200 OK\r\nETag: \"0\"\r\nContent-Length: 0\r\n\r\n";
+                    if w.write_all(ok.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (url, seen)
+}
+
+/// An `s3://` store with no endpoint named refuses to start (TS-38): no
+/// fallback to AWS's default endpoint, and nothing is written. The SDK's
+/// own `AWS_ENDPOINT_URL_S3` does not count as naming one.
+#[test]
+fn an_s3_store_without_an_endpoint_refuses_to_start() {
+    for sdk_only in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut cmd = cli_s3(&out);
+        if sdk_only {
+            cmd.env("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:1");
+        }
+        let run = cmd.output().unwrap();
+        let log = String::from_utf8_lossy(&run.stdout);
+        assert!(!run.status.success(), "{log}");
+        assert!(log.contains("needs its endpoint"), "{log}");
+        assert!(!out.exists(), "nothing written before the refusal");
+    }
+}
+
+/// The endpoint named, by the flag or by `AWS_ENDPOINT`, is the one in the
+/// startup log and the one written to, whatever `AWS_ENDPOINT_URL_S3` says.
+#[test]
+fn the_named_s3_endpoint_is_logged_and_used() {
+    for by_flag in [true, false] {
+        let (url, seen) = mock_s3();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = cli_s3(&dir.path().join("out"));
+        cmd.env("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:1");
+        if by_flag {
+            cmd.args(["--s3-endpoint", &url]);
+        } else {
+            cmd.env("AWS_ENDPOINT", &url);
+        }
+        let run = cmd.output().unwrap();
+        let log = String::from_utf8_lossy(&run.stdout);
+        assert!(run.status.success(), "{log}");
+        assert!(
+            log.lines()
+                .any(|l| l.contains("object store: S3") && l.contains(&format!("endpoint=\"{url}\""))),
+            "{log}"
+        );
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "nothing reached the named endpoint");
+        assert!(
+            seen.iter().all(|l| l.starts_with("PUT /evidence/site/")),
+            "{seen:?}"
+        );
+    }
 }

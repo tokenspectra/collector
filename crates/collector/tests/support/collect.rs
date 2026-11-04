@@ -13,7 +13,7 @@ use collector::observe::StatsSink;
 use collector::output::{JsonlSink, BODIES, TABLES};
 use collector::run::run;
 use collector::stats::{Registry, Snapshot};
-use collector::store::{StoreConfig, StoreSink};
+use collector::store::{StoreConfig, StoreError, StoreSink, StoreSummary};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource};
 
 pub const WINDOW_NS: u64 = 1_000_000_000;
@@ -210,10 +210,21 @@ pub fn run_stored(
     store_cfg: StoreConfig,
     reg: Option<std::sync::Arc<Registry>>,
 ) {
-    let store_dir = out.join("store");
-    std::fs::create_dir_all(&store_dir).expect("store dir");
     // The store the CLI writes through, fsync included.
-    let store = std::sync::Arc::new(collector::store::local(&store_dir).expect("local store"));
+    let store = collector::store::open(&out.join("store").display().to_string(), None).expect("local store");
+    run_into(source, out, store, cfg, store_cfg, reg).expect("store");
+}
+
+/// Runs `source` with its tables in `out` and its objects in `store`;
+/// returns what the store reports when it is finished.
+pub fn run_into(
+    source: &mut dyn PacketSource,
+    out: &Path,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    cfg: DecoderConfig,
+    store_cfg: StoreConfig,
+    reg: Option<std::sync::Arc<Registry>>,
+) -> Result<StoreSummary, StoreError> {
     let mut sink = JsonlSink::create(out).expect("sink");
     let mut stored = StoreSink::new(&mut sink, store, store_cfg, reg.clone());
     match reg {
@@ -225,8 +236,9 @@ pub fn run_stored(
             run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut stored).expect("run");
         }
     }
-    stored.finish().expect("store");
+    let summary = stored.finish();
     sink.finish().expect("finish");
+    summary
 }
 
 /// Runs `source` into a fresh output directory, bodies, views and the

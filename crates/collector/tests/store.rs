@@ -113,7 +113,7 @@ fn every_body_record_and_chunk_is_fetched_by_hash_and_verifies() {
         assert!(!chunks.is_empty(), "{case}");
         let mut seen = 0;
         for c in &chunks {
-            let bytes = fetch_chunk(&store, c["key"].as_str().unwrap()).unwrap();
+            let bytes = fetch_chunk(&store, c["key"].as_str().unwrap(), 1).unwrap();
             assert_eq!(mh::of(&bytes), c["chunk_hash"], "{case}");
             let mine: Vec<&Value> = packets
                 .iter()
@@ -288,6 +288,53 @@ fn an_object_with_other_bytes_is_never_overwritten() {
     );
 }
 
+/// A chunk over `part_bytes` is stored as `-partN` objects that join to
+/// the same compressed chunk; nothing else changes (spec §8).
+#[test]
+fn big_chunks_are_split_into_parts() {
+    let names = ["anthropic_h1_json.pcapng"];
+    let (whole, split) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    run_case(&names, whole.path(), StoreConfig::new(WINDOW_NS));
+    let cfg = StoreConfig {
+        part_bytes: 256,
+        ..StoreConfig::new(WINDOW_NS)
+    };
+    run_case(&names, split.path(), cfg);
+
+    let (a, b) = (rows(whole.path(), "chunks"), rows(split.path(), "chunks"));
+    assert_eq!(a.len(), b.len());
+    let (objects, stored) = (
+        tree(&whole.path().join("store")),
+        tree(&split.path().join("store")),
+    );
+    for (a, b) in a.iter().zip(&b) {
+        let (key, len) = (a["key"].as_str().unwrap(), a["stored_len"].as_u64().unwrap());
+        let parts = len.div_ceil(256);
+        assert!(parts > 1, "the fixture's chunk is bigger than a part");
+        assert_eq!(a["parts"], 1);
+        assert_eq!(b["parts"], parts);
+        let mut b = b.clone();
+        b["parts"] = 1.into();
+        assert_eq!(a, &b, "only the part count differs");
+
+        assert!(!stored.contains_key(key));
+        let joined: Vec<u8> = (0..parts)
+            .flat_map(|i| stored[&format!("{key}-part{i}")].clone())
+            .collect();
+        assert_eq!(joined, objects[key]);
+        let bytes = fetch_chunk(&local(split.path()), key, parts).unwrap();
+        assert_eq!(mh::of(&bytes), a["chunk_hash"]);
+    }
+    // Packs and index files are the same objects, but for the chunk rows.
+    let rest = |t: &BTreeMap<String, Vec<u8>>| {
+        t.iter()
+            .filter(|(k, _)| !k.starts_with("raw/") && !k.ends_with("chunks.parquet"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(rest(&objects), rest(&stored));
+}
+
 #[test]
 fn capture_rate_truncates_workunits_it_does_not_keep() {
     let names = ["openai_h1_sse.pcapng", "openai_h1_json.pcapng"];
@@ -331,7 +378,7 @@ fn capture_rate_truncates_workunits_it_does_not_keep() {
         .filter(|r| r["bucket"] == "workunit")
         .map(|r| r["flow"].as_str().unwrap().to_string())
         .collect();
-    let bytes = fetch_chunk(&local(cut.path()), cc["key"].as_str().unwrap()).unwrap();
+    let bytes = fetch_chunk(&local(cut.path()), cc["key"].as_str().unwrap(), 1).unwrap();
     let packets = rows(cut.path(), "packets");
     let mut truncated = 0;
     for ((data, orig_len), p) in pcapng_packets(&bytes).iter().zip(&packets) {
@@ -385,7 +432,7 @@ fn anomaly_packets_are_kept_whole() {
     let packets = rows(dir.path(), "packets");
     let mut stored = BTreeMap::new();
     for c in rows(dir.path(), "chunks") {
-        let bytes = fetch_chunk(&local(dir.path()), c["key"].as_str().unwrap()).unwrap();
+        let bytes = fetch_chunk(&local(dir.path()), c["key"].as_str().unwrap(), 1).unwrap();
         let in_chunk = packets
             .iter()
             .filter(|p| p["window_start_ns"] == c["window_start_ns"] && p["link"] == c["link"]);
