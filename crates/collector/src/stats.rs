@@ -212,6 +212,16 @@ pub struct Registry {
     pub(crate) store_objects: Labeled<3>,
     pub(crate) store_bytes: Labeled<3>,
     pub(crate) store_existing: AtomicU64,
+    /// Objects the uploader put to the remote store, their bytes, and those
+    /// it found already there (spec §8, the spool).
+    pub(crate) uploads: AtomicU64,
+    pub(crate) upload_bytes: AtomicU64,
+    pub(crate) uploads_existing: AtomicU64,
+    /// Upload attempts that failed and are retried.
+    pub(crate) upload_retries: AtomicU64,
+    /// Objects and bytes in the spool, waiting to be uploaded.
+    spool_objects: AtomicU64,
+    spool_bytes: AtomicU64,
     /// `f64` bits.
     last_window_lag: AtomicU64,
     last_window: Mutex<Option<WindowStats>>,
@@ -249,6 +259,12 @@ impl Default for Registry {
             store_objects: zeros(),
             store_bytes: zeros(),
             store_existing: AtomicU64::new(0),
+            uploads: AtomicU64::new(0),
+            upload_bytes: AtomicU64::new(0),
+            uploads_existing: AtomicU64::new(0),
+            upload_retries: AtomicU64::new(0),
+            spool_objects: AtomicU64::new(0),
+            spool_bytes: AtomicU64::new(0),
             last_window_lag: AtomicU64::new(0f64.to_bits()),
             last_window: Mutex::new(None),
         }
@@ -271,6 +287,11 @@ impl Registry {
     pub(crate) fn add_workunit(&self, protocol: &'static str, outcome: Outcome, class: HttpClass) {
         let mut w = self.workunits.lock().unwrap_or_else(|e| e.into_inner());
         w.entry(protocol).or_insert([[0; 4]; 3])[outcome.idx()][class.idx()] += 1;
+    }
+
+    pub(crate) fn set_spool(&self, objects: u64, bytes: u64) {
+        self.spool_objects.store(objects, Ordering::Relaxed);
+        self.spool_bytes.store(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn set_window(&self, w: WindowStats, lag_s: f64) {
@@ -308,6 +329,12 @@ impl Registry {
             store_objects: load(&self.store_objects),
             store_bytes: load(&self.store_bytes),
             store_existing: self.store_existing.load(Ordering::Relaxed),
+            uploads: self.uploads.load(Ordering::Relaxed),
+            upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
+            uploads_existing: self.uploads_existing.load(Ordering::Relaxed),
+            upload_retries: self.upload_retries.load(Ordering::Relaxed),
+            spool_objects: self.spool_objects.load(Ordering::Relaxed),
+            spool_bytes: self.spool_bytes.load(Ordering::Relaxed),
             last_window_lag_s: f64::from_bits(self.last_window_lag.load(Ordering::Relaxed)),
             last_window: self.last_window.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
@@ -354,6 +381,16 @@ pub struct Snapshot {
     pub store_bytes: [u64; 3],
     /// Puts that found the same object already there.
     pub store_existing: u64,
+    /// The uploader's puts to the remote store, their bytes, and those that
+    /// found the same object already there.
+    pub uploads: u64,
+    pub upload_bytes: u64,
+    pub uploads_existing: u64,
+    /// Upload attempts that failed and are retried.
+    pub upload_retries: u64,
+    /// Objects and bytes in the spool, waiting to be uploaded.
+    pub spool_objects: u64,
+    pub spool_bytes: u64,
     pub last_window_lag_s: f64,
     pub last_window: Option<WindowStats>,
 }
@@ -605,6 +642,21 @@ pub fn render_table(s: &Snapshot) -> String {
         "store objects already there",
         s.store_existing.to_string(),
     );
+    if s.uploads + s.uploads_existing + s.upload_retries + s.spool_objects > 0 {
+        row(
+            &mut t,
+            "uploaded",
+            format!(
+                "{} objects ({} bytes), {} already there, {} retries",
+                s.uploads, s.upload_bytes, s.uploads_existing, s.upload_retries
+            ),
+        );
+        row(
+            &mut t,
+            "spooled",
+            format!("{} objects ({} bytes)", s.spool_objects, s.spool_bytes),
+        );
+    }
     match &s.last_window {
         None => {
             let _ = writeln!(t, "last window: none closed yet");
@@ -745,6 +797,26 @@ pub fn render_prometheus(s: &Snapshot) -> String {
             "Object puts that found the same bytes already there.",
             s.store_existing,
         ),
+        (
+            "uploads_total",
+            "Spooled objects the uploader put to the remote store.",
+            s.uploads,
+        ),
+        (
+            "upload_bytes_total",
+            "Bytes the uploader put to the remote store.",
+            s.upload_bytes,
+        ),
+        (
+            "uploads_existing_total",
+            "Uploads that found the same bytes already in the remote store.",
+            s.uploads_existing,
+        ),
+        (
+            "upload_retries_total",
+            "Upload attempts that failed and are retried.",
+            s.upload_retries,
+        ),
     ] {
         p.scalar(name, "counter", help, v);
     }
@@ -774,6 +846,18 @@ pub fn render_prometheus(s: &Snapshot) -> String {
             p.sample(name, &format!("kind=\"{k}\""), vals[i]);
         }
     }
+    p.scalar(
+        "spool_objects",
+        "gauge",
+        "Objects in the spool, waiting to be uploaded.",
+        s.spool_objects,
+    );
+    p.scalar(
+        "spool_bytes",
+        "gauge",
+        "Bytes in the spool, waiting to be uploaded.",
+        s.spool_bytes,
+    );
     p.scalar(
         "last_window_lag_seconds",
         "gauge",
@@ -901,9 +985,14 @@ mod tests {
         let samples = text.lines().filter(|l| !l.starts_with('#')).count();
         assert!(text.contains("ts_collector_capture_packets_total{cut=\"truncated\"} 0\n"));
         assert!(text.contains("ts_collector_store_objects_total{kind=\"chunk\"} 0\n"));
+        assert!(text.contains("ts_collector_spool_bytes 0\n"));
         // + capture and store: 3 scalars, packets by cut, objects and bytes by kind.
+        // + uploads: 4 counters and 2 spool gauges.
         // Workunits: outcome by HTTP class, for every built-in protocol.
         let workunits = 3 * 4 * crate::wire::BUILTIN.len();
-        assert_eq!(samples, 3 * 7 + 2 + 5 * 2 + workunits + 8 + 1 + 3 + 2 + 2 * 3);
+        assert_eq!(
+            samples,
+            3 * 7 + 2 + 5 * 2 + workunits + 8 + 1 + 3 + 2 + 2 * 3 + 4 + 2
+        );
     }
 }

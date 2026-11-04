@@ -13,75 +13,73 @@ use collector::observe::{log_summary, StatsSink};
 use collector::output::JsonlSink;
 use collector::run::run;
 use collector::ship::{self, Ingest, Shipper};
+use collector::spool::{Spool, Uploaded, Uploader};
 use collector::stats::{serve_metrics, Registry};
 use collector::store::{StoreConfig, StoreSink};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource, RingConfig, RingSource};
 
+// Each option's help is one line; docs/spec.md ("Command line") has the
+// details. README.md shows this help, and tests/readme.rs keeps it in step.
 #[derive(Parser)]
-#[command(about = "TokenSpectra Collector")]
+#[command(about = "TokenSpectra Collector", next_help_heading = "Global options")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-    /// Don't keep HTTP bodies under <out>/bodies/; hashes and tables stay the same.
+    /// Don't keep HTTP bodies (hashes and tables stay the same)
     #[arg(long, global = true)]
     no_bodies: bool,
-    /// More log detail: -v for DEBUG (one line per Request Workunit and
-    /// Flow), -vv for TRACE (reassembly).
+    /// More log detail: -v DEBUG, -vv TRACE
     #[arg(short, long, action = ArgAction::Count, global = true)]
     verbose: u8,
-    /// Less: -q for WARN, -qq for ERROR only.
+    /// Less log detail: -q WARN, -qq ERROR
     #[arg(short, long, action = ArgAction::Count, global = true, conflicts_with = "verbose")]
     quiet: u8,
-    /// Log level; overrides -v/-q. RUST_LOG, when set, overrides both.
+    /// Log level; overrides -v/-q (RUST_LOG overrides it)
     #[arg(long, global = true, value_enum)]
     log_level: Option<Level>,
-    /// Log line format on stdout.
+    /// Log line format on stdout
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
-    /// Serve Prometheus metrics at http://<addr>/metrics, e.g. 127.0.0.1:9464.
+    /// Serve Prometheus metrics here, e.g. 127.0.0.1:9464
     #[arg(long, global = true)]
     metrics_addr: Option<String>,
-    /// Object store for L0 chunks, packs and Parquet index tables: a
-    /// directory, or s3://bucket[/prefix] with its endpoint from
-    /// --s3-endpoint or AWS_ENDPOINT (required) and credentials from the
-    /// AWS_* environment variables [default: <out>/store].
+    /// Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
     #[arg(long, global = true)]
     store: Option<String>,
-    /// With an s3:// store: its endpoint, e.g. https://s3.eu-west-1.amazonaws.com
-    /// or http://127.0.0.1:9000; overrides AWS_ENDPOINT. One of the two is
-    /// required: there is no default endpoint.
+    /// S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
     #[arg(long, global = true)]
     s3_endpoint: Option<String>,
-    /// The control plane's ingest, e.g. http://127.0.0.1:8090/ingest/windows:
-    /// each window's manifest is POSTed there as the window is sealed.
-    /// Without it, manifests stay in <out>/manifests.jsonl for `collector ship`.
+    /// Local spool for s3:// uploads [default: <out>/spool]
+    #[arg(long, global = true)]
+    spool: Option<PathBuf>,
+    /// Spool cap in MiB; a full spool holds the run back
+    #[arg(long, global = true, default_value_t = 4096)]
+    spool_max_mib: u64,
+    /// Seconds to finish uploads at the end of a run
+    #[arg(long, global = true, default_value_t = 30)]
+    upload_wait_s: u64,
+    /// Control-plane ingest URL each window's manifest is POSTed to
     #[arg(long, global = true)]
     ingest: Option<String>,
-    /// Seconds the shipper has, in all, to ship what is left at the end of
-    /// a run, including a request in flight (lookup, connect, upload or
-    /// response); lines it does not get to stay in the log.
+    /// Seconds to finish shipping manifests at the end of a run
     #[arg(long, global = true, default_value_t = 30)]
     ship_wait_s: u64,
-    /// The `{site}` part of object keys.
+    /// The {site} part of object keys
     #[arg(long, global = true, default_value = "local")]
     site: String,
-    /// The `{collector}` part of object keys.
+    /// The {collector} part of object keys
     #[arg(long, global = true, default_value = "local")]
     collector_id: String,
-    /// Capture Rate: share of Request Workunits whose packets L0 chunks keep
-    /// in full (0 to 1). The rest are truncated; every byte is still hashed.
+    /// Capture Rate: share of Request Workunits kept in full (0 to 1)
     #[arg(long, global = true, default_value_t = 1.0)]
     capture_rate: f64,
-    /// 64 hex digits: the key each window's Capture Rate secret is derived
-    /// from, until the control plane hands out secrets. Needed when
-    /// --capture-rate is below 1.
+    /// Capture Rate key, 64 hex digits; needed below rate 1
     #[arg(long, global = true)]
     capture_key: Option<String>,
-    /// Captured bytes left in a truncated packet.
+    /// Captured bytes left in a truncated packet
     #[arg(long, global = true, default_value_t = 128)]
     truncate_to: u32,
-    /// Captured bytes of alarm packets (unexplained, tls, opaque, grpc, UDP)
-    /// kept in full per Flow per Slice; later ones are truncated.
+    /// Alarm-packet bytes kept in full per Flow per Slice
     #[arg(long, global = true, default_value_t = 16 << 20)]
     alarm_cap: u64,
 }
@@ -103,51 +101,59 @@ enum LogFormat {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Assemble Flows from .pcap/.pcapng files, read in the order given.
+    /// Assemble Flows from .pcap/.pcapng files, in the order given
     Files {
-        /// Window (Slice) length in seconds.
+        /// Window (Slice) length in seconds
         #[arg(short, long, default_value_t = 10)]
         window_s: u32,
-        /// Output directory for the JSONL tables.
+        /// Output directory
         #[arg(short, long, default_value = "ts-captures")]
         out: PathBuf,
+        /// Capture files
         files: Vec<PathBuf>,
     },
-    /// Rebuild `by-exchange/` in an output directory from its `http.jsonl`
-    /// and `bodies/`.
+    /// Rebuild by-exchange/ in an output directory
     Views {
+        /// Output directory
         #[arg(default_value = "ts-captures")]
         out: PathBuf,
     },
-    /// POST the manifests in an output directory's log that are not shipped
-    /// yet to --ingest.
+    /// POST the manifests not shipped yet to --ingest
     Ship {
+        /// Output directory
         #[arg(default_value = "ts-captures")]
         out: PathBuf,
     },
-    /// Capture live with a dumpcap ring buffer and assemble Flows.
+    /// Upload what the spool still holds to an s3:// --store
+    Upload {
+        /// Output directory
+        #[arg(default_value = "ts-captures")]
+        out: PathBuf,
+    },
+    /// Capture live through a dumpcap ring buffer
     Ring {
-        /// Window (Slice) length in seconds; also dumpcap's `-b interval`.
+        /// Window (Slice) length in seconds; also dumpcap's ring interval
         #[arg(short, long, default_value_t = 10)]
         window_s: u32,
+        /// Capture interface; it becomes the Link id
         #[arg(short, long)]
         interface: String,
-        /// Directory for dumpcap's ring files [default: <tmp>/tokenspectra-ring-<interface>].
+        /// Ring file directory [default: <tmp>/tokenspectra-ring-<interface>]
         #[arg(short = 'd', long)]
         ring_dir: Option<PathBuf>,
-        /// Stop after this many seconds.
+        /// Stop after this many seconds
         #[arg(short = 't', long)]
         duration_s: Option<u32>,
-        /// Capture filter (dumpcap `-f`).
+        /// Capture filter (dumpcap -f)
         #[arg(short, long)]
         filter: Option<String>,
-        /// Kernel capture buffer in MiB (dumpcap `-B`); raise it if dumpcap
-        /// reports drops on bursty traffic.
+        /// Kernel capture buffer in MiB (dumpcap -B)
         #[arg(short = 'B', long)]
         buffer_mib: Option<u32>,
+        /// The dumpcap binary
         #[arg(long, default_value = "dumpcap")]
         dumpcap: PathBuf,
-        /// Output directory for the JSONL tables.
+        /// Output directory
         #[arg(short, long, default_value = "ts-captures")]
         out: PathBuf,
     },
@@ -195,6 +201,20 @@ fn init_logging(cli: &Cli) {
     }
 }
 
+fn log_uploaded(u: &Uploaded) {
+    if u.left == 0 {
+        info!(objects = u.objects, bytes = u.bytes, "spool uploaded");
+    } else {
+        warn!(
+            objects = u.objects,
+            bytes = u.bytes,
+            left = u.left,
+            left_bytes = u.left_bytes,
+            "spool not empty: the next run or `collector upload` sends the rest"
+        );
+    }
+}
+
 /// A 32-byte key from 64 hex digits.
 fn parse_key(hex: &str) -> Result<[u8; 32], String> {
     let bad = || "--capture-key must be 64 hex digits".to_string();
@@ -218,7 +238,7 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // An s3:// store without a named endpoint refuses to start, before
     // capture begins or anything is written.
     let s3_endpoint = match cli.store.as_deref() {
-        Some(s) if s.starts_with("s3://") => Some(collector::store::s3_endpoint(
+        Some(s) if collector::store::is_remote(s) => Some(collector::store::s3_endpoint(
             cli.s3_endpoint.as_deref(),
             std::env::var("AWS_ENDPOINT").ok().as_deref(),
         )?),
@@ -241,6 +261,21 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 pending = s.pending.unwrap_or_default(),
                 "manifests shipped"
             );
+            return Ok(());
+        }
+        Cmd::Upload { out } => {
+            let store = cli.store.as_deref().filter(|s| collector::store::is_remote(s));
+            let store = store.ok_or("`collector upload` needs an s3:// --store")?;
+            let remote = collector::store::open(store, s3_endpoint)?;
+            let spool = Spool::open(
+                &cli.spool.clone().unwrap_or_else(|| out.join("spool")),
+                u64::MAX,
+                None,
+            )?;
+            let (objects, bytes) = spool.pending();
+            info!(objects, bytes, "uploading the spool");
+            let uploader = Uploader::spawn(spool, remote)?;
+            log_uploaded(&uploader.finish(Duration::from_secs(cli.upload_wait_s))?);
             return Ok(());
         }
         Cmd::Ring {
@@ -292,8 +327,24 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .store
         .clone()
         .unwrap_or_else(|| out.join("store").display().to_string());
-    let object_store = collector::store::open(&store_url, s3_endpoint)?;
     let registry = Registry::new();
+    // A remote store is written through the spool, inside the boundary.
+    let spooled = if collector::store::is_remote(&store_url) {
+        let remote = collector::store::open(&store_url, s3_endpoint)?;
+        let dir = cli.spool.clone().unwrap_or_else(|| out.join("spool"));
+        let spool = Spool::open(&dir, cli.spool_max_mib << 20, Some(registry.clone()))?;
+        let (objects, bytes) = spool.pending();
+        if objects > 0 {
+            info!(
+                objects,
+                bytes, "the spool holds objects from a past run; uploading them first"
+            );
+        }
+        let uploader = Uploader::spawn(spool.clone(), remote)?;
+        Some((spool, uploader))
+    } else {
+        None
+    };
     if let Some(addr) = &cli.metrics_addr {
         let bound = serve_metrics(addr.as_str(), registry.clone())
             .map_err(|e| format!("--metrics-addr {addr}: {e}"))?;
@@ -304,6 +355,10 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         registry.clone(),
         cli.log_format == LogFormat::Json,
         dumpcap_pid,
+        spooled.as_ref().map(|(spool, _)| {
+            let spool = spool.clone();
+            Box::new(move || spool.stop()) as Box<dyn Fn() + Send>
+        }),
     ) {
         Ok(t) => {
             tracing::debug!(
@@ -321,7 +376,15 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let shipper = ingest
         .map(|i| Shipper::spawn(out.clone(), i, Duration::from_secs(1)))
         .transpose()?;
-    let mut store = StoreSink::new(&mut sink, object_store, store_cfg, Some(registry.clone()));
+    let mut store = match &spooled {
+        Some((spool, _)) => StoreSink::spooled(&mut sink, spool.clone(), store_cfg, Some(registry.clone())),
+        None => StoreSink::new(
+            &mut sink,
+            collector::store::open(&store_url, s3_endpoint)?,
+            store_cfg,
+            Some(registry.clone()),
+        ),
+    };
     run(
         source.as_mut(),
         window_ns,
@@ -329,7 +392,18 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         decoder_cfg,
         &mut StatsSink::new(&mut store, registry.clone()),
     )?;
-    let stored = store.finish()?;
+    let stored = store.finish();
+    // The uploader gets its time even when the run failed: what is
+    // spooled is evidence all the same.
+    if let Some((_, uploader)) = spooled {
+        let uploaded = uploader.finish(Duration::from_secs(cli.upload_wait_s));
+        if let Ok(u) = &uploaded {
+            log_uploaded(u);
+        }
+        stored.as_ref().map_err(|e| e.to_string())?;
+        uploaded?;
+    }
+    let stored = stored?;
     sink.finish()?;
     info!(
         store = %store_url,

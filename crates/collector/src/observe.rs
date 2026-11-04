@@ -314,7 +314,9 @@ pub fn print_snapshot(reg: &Registry, json: bool) {
 /// With a `stop_pid` (dumpcap, for `ring`), the first SIGINT/SIGTERM does not
 /// kill the Collector: it is forwarded to dumpcap as SIGINT, which closes its
 /// last ring file and exits; the packet source then ends and the run finishes
-/// normally (store, tables, summary). A second signal takes the default action.
+/// normally (store, tables, summary). `on_stop` runs then too: the spool
+/// stops waiting for room, so a run held back by a full spool can end. A
+/// second signal takes the default action.
 #[cfg(unix)]
 pub mod triggers {
     use std::io::{IsTerminal, Read};
@@ -358,7 +360,12 @@ pub mod triggers {
         }
     }
 
-    pub fn spawn(reg: Arc<Registry>, json: bool, stop_pid: Option<u32>) -> std::io::Result<Triggers> {
+    pub fn spawn(
+        reg: Arc<Registry>,
+        json: bool,
+        stop_pid: Option<u32>,
+        on_stop: Option<Box<dyn Fn() + Send>>,
+    ) -> std::io::Result<Triggers> {
         let saved: Saved = Arc::new(Mutex::new(None));
         let keys = std::io::stdin().is_terminal();
         if keys {
@@ -382,6 +389,9 @@ pub mod triggers {
                         tracing::info!(signal = sig, "stopping: asking dumpcap to close its last file");
                         // SAFETY: plain kill(2) on dumpcap's pid; an error just means it already exited.
                         unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+                        if let Some(f) = &on_stop {
+                            f();
+                        }
                     } else {
                         restore(&s);
                         let _ = signal_hook::low_level::emulate_default_handler(sig);

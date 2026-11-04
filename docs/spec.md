@@ -258,6 +258,15 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - **The endpoint is required.** It comes from `--s3-endpoint`, else `AWS_ENDPOINT`; with neither, the Collector refuses to start, before capture begins or anything is written. There is no fallback to AWS's default endpoint (Amazon S3 itself is named explicitly, e.g. `https://s3.eu-west-1.amazonaws.com`), so evidence cannot leave for a store nobody named. The endpoint is pinned (the SDK's `AWS_ENDPOINT_URL_S3` cannot move it) and named in the startup log.
   - Every put is write-once: `PutMode::Create`, `If-None-Match: *` on S3. A store that ignores the header could overwrite objects; CI checks the S3 path against VersityGW.
   - A put that finds the object already there reads it back: the same bytes (a re-run over the same capture) are left alone, other bytes fail the run. Nothing is overwritten.
+- **The spool (TS-38).** The Operator runs the object store, so it is outside the protected boundary and may be down. With an `s3://` store, every object is first written to a local spool (`--spool`, default `<out>/spool`), which stays inside the boundary, exactly as to the local store: synced on each put, the window's manifest committed after its objects are there. An uploader thread copies spooled objects out in the order they were written and removes each once the store holds it.
+  - **Write-once upload.** Each upload is a `PutMode::Create` put. The same bytes already in the store count as uploaded; other bytes stop the uploader and fail the run, as a conflicting put does without a spool. Any other error is retried after a pause that doubles from 250 ms up to 30 s, for as long as it takes.
+  - **An outage delays evidence instead of ending the run.** The run goes on writing the spool; manifests are committed and shipped, naming objects the store does not hold yet.
+  - **Backpressure.** The spool holds at most `--spool-max-mib` (default 4096). A put reserves its bytes before it writes, waiting until uploads make room, so sealing windows stops and the run is held back instead of filling the disk. A failed put frees its reservation; an object is queued for upload only once it is synced. An object bigger than the whole spool goes in once the spool is empty. An uploaded object's bytes count until its file is removed; a removal that fails is retried and keeps its room.
+  - **One owner.** A spool is locked (`.lock` in it) while a run or `collector upload` has it open; a second process fails to open it.
+  - **Stopping while the spool is full.** The stop signal that ends `ring` also ends the wait for room: the next put that does not fit fails, the run reports `stopped with the spool full`, and the uploader still gets `--upload-wait-s`. Windows sealed before then are in the spool; the rest are only in dumpcap's ring files, which are kept, so running `collector files` over them once the store is back recreates the same objects (puts are deterministic and write-once).
+  - **Open (owner's call, TS-38 review):** while the store is down and the spool is full, `ring` keeps capturing into its ring files, which are not capped. Bounding them means stopping capture or dropping input.
+  - **End of a run.** The uploader has `--upload-wait-s` (default 30) to empty the spool. What is left stays on disk; the next run uploads it first, or `collector upload` does.
+  - Objects are uploaded as spooled. TS-47 adds encryption to the auditor in the uploader, between the spool and the store.
 - **L0 chunks:** one object per Link per window, zstd-compressed. If a chunk passes a size cap (1 GiB stored), split it into `-partN` objects.
   - As built (TS-38): the compressed chunk is cut into 1 GiB pieces, `{key}-part0`, `{key}-part1`, …, each a single write-once put; joined in order they are the compressed chunk. The `chunks` row keeps the whole chunk's `key`, `chunk_hash` and `stored_len`, and `parts` says how many objects hold it (1: the object at `key`).
   - Why not `put_multipart`: `object_store` (0.14) completes a multipart upload without `If-None-Match`, so it could overwrite an object. S3 single puts take up to 5 GiB.
@@ -365,6 +374,18 @@ Transport follows TS-15:
 
 Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in Wireshark (Slice pcapng), and later the Flow/Slice drill-down in the Console.
 
+### Command line
+
+`collector --help` gives one line per option; README.md shows it in full, and `tests/readme.rs` keeps the two in step. The details:
+
+- **Logging.** `-v` adds DEBUG (one line per Request Workunit and Flow), `-vv` TRACE (reassembly); `-q` keeps WARN, `-qq` ERROR only. `--log-level` overrides both, and `RUST_LOG`, when set, overrides all three. Logs go to stdout and are never part of the outputs.
+- **`--no-bodies`.** No `bodies/` or `by-exchange/`; hashes, lengths and every table stay the same (§8).
+- **`--store`.** Default `<out>/store`, a local directory: no spool, no network. `s3://bucket[/prefix]` writes through the spool to S3 or an S3-compatible store (§8); its endpoint comes from `--s3-endpoint`, else `AWS_ENDPOINT`, and has no default; credentials and region come from the `AWS_*` variables.
+- **`--spool`, `--spool-max-mib`, `--upload-wait-s`, `collector upload`.** Only with an `s3://` store (§8, "The spool"): where objects wait, how much the spool holds before the run is held back, how long the uploader has at the end of a run (what it doesn't get to stays for the next run or `collector upload`).
+- **`--ingest`, `--ship-wait-s`, `collector ship`.** Each sealed window's manifest is POSTed to `--ingest` (`http://host[:port]/path`). Without it, manifests stay in `<out>/manifests.jsonl` for `collector ship`. `--ship-wait-s` bounds the whole end-of-run shipping, a request in flight included; lines not shipped stay in the log.
+- **`--capture-rate`, `--capture-key`, `--truncate-to`, `--alarm-cap`.** The Capture Rate cut (§7): the share of Request Workunits whose packets L0 chunks keep in full; every byte is still hashed. Below 1 it needs `--capture-key` (64 hex digits), the key each window's secret is derived from until the control plane hands out secrets. `--alarm-cap` is the bytes of alarm packets (unexplained, tls, opaque, grpc, UDP) kept in full per Flow per Slice.
+- **`ring`.** Runs dumpcap with `-b interval:<window>`; `-f` and `-B` pass through to dumpcap (raise `-B` if dumpcap reports drops on bursty traffic). Ring files go to `--ring-dir` (default `<tmp>/tokenspectra-ring-<interface>`) and are never deleted by dumpcap (§3).
+
 ## 12. Acceptance (proposal)
 
 _As built (TS-27): 1, 2, 4 and 6 run in CI over the whole golden set, all four Wire Protocols included; 2 compares whole output directories, object store and manifest log included. 3 runs end to end with `tools/live_e2e.sh`, which needs capture rights, over a mixed workload from the capture harness. 5 needs a real Tap._
@@ -442,3 +463,7 @@ Metrics, all prefixed `ts_collector_` (labels in brackets):
 | `capture_kept_bytes_total`, `capture_truncated_bytes_total` | Captured bytes written to chunks, and captured bytes the Capture Rate cut |
 | `store_objects_total`, `store_bytes_total` `[kind]` | Objects written and their bytes; `kind`: `chunk`, `pack`, `index` |
 | `store_existing_total` | Puts that found the same object already there (a re-run) |
+| `uploads_total`, `upload_bytes_total` | Spooled objects the uploader put to the remote store, and their bytes (TS-38) |
+| `uploads_existing_total` | Uploads that found the same bytes already in the remote store |
+| `upload_retries_total` | Upload attempts that failed and are retried: a rising count is an outage |
+| `spool_objects`, `spool_bytes` (gauges) | Objects and bytes in the spool, waiting to be uploaded |
