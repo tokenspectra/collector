@@ -43,8 +43,9 @@ struct Cli {
     #[arg(long, global = true)]
     metrics_addr: Option<String>,
     /// Object store for L0 chunks, packs and Parquet index tables: a
-    /// directory, or s3://bucket[/prefix] with credentials and endpoint
-    /// from the AWS_* environment variables [default: <out>/store].
+    /// directory, or s3://bucket[/prefix] with its endpoint from
+    /// --s3-endpoint or AWS_ENDPOINT (required) and credentials from the
+    /// AWS_* environment variables [default: <out>/store].
     #[arg(long, global = true)]
     store: Option<String>,
     /// With an s3:// store: its endpoint, e.g. https://s3.eu-west-1.amazonaws.com

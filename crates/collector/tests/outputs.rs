@@ -365,11 +365,58 @@ fn cli_s3(out: &Path) -> Command {
         .env("AWS_SECRET_ACCESS_KEY", "test")
         .env("AWS_REGION", "us-east-1")
         .env("AWS_ALLOW_HTTP", "true")
-        .args(["--store", "s3://evidence/site", "--upload-wait-s", "0"])
-        .args(["files", "-o"])
+        .args(["--store", "s3://evidence/site", "files", "-o"])
         .arg(out)
         .args(fixture_paths(&["openai_h1_json.pcapng"]));
     cmd
+}
+
+/// An S3 endpoint that accepts every request with 200 and records each
+/// request line.
+fn mock_s3() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut w = conn;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut len = 0;
+                    loop {
+                        let mut h = String::new();
+                        if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            if k.eq_ignore_ascii_case("content-length") {
+                                len = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    let mut body = vec![0; len];
+                    if r.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    log.lock().unwrap().push(line.trim_end().to_string());
+                    let ok = "HTTP/1.1 200 OK\r\nETag: \"0\"\r\nContent-Length: 0\r\n\r\n";
+                    if w.write_all(ok.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (url, seen)
 }
 
 /// An `s3://` store with no endpoint named refuses to start (TS-38): no
@@ -392,31 +439,33 @@ fn an_s3_store_without_an_endpoint_refuses_to_start() {
     }
 }
 
-/// With an endpoint named, the run starts and its log names the endpoint.
-/// It is unreachable here, so the objects stay in the spool.
+/// The endpoint named, by the flag or by `AWS_ENDPOINT`, is the one in the
+/// startup log and the one written to, whatever `AWS_ENDPOINT_URL_S3` says.
 #[test]
-fn the_s3_endpoint_is_named_in_the_startup_log() {
-    for (flag, env) in [
-        (Some("http://127.0.0.1:1"), None),
-        (None, Some("http://127.0.0.1:2")),
-    ] {
+fn the_named_s3_endpoint_is_logged_and_used() {
+    for by_flag in [true, false] {
+        let (url, seen) = mock_s3();
         let dir = tempfile::tempdir().unwrap();
         let mut cmd = cli_s3(&dir.path().join("out"));
-        if let Some(f) = flag {
-            cmd.args(["--s3-endpoint", f]);
-        }
-        if let Some(e) = env {
-            cmd.env("AWS_ENDPOINT", e);
+        cmd.env("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:1");
+        if by_flag {
+            cmd.args(["--s3-endpoint", &url]);
+        } else {
+            cmd.env("AWS_ENDPOINT", &url);
         }
         let run = cmd.output().unwrap();
         let log = String::from_utf8_lossy(&run.stdout);
         assert!(run.status.success(), "{log}");
-        let named = flag.or(env).unwrap();
         assert!(
             log.lines()
-                .any(|l| l.contains("object store: S3") && l.contains(&format!("endpoint=\"{named}\""))),
+                .any(|l| l.contains("object store: S3") && l.contains(&format!("endpoint=\"{url}\""))),
             "{log}"
         );
-        assert!(dir.path().join("out/spool").exists());
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "nothing reached the named endpoint");
+        assert!(
+            seen.iter().all(|l| l.starts_with("PUT /evidence/site/")),
+            "{seen:?}"
+        );
     }
 }
