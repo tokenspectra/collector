@@ -167,8 +167,13 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 
 **DNS and covert-channel features (TS-51).** Decoded at the edge, at 100%, because they are parsers of adversary bytes that are cheap here and expensive to rebuild from L0 later ([verification-pipeline §5](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/verification-pipeline.md)). They are facts: Allowlist rules ("DNS to resolver X, zones in Y, ≤ N B/s"), Signatures and statuses stay in the Classifier.
 - **Which datagrams.** Every UDP datagram, on any port, is tried as one DNS message (RFC 1035 §4.1); a datagram is DNS only when it parses. Ports never count: DNS to a non-standard port is DNS, and a datagram to port 53 that does not parse is not.
-- **Strict parse.** A 12-byte header with a known opcode (QUERY, IQUERY, STATUS, NOTIFY, UPDATE, DSO) and at least one question; then every question and resource record the header counts must parse. Names are read label by label: 63 bytes a label, 255 a name; label types `01` and `10` are rejected; a compression pointer must point backwards, at most 128 per name. A datagram the capture cut is not read. Bytes after the last record do not stop the parse; they are counted in `trailing_bytes`, since data hidden there is worth seeing.
-- **Not changed:** a UDP Flow's verdict stays `opaque` and its bytes `unexplained` (below), and the Capture Rate keeps it as an alarm Flow (§7). The Classifier reads the `dns` and `features` tables to match an Allowlist rule.
+- **Strict parse.** A 12-byte header with a known opcode (QUERY, IQUERY, STATUS, NOTIFY, UPDATE, DSO) and at least one question; then every question and resource record the header counts must parse. A datagram the capture cut is not read.
+  - **Names** are read label by label: 63 bytes a label, 255 a name; label types `01` and `10` are rejected. A compression pointer must target the start of a label, or of a pointer, in an **earlier** name of the same message: never the header, a label's bytes, a root octet, other data or its own name (which would loop). At most 128 pointers are followed per name.
+  - **RDATA** must fit its RDLENGTH, and the types with a fixed format are checked inside it: A (4 bytes) and AAAA (16); TXT and SPF as one or more character-strings that fill it exactly; the name-bearing types (NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME; MINFO; MX, AFSDB, RT, KX; SOA; SRV) as their fixed fields and names, which end at RDLENGTH and whose pointers follow the rule above; OPT as options that fill it. Other types stay opaque.
+  - Bytes after the last record do not stop the parse; they are counted in `trailing_bytes`, since data hidden there is worth seeing.
+- **Byte accounting.** Each payload byte of a UDP Flow is in exactly one bucket (below): `fact` when its datagram is a whole DNS message, `gap` when the capture cut it, `unexplained` otherwise. So the bytes of a UDP/53 Flow are all in a DNS fact or explicitly unexplained, and per direction and Slice `fact` equals the `size` of that direction's `dns` rows.
+- **Not changed:** a UDP Flow's verdict stays `opaque`, and the Capture Rate keeps it as an alarm Flow whatever its buckets (§7). The Classifier reads the `dns` and `features` tables to match an Allowlist rule.
+- **A pure parse.** `dns.rs` reads bytes and returns rows: no clock, no I/O, no store, stats or manifest; it is meant for the `parse` crate ([hardware-collector §4, §7](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/hardware-collector.md#protocol-facts-dns-tls-clienthello-ntp)).
 - **Not in TS-51:** DNS over TCP (it stays `opaque`), DNS over TLS or HTTPS (opaque by design), EDNS options, mDNS-specific fields.
 
 `dns`: one row per DNS message, in its packet's window.
@@ -196,7 +201,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 | `dns_qname_len_max`, `dns_label_len_max`, `dns_label_len_mean` | Over the queries' names; the mean is over every label of every query name |
 | `dns_txt_records`, `dns_txt_bytes`, `dns_txt_max` | Over every message's TXT records |
 
-Name features are taken over queries only, so a name its response repeats counts once. Ratios are rounded to 3 decimals so they print the same on every platform; they are computed from the capture alone, so two runs give the same rows (§3).
+Name features are taken over queries only, so a name its response repeats counts once. Content features (`dns_qname_*`, `dns_label_*`, `dns_txt_*`) belong to the parse; the rate and volume ones (`dns_query_rate`, `dns_*bytes`) are to come from the commit layer's per-Flow counters (TS-57), under the same columns, so the Classifier can rely on them without relying on the parse. Ratios are rounded to 3 decimals so they print the same on every platform; they are computed from the capture alone, so two runs give the same rows (§3).
 
 **Byte accounting.** For each Flow, direction and Slice, every stream byte falls in exactly one bucket:
 
@@ -205,8 +210,9 @@ Name features are taken over queries only, so a name its response repeats counts
 | `workunit` | Inside a Request Workunit's HTTP message (headers and body) |
 | `http_other` | Inside a parsed HTTP message that is not a Workunit |
 | `framing` | Protocol overhead around messages: HTTP/2 frame headers, SETTINGS, PING, chunked-encoding lines |
-| `unexplained` | Everything else, plus every byte of `tls`/`opaque`/`grpc` Flows |
-| `gap` | Bytes counted by sequence numbers but never captured |
+| `fact` | Inside a protocol fact: a UDP datagram that is a whole DNS message (TS-51) |
+| `unexplained` | Everything else, plus every byte of `tls`/`opaque`/`grpc` Flows and of UDP datagrams that are not facts |
+| `gap` | Bytes counted by sequence numbers (TCP) or by length (UDP) but never captured |
 
 - The Collector reports buckets and verdicts. **It never assigns a status.**
 - The Classifier applies the rules from [architecture.md](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/architecture.md) §5:

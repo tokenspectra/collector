@@ -76,12 +76,13 @@ impl VerdictLabel {
     }
 }
 
-pub const BUCKETS: [Bucket; 5] = [
+pub const BUCKETS: [Bucket; 6] = [
     Bucket::Workunit,
     Bucket::HttpOther,
     Bucket::Framing,
     Bucket::Unexplained,
     Bucket::Gap,
+    Bucket::Fact,
 ];
 
 pub fn bucket_str(b: Bucket) -> &'static str {
@@ -91,6 +92,7 @@ pub fn bucket_str(b: Bucket) -> &'static str {
         Bucket::Framing => "framing",
         Bucket::Unexplained => "unexplained",
         Bucket::Gap => "gap",
+        Bucket::Fact => "fact",
     }
 }
 
@@ -193,7 +195,7 @@ pub struct Registry {
     pub(crate) flows: Labeled<7>,
     pub(crate) flows_new: AtomicU64,
     pub(crate) flows_with_workunit: AtomicU64,
-    accounted: [Labeled<2>; 5],
+    accounted: [Labeled<2>; BUCKETS.len()],
     /// `[outcome][http_class]` by Wire Protocol id.
     workunits: Mutex<BTreeMap<&'static str, [[u64; 4]; 3]>>,
     pub(crate) gaps: AtomicU64,
@@ -359,7 +361,7 @@ pub struct Snapshot {
     /// Closed Flows that carried at least one Request Workunit.
     pub flows_with_workunit: u64,
     /// `[bucket][dir]`, in [`BUCKETS`] and [`DIRS`] order.
-    pub accounted: [[u64; 2]; 5],
+    pub accounted: [[u64; 2]; BUCKETS.len()],
     /// `[outcome][http_class]`, in [`Outcome::ALL`] and [`HttpClass::ALL`]
     /// order, by Wire Protocol id.
     pub workunits_by_protocol: BTreeMap<&'static str, [[u64; 4]; 3]>,
@@ -992,7 +994,7 @@ mod tests {
         let workunits = 3 * 4 * crate::wire::BUILTIN.len();
         assert_eq!(
             samples,
-            3 * 7 + 2 + 5 * 2 + workunits + 8 + 1 + 3 + 2 + 2 * 3 + 4 + 2
+            3 * 7 + 2 + BUCKETS.len() * 2 + workunits + 8 + 1 + 3 + 2 + 2 * 3 + 4 + 2
         );
     }
 }

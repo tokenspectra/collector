@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord, SliceRecord};
+use collector::decode::FeaturesRecord;
 use collector::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
-use collector::dns::{DnsRecord, FeaturesRecord};
+use collector::dns::DnsRecord;
 use collector::flow::Dir;
 use collector::manifest::LOG;
 use collector::observe::StatsSink;

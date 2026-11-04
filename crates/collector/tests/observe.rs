@@ -17,10 +17,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord};
+use collector::decode::FeaturesRecord;
 use collector::decode::{
     BodyKey, Bucket, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord,
 };
-use collector::dns::{DnsRecord, FeaturesRecord};
+use collector::dns::DnsRecord;
 use collector::flow::FlowKind;
 use collector::observe::StatsSink;
 use collector::output::TABLES;
@@ -50,7 +51,7 @@ fn final_counters_equal_the_tables() {
             bytes[VerdictLabel::Other as usize] += u64::from(p.orig_len);
         }
         let mut flows = [0u64; 7];
-        let mut accounted = [[0u64; 2]; 5];
+        let mut accounted = [[0u64; 2]; BUCKETS.len()];
         let mut stream_bytes = 0;
         for f in &c.flows {
             let label = VerdictLabel::of(f.slice.kind, f.verdict) as usize;

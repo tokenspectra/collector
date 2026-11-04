@@ -251,7 +251,8 @@ fn dns_messages_and_covert_channel_features() {
     let on = |flow: &str| -> Vec<&collector::dns::DnsRecord> {
         c.dns.iter().filter(|d| d.flow.as_str() == flow).collect()
     };
-    // 2 + 2 + 8 + 3 messages; the junk datagram and the looped answer are not DNS.
+    // 2 + 2 + 8 + 3 messages; the junk datagram, the looped answer and the
+    // TXT answer with a short string are not DNS.
     assert_eq!(on(resolver).len(), 15);
     let txt = on(resolver)
         .into_iter()
@@ -284,7 +285,7 @@ fn dns_messages_and_covert_channel_features() {
             first.responses,
             first.other_datagrams
         ),
-        (12, 6, 6, 2)
+        (12, 6, 6, 3)
     );
     assert_eq!(first.query_rate, 6.0);
     assert_eq!((first.txt_records, first.txt_max), (6, Some(357)));
@@ -296,6 +297,36 @@ fn dns_messages_and_covert_channel_features() {
         .features
         .iter()
         .all(|f| f.flow.as_str() != "tap0|udp|10.0.0.1:41000|10.0.0.99:9999|0"));
+    // Byte accounting: every payload byte of a UDP Flow is in a fact (a
+    // whole DNS message), a gap or unexplained, and the facts are exactly
+    // the DNS messages, per direction.
+    for s in c
+        .flows
+        .iter()
+        .filter(|s| s.slice.kind == collector::flow::FlowKind::Udp)
+    {
+        for (dir, st, b) in [
+            (Dir::Orig, &s.slice.orig_stats, &s.orig_bytes),
+            (Dir::Resp, &s.slice.resp_stats, &s.resp_bytes),
+        ] {
+            assert_eq!(b.fact + b.unexplained + b.gap, st.payload_bytes);
+            let dns: u64 = c
+                .dns
+                .iter()
+                .filter(|m| {
+                    m.flow == s.slice.flow && m.window_start_ns == s.slice.window_start_ns && m.dir == dir
+                })
+                .map(|m| u64::from(m.size))
+                .sum();
+            assert_eq!(b.fact, dns, "{} {dir:?}", s.slice.flow);
+        }
+    }
+    let game = c
+        .flows
+        .iter()
+        .find(|s| s.slice.flow.as_str().ends_with("10.0.0.99:9999|0"))
+        .unwrap();
+    assert_eq!((game.orig_bytes.fact, game.orig_bytes.unexplained), (0, 64));
     // The bytes of every DNS message add up per Slice.
     for f in &c.features {
         let d = f.dns.as_ref().unwrap();

@@ -129,11 +129,13 @@ const FLOWS: &[Column] = &[
     ("orig_bytes.framing", Int),
     ("orig_bytes.unexplained", Int),
     ("orig_bytes.gap", Int),
+    ("orig_bytes.fact", Int),
     ("resp_bytes.workunit", Int),
     ("resp_bytes.http_other", Int),
     ("resp_bytes.framing", Int),
     ("resp_bytes.unexplained", Int),
     ("resp_bytes.gap", Int),
+    ("resp_bytes.fact", Int),
     ("orig_desync", Str),
     ("resp_desync", Str),
 ];

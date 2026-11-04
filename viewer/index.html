@@ -9,12 +9,12 @@
   :root {
     --bg: #f7f7f5; --panel: #fff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e2e1db; --hover: #efeee9;
     --link: #2f62a8; --ok: #2f8f6b; --bad: #c0392b; --warn: #b8691d;
-    --c-green: #2f8f6b; --c-blue: #3d6fb6; --c-red: #c0392b;
+    --c-green: #2f8f6b; --c-violet: #7a5bb5; --c-blue: #3d6fb6; --c-red: #c0392b;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #161615; --panel: #1f1f1e; --ink: #ecebe6; --muted: #9a9993; --line: #34342f; --hover: #2a2a27;
       --link: #79a6e8; --ok: #5cc49a; --bad: #ef7b6c; --warn: #e3a35c;
-      --c-green: #3fa77c; --c-blue: #5f8fd6; --c-red: #dd5f50; }
+      --c-green: #3fa77c; --c-violet: #a58ae0; --c-blue: #5f8fd6; --c-red: #dd5f50; }
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -330,7 +330,7 @@ function index(t, name, missing) {
   for (const f of d.flowsById.values()) {
     f.slices.sort((a, b) => (BigInt(a.window_start_ns) < BigInt(b.window_start_ns) ? -1 : 1));
     f.exchanges.sort((a, b) => a.exchange - b.exchange);
-    const tot = { workunit: 0, http_other: 0, framing: 0, unexplained: 0, gap: 0 };
+    const tot = Object.fromEntries(BUCKETS.map(k => [k, 0]));
     let pk = 0, wire = 0;
     for (const s of f.slices) {
       for (const k in tot) tot[k] += (s.orig_bytes?.[k] || 0) + (s.resp_bytes?.[k] || 0);
@@ -424,18 +424,20 @@ function verdictPill(v) {
   if (!v) return pill("no payload");
   return pill(v, { http1: "ok", http2: "ok", tls: "warn", opaque: "bad", grpc: "warn" }[v] || "");
 }
-const BUCKETS = ["workunit", "http_other", "framing", "unexplained", "gap"];
-// Three traffic classes over the five byte buckets, bottom of the stack first. These are the
+const BUCKETS = ["workunit", "fact", "http_other", "framing", "unexplained", "gap"];
+// Four traffic classes over the six byte buckets, bottom of the stack first. These are the
 // Collector's buckets grouped for reading, not Slice statuses: the Collector never assigns a status.
 const CLASSES = [
   { key: "green", label: "Workunit", parts: ["workunit"] },
+  // Whole protocol messages (DNS) on UDP: facts for the Classifier's Allowlist rules.
+  { key: "violet", label: "Protocol fact", parts: ["fact"] },
   { key: "blue", label: "Other HTTP", parts: ["http_other", "framing"] },
   { key: "red", label: "Unexplained", parts: ["unexplained", "gap"] },
 ];
 const classify = b => Object.fromEntries(CLASSES.map(c => [c.key, c.parts.reduce((s, k) => s + (b?.[k] || 0), 0)]));
 const bucketTitle = b => BUCKETS.map(k => `${k}: ${num(b?.[k] || 0)}`).join("\n");
 function bucketBar(b) {
-  const c = classify(b), total = c.green + c.blue + c.red;
+  const c = classify(b), total = CLASSES.reduce((s, k) => s + c[k.key], 0);
   if (!total) return '<div class="bar" title="no stream bytes"></div>';
   return `<div class="bar" title="${bucketTitle(b)}">` +
     CLASSES.map(k => c[k.key] ? `<i style="width:${(100 * c[k.key] / total).toFixed(2)}%;background:var(--c-${k.key})"></i>` : "").join("") + "</div>";
@@ -457,7 +459,7 @@ function stackChart(title, points) {
 const CW = 760, CH = 210, PAD = { l: 52, r: 10, t: 20, b: 22 };
 function chartGeom(pts) {
   const vals = pts.map(p => classify(p.b));
-  const tot = vals.map(v => v.green + v.blue + v.red);
+  const tot = vals.map(v => CLASSES.reduce((s, k) => s + v[k.key], 0));
   const max = Math.max(1, ...tot);
   const n = pts.length, w = CW - PAD.l - PAD.r, h = CH - PAD.t - PAD.b;
   const x = i => PAD.l + (n === 1 ? w / 2 : (i / (n - 1)) * w);
