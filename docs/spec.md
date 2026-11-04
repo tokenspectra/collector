@@ -374,6 +374,18 @@ Transport follows TS-15:
 
 Consumers: the Sampler and Recompute Worker (by `workunit_id`), human review in Wireshark (Slice pcapng), and later the Flow/Slice drill-down in the Console.
 
+### Command line
+
+`collector --help` gives one line per option; README.md shows it in full, and `tests/readme.rs` keeps the two in step. The details:
+
+- **Logging.** `-v` adds DEBUG (one line per Request Workunit and Flow), `-vv` TRACE (reassembly); `-q` keeps WARN, `-qq` ERROR only. `--log-level` overrides both, and `RUST_LOG`, when set, overrides all three. Logs go to stdout and are never part of the outputs.
+- **`--no-bodies`.** No `bodies/` or `by-exchange/`; hashes, lengths and every table stay the same (§8).
+- **`--store`.** Default `<out>/store`, a local directory: no spool, no network. `s3://bucket[/prefix]` writes through the spool to S3 or an S3-compatible store (§8); its endpoint comes from `--s3-endpoint`, else `AWS_ENDPOINT`, and has no default; credentials and region come from the `AWS_*` variables.
+- **`--spool`, `--spool-max-mib`, `--upload-wait-s`, `collector upload`.** Only with an `s3://` store (§8, "The spool"): where objects wait, how much the spool holds before the run is held back, how long the uploader has at the end of a run (what it doesn't get to stays for the next run or `collector upload`).
+- **`--ingest`, `--ship-wait-s`, `collector ship`.** Each sealed window's manifest is POSTed to `--ingest` (`http://host[:port]/path`). Without it, manifests stay in `<out>/manifests.jsonl` for `collector ship`. `--ship-wait-s` bounds the whole end-of-run shipping, a request in flight included; lines not shipped stay in the log.
+- **`--capture-rate`, `--capture-key`, `--truncate-to`, `--alarm-cap`.** The Capture Rate cut (§7): the share of Request Workunits whose packets L0 chunks keep in full; every byte is still hashed. Below 1 it needs `--capture-key` (64 hex digits), the key each window's secret is derived from until the control plane hands out secrets. `--alarm-cap` is the bytes of alarm packets (unexplained, tls, opaque, grpc, UDP) kept in full per Flow per Slice.
+- **`ring`.** Runs dumpcap with `-b interval:<window>`; `-f` and `-B` pass through to dumpcap (raise `-B` if dumpcap reports drops on bursty traffic). Ring files go to `--ring-dir` (default `<tmp>/tokenspectra-ring-<interface>`) and are never deleted by dumpcap (§3).
+
 ## 12. Acceptance (proposal)
 
 _As built (TS-27): 1, 2, 4 and 6 run in CI over the whole golden set, all four Wire Protocols included; 2 compares whole output directories, object store and manifest log included. 3 runs end to end with `tools/live_e2e.sh`, which needs capture rights, over a mixed workload from the capture harness. 5 needs a real Tap._
