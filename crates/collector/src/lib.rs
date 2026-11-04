@@ -6,7 +6,8 @@
 //! (SSE, NDJSON) and Request Workunits ([`wire`]), multihash
 //! names ([`mh`]) and body views ([`views`]). Hashing, the Capture Rate
 //! cut and the object store: L0 chunks ([`chunk`], [`capture`]), packs
-//! ([`pack`]), Parquet index tables ([`index`]), all written by [`store`]. Counters and diagnostics
+//! ([`pack`]), Parquet index tables ([`index`]), all written by [`store`]; window
+//! manifests, signed and chained ([`manifest`], [`sign`]). Counters and diagnostics
 //! logs ([`stats`], [`observe`]) sit beside the pipeline and never change
 //! its output. See `docs/spec.md` §3–8 and §14.
 
@@ -31,6 +32,7 @@ pub mod pack;
 pub mod ring;
 pub mod run;
 pub mod ship;
+pub mod sign;
 pub mod source;
 pub mod spool;
 pub mod stats;

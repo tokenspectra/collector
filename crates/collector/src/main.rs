@@ -13,6 +13,7 @@ use collector::observe::{log_summary, StatsSink};
 use collector::output::JsonlSink;
 use collector::run::run;
 use collector::ship::{self, Ingest, Shipper};
+use collector::sign::{KeyProvider, SoftwareKey};
 use collector::spool::{Spool, Uploaded, Uploader};
 use collector::stats::{serve_metrics, Registry};
 use collector::store::{StoreConfig, StoreSink};
@@ -64,6 +65,9 @@ struct Cli {
     /// Seconds to finish shipping manifests at the end of a run
     #[arg(long, global = true, default_value_t = 30)]
     ship_wait_s: u64,
+    /// Manifest signing key, made if missing [default: <out>/signing.key]
+    #[arg(long, global = true)]
+    signing_key: Option<PathBuf>,
     /// The {site} part of object keys
     #[arg(long, global = true, default_value = "local")]
     site: String,
@@ -372,7 +376,14 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let mut sink = JsonlSink::create(&out)?;
+    let key_path = cli.signing_key.clone().unwrap_or_else(|| out.join("signing.key"));
+    let key = SoftwareKey::open_or_create(&key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
+    info!(
+        key = %collector::sign::hex(&key.public_key()),
+        path = %key_path.display(),
+        "manifests signed with a software key"
+    );
+    let mut sink = JsonlSink::create(&out, Box::new(key))?;
     let shipper = ingest
         .map(|i| Shipper::spawn(out.clone(), i, Duration::from_secs(1)))
         .transpose()?;

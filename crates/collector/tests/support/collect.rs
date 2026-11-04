@@ -12,11 +12,31 @@ use collector::manifest::LOG;
 use collector::observe::StatsSink;
 use collector::output::{JsonlSink, BODIES, TABLES};
 use collector::run::run;
+use collector::sign::{KeyProvider, SoftwareKey};
 use collector::stats::{Registry, Snapshot};
 use collector::store::{StoreConfig, StoreError, StoreSink, StoreSummary};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource};
 
 pub const WINDOW_NS: u64 = 1_000_000_000;
+
+/// The seed of the key test runs sign manifests with. Fixed, so two runs
+/// give the same bytes.
+pub const TEST_SEED: [u8; 32] = [0x5a; 32];
+
+pub fn test_key() -> Box<dyn KeyProvider> {
+    Box::new(SoftwareKey::from_seed(TEST_SEED))
+}
+
+/// Writes the test key as a key file at `path`, for the CLI's
+/// `--signing-key` (its default is `<out>/signing.key`).
+pub fn write_test_key(path: &Path) {
+    std::fs::write(path, format!("{}\n", collector::sign::hex(&TEST_SEED))).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
 
 /// Keeps everything in memory. Streams are rebuilt from segments; gap
 /// bytes show as `~`.
@@ -225,7 +245,7 @@ pub fn run_into(
     store_cfg: StoreConfig,
     reg: Option<std::sync::Arc<Registry>>,
 ) -> Result<StoreSummary, StoreError> {
-    let mut sink = JsonlSink::create(out).expect("sink");
+    let mut sink = JsonlSink::create(out, test_key()).expect("sink");
     let mut stored = StoreSink::new(&mut sink, store, store_cfg, reg.clone());
     match reg {
         Some(reg) => {
