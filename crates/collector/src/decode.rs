@@ -15,6 +15,10 @@
 //!   `framing`, `unexplained`, `gap`) and reports the buckets per Flow,
 //!   direction and Slice.
 //!
+//! For each UDP Flow it tries every datagram as DNS ([`crate::dns`]) and
+//! reports each message, plus one row of features per Slice that carried
+//! one.
+//!
 //! A request's bytes are only known to be a Workunit once its response
 //! head arrives, so a Slice's row waits until every byte in it has a
 //! bucket. Rows stay in capture order per Flow. The Decoder reports
@@ -28,6 +32,7 @@ use serde::Serialize;
 
 use crate::assembler::{EventRecord, FlowSink, PacketRecord, SegmentRecord, SliceRecord};
 use crate::coding::{self, DecodeError, Decoding, Encoding};
+use crate::dns::{self, Datagram, DnsRecord, FeaturesRecord, Tally};
 use crate::flow::{Dir, FlowId, FlowKind};
 use crate::http::{Head, HeadReply, Lab, Out, StartLine};
 use crate::http1::{parse_request_line, parse_status_line, H1};
@@ -316,6 +321,10 @@ pub trait RecordSink {
     fn flow(&mut self, rec: &FlowRecord);
     fn exchange(&mut self, rec: &ExchangeRecord);
     fn workunit(&mut self, rec: &WorkunitRecord);
+    /// A DNS message in a UDP datagram, before its packet's record.
+    fn dns(&mut self, rec: &DnsRecord);
+    /// A Slice's covert-channel features, right after its Flow row.
+    fn features(&mut self, rec: &FeaturesRecord);
     /// More bytes of a body, as hashed: chunked encoding removed, content
     /// coding kept. Only called when [`DecoderConfig::keep_bodies`] is set.
     fn body_data(&mut self, _key: &BodyKey, _data: &[u8]) {}
@@ -342,16 +351,22 @@ pub trait RecordSink {
 
 pub struct Decoder<'a> {
     cfg: DecoderConfig,
+    window_ns: u64,
     sink: &'a mut dyn RecordSink,
     flows: HashMap<FlowId, FlowState>,
+    /// What each UDP Flow's datagrams added up to in the current Slice.
+    tallies: HashMap<FlowId, Tally>,
 }
 
 impl<'a> Decoder<'a> {
-    pub fn new(cfg: DecoderConfig, sink: &'a mut dyn RecordSink) -> Self {
+    /// A decoder for Slices of `window_ns`.
+    pub fn new(cfg: DecoderConfig, window_ns: u64, sink: &'a mut dyn RecordSink) -> Self {
         Decoder {
             cfg,
+            window_ns,
             sink,
             flows: HashMap::new(),
+            tallies: HashMap::new(),
         }
     }
 }
@@ -381,6 +396,17 @@ impl FlowSink for Decoder<'_> {
         }
     }
 
+    fn datagram(&mut self, d: &Datagram<'_>) {
+        let tally = self.tallies.entry(d.flow.clone()).or_default();
+        match dns::decode(d) {
+            Some(r) => {
+                tally.add(&r);
+                self.sink.dns(&r);
+            }
+            None => tally.other(),
+        }
+    }
+
     fn slice(&mut self, rec: &SliceRecord) {
         if rec.kind != FlowKind::Tcp {
             let bytes = |s: &crate::assembler::DirStats| Buckets {
@@ -396,6 +422,18 @@ impl FlowSink for Decoder<'_> {
                 orig_desync: None,
                 resp_desync: None,
             });
+            let dns = self
+                .tallies
+                .remove(&rec.flow)
+                .and_then(|t| t.finish(self.window_ns));
+            if dns.is_some() {
+                self.sink.features(&FeaturesRecord {
+                    window_start_ns: rec.window_start_ns,
+                    flow: rec.flow.clone(),
+                    link: rec.link.clone(),
+                    dns,
+                });
+            }
             return;
         }
         let sink = &mut *self.sink;
@@ -436,7 +474,7 @@ impl Decoder<'_> {
 
     /// Flows with protocol state still held.
     pub fn open_flows(&self) -> usize {
-        self.flows.len()
+        self.flows.len() + self.tallies.len()
     }
 }
 
@@ -1681,8 +1719,13 @@ mod tests {
             fn flow(&mut self, _: &FlowRecord) {}
             fn exchange(&mut self, _: &ExchangeRecord) {}
             fn workunit(&mut self, _: &WorkunitRecord) {}
+            fn dns(&mut self, _: &DnsRecord) {}
+            fn features(&mut self, _: &FeaturesRecord) {}
         }
         let mut nop = Nop;
-        assert_eq!(Decoder::new(DecoderConfig::default(), &mut nop).open_flows(), 0);
+        assert_eq!(
+            Decoder::new(DecoderConfig::default(), 1, &mut nop).open_flows(),
+            0
+        );
     }
 }

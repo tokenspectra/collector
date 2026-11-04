@@ -17,6 +17,7 @@ use crate::assembler::{EventKind, EventRecord, PacketRecord, SegmentRecord};
 use crate::decode::{
     BodyKey, Bucket, ExchangeRecord, FlowRecord, RecordSink, Span, WindowClose, WorkunitRecord,
 };
+use crate::dns::{DnsRecord, FeaturesRecord};
 use crate::flow::{Dir, FlowId};
 use crate::source::CapturedPacket;
 use crate::stats::{
@@ -154,6 +155,14 @@ impl RecordSink for StatsSink<'_> {
             );
         }
         self.inner.flow(rec);
+    }
+
+    fn dns(&mut self, rec: &DnsRecord) {
+        self.inner.dns(rec);
+    }
+
+    fn features(&mut self, rec: &FeaturesRecord) {
+        self.inner.features(rec);
     }
 
     fn exchange(&mut self, rec: &ExchangeRecord) {

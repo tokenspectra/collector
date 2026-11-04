@@ -20,6 +20,7 @@ use collector::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use collector::decode::{
     BodyKey, Bucket, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord,
 };
+use collector::dns::{DnsRecord, FeaturesRecord};
 use collector::flow::FlowKind;
 use collector::observe::StatsSink;
 use collector::output::TABLES;
@@ -245,6 +246,12 @@ impl RecordSink for Recording {
     }
     fn workunit(&mut self, rec: &WorkunitRecord) {
         self.0.push(format!("workunit {rec:?}"));
+    }
+    fn dns(&mut self, rec: &DnsRecord) {
+        self.0.push(format!("dns {rec:?}"));
+    }
+    fn features(&mut self, rec: &FeaturesRecord) {
+        self.0.push(format!("features {rec:?}"));
     }
     fn body_data(&mut self, key: &BodyKey, data: &[u8]) {
         self.0.push(format!("body_data {key:?} {data:?}"));

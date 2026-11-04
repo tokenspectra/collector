@@ -31,6 +31,7 @@ Everything below these eight points is proposal, not settled.
 - a pluggable Wire Protocol layer (§5) with shared response framing (SSE, NDJSON) → Request Workunits:
   - OpenAI Chat Completions and legacy Completions (TS-29);
   - OpenAI Responses, Anthropic Messages and Ollama native, one module each (TS-30 to TS-32);
+- DNS over UDP, and per-Slice covert-channel features, as tables (§5, TS-51);
 - hashing, the Capture Rate cut, the object-store layout;
 - metadata and records sent to the control plane.
 
@@ -163,6 +164,39 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 - `sse_done`: `message_stop` arrived.
 - Outcome (§14): `done` is set only by `message_stop`, so only a stream that reaches it is `ok`, whatever its `stop_reason` (`max_tokens` is a whole response, recorded as the finish reason). A stream that ends cleanly without `message_stop`, and one with an in-band `error` event behind HTTP 200, are counted as not read, so they are `errored`; a gap makes the Workunit `incomplete` first. An error body on a non-2xx status is read: an `ok` Workunit with that status and `error_type` set. A whole JSON body of any other `type` (the API names every stream event, so an unnamed frame is a body) is not read, so it is `errored`.
 - `extra`: `cache_creation_input_tokens`, `cache_read_input_tokens`, `stop_sequence`, and `error_type` (`error.type` of an error body or event, e.g. `overloaded_error`).
+
+**DNS and covert-channel features (TS-51).** Decoded at the edge, at 100%, because they are parsers of adversary bytes that are cheap here and expensive to rebuild from L0 later ([verification-pipeline §5](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/verification-pipeline.md)). They are facts: Allowlist rules ("DNS to resolver X, zones in Y, ≤ N B/s"), Signatures and statuses stay in the Classifier.
+- **Which datagrams.** Every UDP datagram, on any port, is tried as one DNS message (RFC 1035 §4.1); a datagram is DNS only when it parses. Ports never count: DNS to a non-standard port is DNS, and a datagram to port 53 that does not parse is not.
+- **Strict parse.** A 12-byte header with a known opcode (QUERY, IQUERY, STATUS, NOTIFY, UPDATE, DSO) and at least one question; then every question and resource record the header counts must parse. Names are read label by label: 63 bytes a label, 255 a name; label types `01` and `10` are rejected; a compression pointer must point backwards, at most 128 per name. A datagram the capture cut is not read. Bytes after the last record do not stop the parse; they are counted in `trailing_bytes`, since data hidden there is worth seeing.
+- **Not changed:** a UDP Flow's verdict stays `opaque` and its bytes `unexplained` (below), and the Capture Rate keeps it as an alarm Flow (§7). The Classifier reads the `dns` and `features` tables to match an Allowlist rule.
+- **Not in TS-51:** DNS over TCP (it stays `opaque`), DNS over TLS or HTTPS (opaque by design), EDNS options, mDNS-specific fields.
+
+`dns`: one row per DNS message, in its packet's window.
+
+| Column | Meaning |
+|---|---|
+| `window_start_ns`, `index`, `ts_ns`, `flow`, `dir` | The packet that carried it (joins `packets`) and its direction |
+| `id`, `response`, `opcode`, `rcode`, `aa`, `tc`, `rd`, `ra` | Header fields; `response` is QR; `rcode` is the header's 4 bits (no EDNS extension) |
+| `questions`, `answers`, `authority`, `additional` | Section counts, as the header gives them |
+| `qname`, `qtype`, `qclass` | The first question. `qname` is in presentation form (RFC 1035 §5.1): bytes outside `!`..`~` are `\DDD`, `.` and `\` inside a label are escaped, the root is `.`; case as sent |
+| `qname_len`, `labels`, `label_len_max` | Label bytes plus the dots between them; label count; longest label |
+| `qname_entropy` | Shannon entropy of the name's label bytes, ASCII letters folded to lower case (so 0x20 case randomisation adds nothing), in bits per byte, rounded to 3 decimals; `null` for the root |
+| `txt_records`, `txt_bytes`, `txt_max` | TXT records in any section; the sum and largest of their RDATA lengths (`null` with none) |
+| `size`, `trailing_bytes` | The message's bytes (the UDP payload); bytes after the last record |
+
+`features`: one row per Flow per Slice that has any feature, after the Flow's row. Columns come in **families**, one per decoder, named `{family}_{feature}`; a family is `null` when its decoder saw nothing in the Slice. TS-51 adds `dns_*`; TLS ClientHello and NTP (TS-52, TS-53) add their own families after it, so existing columns never move or change type. The row is keyed by `window_start_ns`, `flow` and `link`, which join `flows`.
+
+| Column | Meaning |
+|---|---|
+| `dns_messages`, `dns_queries`, `dns_responses` | DNS messages in the Slice, both directions |
+| `dns_other_datagrams` | The Flow's datagrams in the Slice that are not DNS (did not parse, or were cut) |
+| `dns_query_bytes`, `dns_response_bytes`, `dns_bytes` | DNS message bytes: queries, responses, both (bytes per Slice) |
+| `dns_query_rate` | Queries per second of the window, rounded to 3 decimals |
+| `dns_qname_entropy_max`, `dns_qname_entropy_mean` | Over the queries' `qname_entropy` |
+| `dns_qname_len_max`, `dns_label_len_max`, `dns_label_len_mean` | Over the queries' names; the mean is over every label of every query name |
+| `dns_txt_records`, `dns_txt_bytes`, `dns_txt_max` | Over every message's TXT records |
+
+Name features are taken over queries only, so a name its response repeats counts once. Ratios are rounded to 3 decimals so they print the same on every platform; they are computed from the capture alone, so two runs give the same rows (§3).
 
 **Byte accounting.** For each Flow, direction and Slice, every stream byte falls in exactly one bucket:
 
@@ -311,9 +345,10 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - `flows`: per-Flow, per-Slice metadata, verdict, buckets, Slice hash;
   - `packets`: chunk, packet index, timestamp, Flow, direction, stream offset, captured and original length, packet hash;
   - `workunits`: L3 records;
-  - `blobs`: hash → pack location.
+  - `blobs`: hash → pack location;
+  - `dns` and `features` (TS-51, §5): DNS messages, and covert-channel features per Flow per Slice.
   - As built (TS-26), also `segments`, `events` and `http`, the same tables as the local JSONL, and `chunks`: one row per L0 chunk with its key, chunk hash, Merkle root, packet count and the Capture Rate's kept and truncated bytes, and (TS-38) the number of `parts` it is stored in.
-  - Each table has a fixed schema, so a column keeps its type in every window. Nested records are flattened (`orig_stats.packets` → `orig_stats_packets`). Values the Operator sends as arbitrary JSON (`usage`, `seed`, `n`), and lists, are JSON text. Every column is optional.
+  - Each table has a fixed schema, so a column keeps its type in every window. Nested records are flattened (`orig_stats.packets` → `orig_stats_packets`, `dns.query_rate` → `dns_query_rate`). Ratios (entropy, rates) are doubles. Values the Operator sends as arbitrary JSON (`usage`, `seed`, `n`), and lists, are JSON text. Every column is optional.
   - A row goes in the window it belongs to (a packet's, a Slice's) while that window is held; otherwise, and for `http`, `workunits` and pack items, in the newest window held when it is written.
 - **Local view.** `bodies/` and `by-exchange/` stay beside the tables as the local view; packs are the store.
 - **Tamper evidence (optional):** S3 Object Lock in compliance mode makes objects WORM, even for the account root. It needs versioning (research §4).
@@ -400,6 +435,7 @@ _As built (TS-27): 1, 2, 4 and 6 run in CI over the whole golden set, all four W
    - HTTP/1.1 JSON, HTTP/1.1 SSE with chunked encoding, h2c JSON and SSE;
    - a Flow spanning windows, a mid-stream start, a lost segment, a retransmit with different bytes;
    - `/health`, a TLS Flow on the plaintext Link, a non-HTTP TCP Flow, UDP;
+   - DNS (TS-51): A and TXT lookups, big TXT answers, tunnel-like names over two windows, trailing bytes, a datagram that is not DNS, a compression loop, DNS to a non-standard port;
    - content codings (TS-37): gzip JSON, gzip SSE flushed per event, and one Flow with `deflate` (zlib and raw), `br`, `zstd`, a gzip request body, an unknown coding, a gzip bomb and a cut-off gzip stream.
 2. **Determinism:** two runs over the same files give byte-identical tables.
 3. **Live equals offline:** a live `RingSource` run and a `FileSource` run over the same dumpcap files give the same output.

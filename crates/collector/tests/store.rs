@@ -402,7 +402,7 @@ fn capture_rate_truncates_workunits_it_does_not_keep() {
     assert_eq!(s.capture_truncated_bytes, cc["truncated_bytes"].as_u64().unwrap());
     assert_eq!(s.store_objects[0], 1);
     assert_eq!(s.store_objects[1], 1);
-    assert_eq!(s.store_objects[2], 8);
+    assert_eq!(s.store_objects[2], collector::index::TABLES.len() as u64);
 }
 
 #[test]
