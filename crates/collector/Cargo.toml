@@ -23,6 +23,8 @@ parquet = { version = "60", default-features = false, features = ["zstd"] }
 zstd = "0.14"
 flate2 = "1"
 brotli = "9"
+ed25519-dalek = "2"
+getrandom = "0.3"
 
 [dev-dependencies]
 futures = "0.3"

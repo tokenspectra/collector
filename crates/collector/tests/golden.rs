@@ -1110,7 +1110,7 @@ fn tables_and_views_are_on_disk_when_a_window_closes() {
     // Left by an earlier run into the same directory.
     std::fs::create_dir_all(dir.path().join("by-exchange/stale")).unwrap();
     std::fs::write(dir.path().join("by-exchange/stale/0.request.json"), "{}").unwrap();
-    let mut sink = JsonlSink::create(dir.path()).unwrap();
+    let mut sink = JsonlSink::create(dir.path(), collect::test_key()).unwrap();
     let mut source = FileSource::new(fixture_paths(&["openai_h1_sse.pcapng"]));
     run(
         &mut source,

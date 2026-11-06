@@ -27,7 +27,9 @@ use collector::run::run;
 use collector::stats::{serve_metrics, HttpClass, Outcome, Registry, Snapshot, VerdictLabel, BUCKETS, DIRS};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource};
 
-use collect::{collect_observed, fixture_paths, tables_and_bodies_with, Collected, WINDOW_NS};
+use collect::{
+    collect_observed, fixture_paths, tables_and_bodies_with, write_test_key, Collected, WINDOW_NS,
+};
 use fixtures::cases;
 
 fn observed(files: &[String]) -> (Collected, Snapshot) {
@@ -398,6 +400,8 @@ fn bin() -> &'static str {
 /// `collector -v --log-format json files ...` over a case: (log lines, output dir).
 fn run_cli(files: &[String], extra: &[&str]) -> (Vec<serde_json::Value>, tempfile::TempDir) {
     let out = tempfile::tempdir().unwrap();
+    // One key for every run, so their manifests are the same.
+    write_test_key(&out.path().join("signing.key"));
     let paths: Vec<PathBuf> = fixture_paths(&files.iter().map(String::as_str).collect::<Vec<_>>());
     let output = Command::new(bin())
         .args(["--log-format", "json"])

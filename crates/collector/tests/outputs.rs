@@ -17,14 +17,15 @@ use std::process::Command;
 use std::time::Duration;
 
 use collector::capture::CaptureConfig;
-use collector::manifest::LOG;
+use collector::manifest::{verify_log, LOG};
 use collector::ship::{pending_lines, ship_pending, Ingest, ShipError, CURSOR};
+use collector::sign::{KeyProvider, SoftwareKey};
 use collector::store::StoreConfig;
 use collector::{DecoderConfig, FileSource};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::Value;
 
-use collect::{fixture_paths, run_stored, run_to_dir, WINDOW_NS};
+use collect::{fixture_paths, run_stored, run_to_dir, TEST_SEED, WINDOW_NS};
 use fixtures::{cases, CAPTURED};
 use ingest::MockIngest;
 
@@ -96,6 +97,11 @@ fn manifests_name_every_object_and_sum_to_the_tables() {
         let store = out.path().join("store");
         let manifests = lines(&out.path().join(LOG));
         assert!(!manifests.is_empty(), "{case}: no manifest");
+        // One chain, signed with the run's key, from a fresh log.
+        let log = std::fs::read(out.path().join(LOG)).unwrap();
+        let chain = verify_log(&log, SoftwareKey::from_seed(TEST_SEED).public_key()).unwrap();
+        assert_eq!(chain.len(), manifests.len(), "{case}");
+        assert!(chain.iter().all(|v| !v.restart), "{case}");
 
         // One manifest per sealed window, in order, each window once.
         let windows: Vec<u64> = manifests
@@ -303,8 +309,9 @@ fn two_runs_give_byte_identical_output_directories() {
     }
 }
 
-/// The CLI ships each window as it is sealed, and a second run into the same
-/// directory appends the same manifests, which the ingest takes as repeats.
+/// The CLI signs and ships each window as it is sealed. A second run into
+/// the same directory finds every window already in the log, so it appends
+/// and ships nothing.
 #[test]
 fn the_cli_ships_to_the_ingest() {
     let ingest = MockIngest::start();
@@ -347,11 +354,16 @@ fn the_cli_ships_to_the_ingest() {
     assert_eq!((held.len() as u64, accepted), (n, n));
     assert!(held.keys().all(|k| k.starts_with("cli/")));
 
+    // Signed with the key the CLI made in the output directory.
+    let key = SoftwareKey::open_or_create(&out.path().join("signing.key")).unwrap();
+    let log = std::fs::read(out.path().join(LOG)).unwrap();
+    assert_eq!(verify_log(&log, key.public_key()).unwrap().len() as u64, n);
+
     run();
-    assert_eq!(lines(&out.path().join(LOG)).len() as u64, 2 * n);
+    assert_eq!(std::fs::read(out.path().join(LOG)).unwrap(), log);
     assert_eq!(pending_lines(out.path()).unwrap(), 0);
     let (again, accepted, duplicates, conflicts) = ingest.snapshot();
-    assert_eq!((again, accepted, duplicates, conflicts), (held, n, n, 0));
+    assert_eq!((again, accepted, duplicates, conflicts), (held, n, 0, 0));
 }
 
 /// The CLI with an `s3://` store and the AWS variables that could name an

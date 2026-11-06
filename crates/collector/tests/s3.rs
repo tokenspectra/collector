@@ -339,7 +339,7 @@ fn run_spooled_from(
     spool: Arc<Spool>,
     reg: Arc<Registry>,
 ) -> Result<(), collector::store::StoreError> {
-    let mut sink = JsonlSink::create(out).unwrap();
+    let mut sink = JsonlSink::create(out, collect::test_key()).unwrap();
     let mut stored = StoreSink::spooled(&mut sink, spool, StoreConfig::new(WINDOW_NS), Some(reg));
     collector::run::run(
         source,

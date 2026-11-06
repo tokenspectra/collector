@@ -59,6 +59,7 @@ Global options:
       --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
       --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
       --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
       --site <SITE>                    The {site} part of object keys [default: local]
       --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
       --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
@@ -97,6 +98,7 @@ Global options:
       --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
       --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
       --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
       --site <SITE>                    The {site} part of object keys [default: local]
       --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
       --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
@@ -135,6 +137,7 @@ Global options:
       --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
       --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
       --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
       --site <SITE>                    The {site} part of object keys [default: local]
       --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
       --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
@@ -173,6 +176,7 @@ Global options:
       --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
       --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
       --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
       --site <SITE>                    The {site} part of object keys [default: local]
       --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
       --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
@@ -211,6 +215,7 @@ Global options:
       --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
       --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
       --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
       --site <SITE>                    The {site} part of object keys [default: local]
       --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
       --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
@@ -254,6 +259,7 @@ Global options:
       --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
       --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
       --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
       --site <SITE>                    The {site} part of object keys [default: local]
       --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
       --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]

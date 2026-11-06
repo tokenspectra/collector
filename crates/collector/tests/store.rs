@@ -270,7 +270,7 @@ fn an_object_with_other_bytes_is_never_overwritten() {
         .unwrap();
     std::fs::write(dir.path().join("store").join(&pack), b"tampered").unwrap();
     let store = Arc::new(local(dir.path()));
-    let mut sink = collector::output::JsonlSink::create(dir.path()).unwrap();
+    let mut sink = collector::output::JsonlSink::create(dir.path(), collect::test_key()).unwrap();
     let mut stored = collector::store::StoreSink::new(&mut sink, store, StoreConfig::new(WINDOW_NS), None);
     collector::run::run(
         &mut FileSource::new(fixture_paths(&["openai_h1_json.pcapng"])),

@@ -8,8 +8,8 @@
 //! `blobs` (one row per pack item). Rows are written in a fixed order with fixed field order, so
 //! the files are byte-identical across runs.
 //!
-//! Each window's manifest is appended to the manifest log
-//! ([`manifest::LOG`](crate::manifest::LOG)) as the store seals it.
+//! Each window's manifest is signed, chained and appended to the manifest
+//! log ([`manifest::LOG`](crate::manifest::LOG)) as the store seals it.
 //!
 //! HTTP bodies go to `bodies/{multihash}`, one file per distinct body, until
 //! packs exist (spec §8). `b3sum` of a file prints the last 64 digits of its
@@ -30,6 +30,7 @@ use serde::Serialize;
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord};
 use crate::manifest::{Log, WindowManifest};
+use crate::sign::KeyProvider;
 use crate::store::{BlobRecord, ChunkRecord};
 use crate::{mh, views};
 
@@ -70,9 +71,9 @@ pub struct JsonlSink {
 
 impl JsonlSink {
     /// Creates the table files in `dir`, which must exist, opens the
-    /// manifest log there for appending, and removes a `by-exchange/` left
-    /// there by an earlier run.
-    pub fn create(dir: &Path) -> io::Result<Self> {
+    /// manifest log there for appending, signed with `key`, and removes a
+    /// `by-exchange/` left there by an earlier run.
+    pub fn create(dir: &Path, key: Box<dyn KeyProvider>) -> io::Result<Self> {
         let stale = dir.join(views::BY_EXCHANGE);
         if stale.exists() {
             std::fs::remove_dir_all(stale)?;
@@ -87,7 +88,7 @@ impl JsonlSink {
             workunits: open("workunits")?,
             chunks: open("chunks")?,
             blobs: open("blobs")?,
-            log: Log::open(dir)?,
+            log: Log::open(dir, key)?,
             out: dir.to_owned(),
             bodies: dir.join(BODIES),
             unlinked: Vec::new(),
