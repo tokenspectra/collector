@@ -234,6 +234,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "bundle"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -356,14 +364,15 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "brotli",
+ "bundle",
  "bytes",
  "clap",
+ "commit",
  "ed25519-dalek",
  "flate2",
  "futures",
  "getrandom 0.3.4",
  "libc",
- "multihash",
  "object_store",
  "parquet",
  "pcap-file",
@@ -393,6 +402,14 @@ checksum = "4356eba6976435498d05a311ee9fc486da3bc81c200d3f0d7dd9703b41913f92"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "commit"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "multihash",
 ]
 
 [[package]]

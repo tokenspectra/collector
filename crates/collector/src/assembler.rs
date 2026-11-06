@@ -8,11 +8,11 @@
 
 use std::collections::HashMap;
 
+use commit::mh;
 use serde::Serialize;
 
 use crate::dns::Datagram;
 use crate::flow::{Dir, Endpoint, FlowId, FlowKind, Tuple};
-use crate::mh;
 use crate::net::{self, Decoded, Transport, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
 use crate::packet::{CapturedPacket, LinkId, PacketRef};
 use crate::tcp::{Emit, TcpDir};

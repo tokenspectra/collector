@@ -39,6 +39,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+pub use bundle::manifest::ChunkRecord;
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -115,30 +116,6 @@ impl StoreConfig {
             part_bytes: 1 << 30,
         }
     }
-}
-
-/// One L0 chunk as written (the `chunks` table, spec §6 "chunk index").
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ChunkRecord {
-    pub link: LinkId,
-    pub window_start_ns: u64,
-    pub key: String,
-    /// BLAKE3 of the uncompressed pcapng, as stored.
-    pub chunk_hash: String,
-    /// Merkle root over the packets' hashes (spec §6, [`chunk::merkle_root`]).
-    pub merkle_root: String,
-    pub packets: u64,
-    pub truncated_packets: u64,
-    /// Captured bytes stored, and captured bytes cut by the Capture Rate.
-    pub kept_bytes: u64,
-    pub truncated_bytes: u64,
-    pub pcapng_len: u64,
-    /// Size of the compressed chunk, all parts together.
-    pub stored_len: u64,
-    /// Objects it is stored in: 1 is the object at `key`; more are
-    /// `{key}-part0` to `{key}-part{parts - 1}`, whose bytes joined in order
-    /// are the compressed chunk.
-    pub parts: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

@@ -8,9 +8,8 @@
 
 use std::io::{self, Write};
 
+use commit::mh;
 use serde::Serialize;
-
-use crate::mh;
 
 /// Decoded bytes below which the ratio cap does not apply, so a small body
 /// that compresses well (`{}` under gzip is 20 bytes on the wire) is read.

@@ -28,9 +28,14 @@ jobs:
           # Set by hand: Dependabot moves the action's SHA, not this input.
           toolchain: "1.99.1"
           components: rustfmt, clippy
+          targets: thumbv7em-none-eabi, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
+      # The trusted core has to build where there is no std, and for the
+      # Console in the browser.
+      - run: cargo build -p commit --target thumbv7em-none-eabi
+      - run: cargo build -p commit --target wasm32-unknown-unknown
       # A bucket of the posix backend is a top-level directory.
       - name: Start VersityGW
         run: |
