@@ -32,9 +32,16 @@
 //! the channel down carries on too. The run keeps capturing with its last
 //! config and current seed epoch, windows wait in the log and the spool, and
 //! each manifest sealed meanwhile says `observed.channel_cut`.
+//!
+//! **One process per Fleet directory.** Each process keeps its own copy of
+//! [`STATE`] and writes all of it, so a second one would put back what the
+//! first has moved on from. [`Fleet::open`] takes an OS lock on [`LOCK`]
+//! before it reads anything and holds it for as long as the [`Fleet`] lives.
+//! The OS lets go when the process ends, however it ends, so a crash leaves
+//! nothing stale; the file itself stays.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +68,9 @@ pub const KIND: &str = "collector";
 
 /// What the Collector keeps of its enrolment, in the Fleet directory.
 pub const STATE: &str = "state.json";
+
+/// Held by the process using the Fleet directory, beside [`STATE`].
+pub const LOCK: &str = "lock";
 
 /// The Fleet key's signature contexts, so a signature on one thing can't
 /// pass for another.
@@ -94,6 +104,8 @@ pub enum FleetError {
     NoToken,
     #[error("Fleet: {0}: plain http:// needs --dev-plain-http")]
     Plain(String),
+    #[error("Fleet: {0} is in use by another Collector; a running capture ships its own log")]
+    Busy(PathBuf),
 }
 
 fn bad(what: impl fmt::Display) -> FleetError {
@@ -295,6 +307,8 @@ pub struct Fleet {
     running: Mutex<Running>,
     last_contact: Mutex<Instant>,
     stopping: AtomicBool,
+    /// Never read: the lock lasts as long as the open file.
+    _lock: File,
 }
 
 impl fmt::Debug for Fleet {
@@ -316,9 +330,11 @@ pub struct Stamp {
 impl Fleet {
     /// Picks up the enrolment kept in `opts.dir`, or enrols if there is
     /// none. Kept state needs no network, so a Collector that restarts
-    /// with the channel cut goes on capturing.
+    /// with the channel cut goes on capturing. A directory another process
+    /// holds is refused, before anything in it is read or written.
     pub fn open(opts: FleetOptions) -> Result<Arc<Self>, FleetError> {
         make_private_dir(&opts.dir)?;
+        let lock = lock_dir(&opts.dir)?;
         let root =
             VerifyingKey::from_bytes(&opts.root).map_err(|_| bad("--fleet-root is not an Ed25519 key"))?;
         let tls_key: Arc<dyn KeyProvider> = Arc::new(SoftwareKey::open_or_create(&opts.dir.join("tls.key"))?);
@@ -382,6 +398,7 @@ impl Fleet {
             running: Mutex::new(running),
             last_contact: Mutex::new(Instant::now()),
             stopping: AtomicBool::new(false),
+            _lock: lock,
         }))
     }
 
@@ -826,6 +843,20 @@ fn make_private_dir(dir: &Path) -> io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// Takes `dir` for this process, or says who has it. Never waits.
+fn lock_dir(dir: &Path) -> Result<File, FleetError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(FleetError::Busy(dir.to_path_buf())),
+        Err(TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 /// Replaces [`STATE`] in `dir` atomically, synced.

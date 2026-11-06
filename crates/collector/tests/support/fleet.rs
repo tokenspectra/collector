@@ -80,6 +80,8 @@ pub struct MockFleet {
     pub state: Arc<Mutex<State>>,
     /// Connections are dropped at once: the Operator cut the channel.
     pub cut: Arc<AtomicBool>,
+    /// Pulls are counted, then left waiting: a run stays in its first poll.
+    pub hold: Arc<AtomicBool>,
     client_ca: Arc<(CertificateParams, KeyPair)>,
     _dir: tempfile::TempDir,
 }
@@ -191,10 +193,12 @@ impl MockFleet {
             hpke_key: None,
         }));
         let cut = Arc::new(AtomicBool::new(false));
+        let hold = Arc::new(AtomicBool::new(false));
         let client_ca = Arc::new((ca_params, ca_key));
         let server = Server {
             root: root.clone(),
             state: state.clone(),
+            hold: hold.clone(),
             client_ca: client_ca.clone(),
         };
         let (tls, down) = (Arc::new(tls), cut.clone());
@@ -217,6 +221,7 @@ impl MockFleet {
             root,
             state,
             cut,
+            hold,
             client_ca,
             _dir: dir,
         }
@@ -248,6 +253,7 @@ impl MockFleet {
 struct Server {
     root: SigningKey,
     state: Arc<Mutex<State>>,
+    hold: Arc<AtomicBool>,
     client_ca: Arc<(CertificateParams, KeyPair)>,
 }
 
@@ -307,8 +313,11 @@ impl Server {
             "/enrol" => self.enrol(&v, client_cert),
             "/pull" if !client_cert => ("403 Forbidden", "no client certificate".into()),
             "/pull" => {
+                self.state.lock().unwrap().pulls.push(v);
+                while self.hold.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 let mut s = self.state.lock().unwrap();
-                s.pulls.push(v);
                 let reply = json!({
                     "config": s.next_config.take(),
                     "seeds": std::mem::take(&mut s.next_seeds),

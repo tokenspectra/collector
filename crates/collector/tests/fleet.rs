@@ -7,7 +7,8 @@ mod collect;
 mod fleet_mock;
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -484,6 +485,40 @@ fn ship_renews_a_certificate_that_ran_out_before_it_drains_the_log() {
     assert_eq!(s.windows.len(), lines.len());
     assert!(!s.attested.last().unwrap().client_cert);
     assert_eq!(pending_lines(&out).unwrap(), 0);
+}
+
+#[test]
+fn one_process_holds_the_fleet_directory_and_a_crash_lets_it_go() {
+    let mock = MockFleet::start();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let state = out.join("fleet").join(STATE);
+
+    // A capture, held in its first poll: enrolled, with the channel up.
+    mock.hold.store(true, Ordering::Relaxed);
+    let mut capture = cli(&mock, &out);
+    files(&mut capture, &out);
+    let mut capture = capture.stdout(Stdio::null()).spawn().unwrap();
+    wait_for("the capture's first poll", || {
+        !mock.state.lock().unwrap().pulls.is_empty()
+    });
+    let kept = std::fs::read(&state).unwrap();
+
+    // `ship` beside it is refused before it reads or writes anything.
+    let ship = cli(&mock, &out).arg("ship").arg(&out).output().unwrap();
+    assert!(!ship.status.success());
+    let said = String::from_utf8_lossy(&ship.stdout);
+    assert!(said.contains("in use by another Collector"), "{said}");
+    assert_eq!(std::fs::read(&state).unwrap(), kept);
+    assert_eq!(mock.state.lock().unwrap().attested.len(), 1);
+    assert_eq!(mock.state.lock().unwrap().pulls.len(), 1);
+
+    // A killed process leaves nothing behind that holds the next one up.
+    capture.kill().unwrap();
+    capture.wait().unwrap();
+    mock.hold.store(false, Ordering::Relaxed);
+    let ship = cli(&mock, &out).arg("ship").arg(&out).output().unwrap();
+    assert!(ship.status.success(), "{}", String::from_utf8_lossy(&ship.stdout));
 }
 
 #[test]
