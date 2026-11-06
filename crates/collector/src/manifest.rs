@@ -430,6 +430,11 @@ mod tests {
 
     const SEED: [u8; 32] = [1; 32];
 
+    const PINNED: &str = concat!(
+        "{\"site\":\"local\",\"collector\":\"c1\",\"window_start_ns\":0,\"window_ns\":10,\"links\":[\"lo\"],\"chunks\":[{\"link\":\"lo\",\"window_start_ns\":0,\"key\":\"raw/c\",\"chunk_hash\":\"f1e206b1d440ada61d0f4e4416c73bcbab3694f96875a3e5df3253075163ffe93cd4d\",\"merkle_root\":\"f1e2092a2b787a06d7272df43eaf87acc3b9c1d315d79d599d61c285983483e431998\",\"packets\":1,\"truncated_packets\":2,\"kept_bytes\":3,\"truncated_bytes\":4,\"pcapng_len\":5,\"stored_len\":6,\"parts\":1}],\"pack\":\"pack/p\",\"index\":[{\"table\":\"packets\",\"key\":\"index/p\",\"rows\":1}],\"totals\":{\"packets\":1,\"bytes\":2,\"kept_bytes\":3,\"truncated_bytes\":4,\"flows\":5,\"exchanges\":6,\"workunits\":7,\"events\":8,\"blobs\":9},\"chain\":{\"seq\":0,\"prev\":null,\"restart\":false,\"key\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\"},\"sig\":\"4946a2dc63dee3f4ad7e7400acced7f72d42f51d7cb79ec2c26bc5ead2c61662b1052c7680c4f3606eca3510cc23fa74438fb13d6fbed263bdc198f99a6ebd00\"}\n",
+        "{\"site\":\"local\",\"collector\":\"c1\",\"window_start_ns\":10,\"window_ns\":10,\"links\":[\"lo\"],\"chunks\":[],\"pack\":null,\"index\":[],\"totals\":{\"packets\":0,\"bytes\":0,\"kept_bytes\":0,\"truncated_bytes\":0,\"flows\":0,\"exchanges\":0,\"workunits\":0,\"events\":0,\"blobs\":0},\"chain\":{\"seq\":1,\"prev\":\"f1e20a634eed8799c7f9db6e64262d58d858642847cd693ea1a13dd807aa773f7c482\",\"restart\":false,\"key\":\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\"},\"sig\":\"c5fe494ca6850218a300f6c15865494e3483d5b4b1565201e7b6b9e40d34a170199f7403da0ab51c0a7b889a5ac984a8106b20375cab2da50064493cab59b40c\"}\n",
+    );
+
     fn manifest(w: u64) -> WindowManifest {
         WindowManifest {
             site: "local".into(),
@@ -623,5 +628,51 @@ mod tests {
             v.iter().map(|v| v.restart).collect::<Vec<_>>(),
             [false, false, true]
         );
+    }
+
+    /// The bytes of a line are the format: every field of the manifest, in
+    /// order, under a fixed key.
+    #[test]
+    fn a_signed_line_keeps_its_bytes() {
+        let m = WindowManifest {
+            chunks: vec![ChunkRecord {
+                link: LinkId::new("lo"),
+                window_start_ns: 0,
+                key: "raw/c".into(),
+                chunk_hash: mh::of(b"chunk"),
+                merkle_root: mh::of(b"root"),
+                packets: 1,
+                truncated_packets: 2,
+                kept_bytes: 3,
+                truncated_bytes: 4,
+                pcapng_len: 5,
+                stored_len: 6,
+                parts: 1,
+            }],
+            pack: Some("pack/p".into()),
+            index: vec![IndexFile {
+                table: "packets".into(),
+                key: "index/p".into(),
+                rows: 1,
+            }],
+            totals: Totals {
+                packets: 1,
+                bytes: 2,
+                kept_bytes: 3,
+                truncated_bytes: 4,
+                flows: 5,
+                exchanges: 6,
+                workunits: 7,
+                events: 8,
+                blobs: 9,
+            },
+            ..manifest(0)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), key(SEED)).unwrap();
+        log.append(&m).unwrap();
+        log.append(&manifest(10)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(LOG)).unwrap();
+        assert_eq!(text, PINNED);
     }
 }
