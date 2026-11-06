@@ -210,10 +210,20 @@ pub struct StoreSummary {
     pub index_files: u64,
 }
 
-/// Wraps a [`RecordSink`]: writes the object store and forwards every
+/// A [`RecordSink`] that also hears what the store wrote.
+pub trait ObjectSink: RecordSink {
+    /// An L0 chunk was written (spec §6–8).
+    fn chunk(&mut self, _rec: &ChunkRecord) {}
+    /// A pack item was written (spec §8).
+    fn blob(&mut self, _rec: &BlobRecord) {}
+    /// A window was sealed: every object it names is written (spec §11).
+    fn manifest(&mut self, _rec: &WindowManifest) {}
+}
+
+/// Wraps an [`ObjectSink`]: writes the object store and forwards every
 /// record, plus a `chunks` and a `blobs` record per object written.
 pub struct StoreSink<'a> {
-    inner: &'a mut dyn RecordSink,
+    inner: &'a mut dyn ObjectSink,
     store: Arc<dyn ObjectStore>,
     cfg: StoreConfig,
     reg: Option<Arc<Registry>>,
@@ -230,7 +240,7 @@ pub struct StoreSink<'a> {
 
 impl<'a> StoreSink<'a> {
     pub fn new(
-        inner: &'a mut dyn RecordSink,
+        inner: &'a mut dyn ObjectSink,
         store: Arc<dyn ObjectStore>,
         cfg: StoreConfig,
         reg: Option<Arc<Registry>>,
@@ -254,7 +264,7 @@ impl<'a> StoreSink<'a> {
     /// Writes into `spool` instead: each put waits for room in it, and
     /// queues the object for the uploader once it is there.
     pub fn spooled(
-        inner: &'a mut dyn RecordSink,
+        inner: &'a mut dyn ObjectSink,
         spool: Arc<Spool>,
         cfg: StoreConfig,
         reg: Option<Arc<Registry>>,
@@ -1011,6 +1021,9 @@ mod tests {
         fn workunit(&mut self, _: &WorkunitRecord) {}
         fn dns(&mut self, _: &DnsRecord) {}
         fn features(&mut self, _: &FeaturesRecord) {}
+    }
+
+    impl ObjectSink for Chunks {
         fn chunk(&mut self, rec: &ChunkRecord) {
             self.0.push(rec.clone());
         }

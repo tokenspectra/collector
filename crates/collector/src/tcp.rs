@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::assembler::{DirStats, EventKind, EventRecord, FlowSink, SegmentRecord};
 use crate::flow::{Dir, FlowId};
-use crate::window::PacketRef;
+use crate::packet::PacketRef;
 
 /// Where reassembly output goes for one direction.
 pub(crate) struct Emit<'a> {

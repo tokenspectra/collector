@@ -6,17 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
-
-use crate::source::LinkId;
-
-/// Where a packet sits in L0: the chunk (this Link's packets in the window
-/// starting at `window_start_ns`) and its index within that chunk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct PacketRef {
-    pub window_start_ns: u64,
-    pub index: u32,
-}
+use crate::packet::LinkId;
+pub use crate::packet::PacketRef;
 
 /// Assigns packets to windows in capture order.
 ///

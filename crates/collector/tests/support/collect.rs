@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord, SliceRecord};
 use collector::decode::FeaturesRecord;
-use collector::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
+use collector::decode::{BodyKey, ExchangeRecord, FlowRecord, Observed, RecordSink, WorkunitRecord};
 use collector::dns::DnsRecord;
 use collector::flow::Dir;
 use collector::manifest::LOG;
-use collector::observe::StatsSink;
+use collector::observe::Stats;
 use collector::output::{JsonlSink, BODIES, TABLES};
 use collector::run::run;
 use collector::sign::{KeyProvider, SoftwareKey};
@@ -154,7 +154,7 @@ pub fn collect(source: &mut dyn PacketSource) -> Collected {
     sink
 }
 
-/// Like [`collect`], through a [`StatsSink`]; returns the final counters too.
+/// Like [`collect`], through a [`Stats`]; returns the final counters too.
 pub fn collect_observed(source: &mut dyn PacketSource) -> (Collected, Snapshot) {
     let mut sink = Collected::default();
     let reg = Registry::new();
@@ -163,7 +163,7 @@ pub fn collect_observed(source: &mut dyn PacketSource) -> (Collected, Snapshot) 
         WINDOW_NS,
         AssemblerConfig::default(),
         DecoderConfig::default(),
-        &mut StatsSink::new(&mut sink, reg.clone()),
+        &mut Observed::new(&mut sink, Stats::new(reg.clone())),
     )
     .expect("run");
     (sink, reg.snapshot())
@@ -189,7 +189,7 @@ pub fn tables_and_bodies(source: &mut dyn PacketSource, keep_bodies: bool) -> (F
 }
 
 /// Like [`tables_and_bodies`]; with `observe`, the sink is wrapped in a
-/// [`StatsSink`] the way the CLI runs it.
+/// [`Stats`] the way the CLI runs it.
 pub fn tables_and_bodies_with(
     source: &mut dyn PacketSource,
     keep_bodies: bool,
@@ -234,7 +234,7 @@ pub fn tables_and_bodies_with(
 
 /// Runs `source` into `out` the way the CLI does: tables in `out`, the
 /// object store in `out/store`, and with a registry, through a
-/// [`StatsSink`].
+/// [`Stats`].
 pub fn run_stored(
     source: &mut dyn PacketSource,
     out: &Path,
@@ -261,7 +261,7 @@ pub fn run_into(
     let mut stored = StoreSink::new(&mut sink, store, store_cfg, reg.clone());
     match reg {
         Some(reg) => {
-            let mut stats = StatsSink::new(&mut stored, reg);
+            let mut stats = Observed::new(&mut stored, Stats::new(reg));
             run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut stats).expect("run");
         }
         None => {

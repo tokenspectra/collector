@@ -14,9 +14,8 @@ use crate::dns::Datagram;
 use crate::flow::{Dir, Endpoint, FlowId, FlowKind, Tuple};
 use crate::mh;
 use crate::net::{self, Decoded, Transport, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
-use crate::source::{CapturedPacket, LinkId};
+use crate::packet::{CapturedPacket, LinkId, PacketRef};
 use crate::tcp::{Emit, TcpDir};
-use crate::window::PacketRef;
 
 const SECOND: u64 = 1_000_000_000;
 

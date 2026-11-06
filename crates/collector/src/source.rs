@@ -4,11 +4,9 @@
 //! the same files always yield the same packets.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use pcap_file::pcap::PcapReader;
 use pcap_file::pcapng::blocks::interface_description::{
@@ -18,46 +16,7 @@ use pcap_file::pcapng::blocks::interface_statistics::InterfaceStatisticsOption;
 use pcap_file::pcapng::{Block, PcapNgReader};
 use pcap_file::TsResolution;
 
-/// A Link, named after the capture interface (`if_name` in the pcapng
-/// Interface Description Block, or `if<N>` when the block has no name).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LinkId(pub Arc<str>);
-
-impl LinkId {
-    pub fn new(name: &str) -> Self {
-        LinkId(Arc::from(name))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for LinkId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl serde::Serialize for LinkId {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.0)
-    }
-}
-
-/// One packet as captured on a Link.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapturedPacket {
-    pub link_id: LinkId,
-    /// pcap LINKTYPE_* of the interface.
-    pub link_type: u32,
-    /// Capture timestamp in nanoseconds since the Unix epoch.
-    pub ts_ns: u64,
-    /// Length of the packet on the wire.
-    pub orig_len: u32,
-    /// Captured bytes (`data.len()` is the captured length).
-    pub data: Vec<u8>,
-}
+pub use crate::packet::{CapturedPacket, LinkId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {

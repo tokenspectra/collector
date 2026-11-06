@@ -1,10 +1,9 @@
-//! Diagnostics beside the pipeline (spec §14): [`StatsSink`] counts and logs
+//! Diagnostics beside the pipeline (spec §14): [`Stats`] counts and logs
 //! everything on its way to the real sink, and the snapshot triggers print
 //! the registry on demand.
 //!
-//! [`StatsSink`] forwards every call unchanged, so wrapping a sink never
-//! changes what it writes. Wall-clock time appears only here, in logs and
-//! in the lag gauge.
+//! [`Stats`] is an [`Observer`], so it never changes what a sink writes.
+//! Wall-clock time appears only here, in logs and in the lag gauge.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,19 +13,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 
 use crate::assembler::{EventKind, EventRecord, PacketRecord, SegmentRecord};
-use crate::decode::{
-    BodyKey, Bucket, ExchangeRecord, FeaturesRecord, FlowRecord, RecordSink, Span, WindowClose,
-    WorkunitRecord,
-};
-use crate::dns::DnsRecord;
+use crate::decode::{Bucket, ExchangeRecord, FlowRecord, Observer, WindowClose, WorkunitRecord};
 use crate::flow::{Dir, FlowId};
-use crate::source::CapturedPacket;
 use crate::stats::{
-    add, bucket_str, dir_str, fmt_ts, pct, HttpClass, Outcome, Registry, Snapshot, VerdictLabel, WindowStats,
-    BUCKETS, DIRS,
+    add, bucket_str, fmt_ts, pct, HttpClass, Outcome, Registry, Snapshot, VerdictLabel, WindowStats, BUCKETS,
+    DIRS,
 };
-use crate::store::{BlobRecord, ChunkRecord};
-use crate::window::PacketRef;
 
 /// What is known about an open Flow.
 #[derive(Default)]
@@ -42,9 +34,8 @@ struct Request {
     target: Option<String>,
 }
 
-/// Wraps a [`RecordSink`]: updates the [`Registry`], logs, and forwards.
-pub struct StatsSink<'a> {
-    inner: &'a mut dyn RecordSink,
+/// Updates the [`Registry`] and logs.
+pub struct Stats {
     reg: Arc<Registry>,
     open: HashMap<FlowId, Seen>,
     requests: HashMap<String, Request>,
@@ -52,10 +43,9 @@ pub struct StatsSink<'a> {
     prev: Snapshot,
 }
 
-impl<'a> StatsSink<'a> {
-    pub fn new(inner: &'a mut dyn RecordSink, reg: Arc<Registry>) -> Self {
-        StatsSink {
-            inner,
+impl Stats {
+    pub fn new(reg: Arc<Registry>) -> Self {
+        Stats {
             reg,
             open: HashMap::new(),
             requests: HashMap::new(),
@@ -64,7 +54,7 @@ impl<'a> StatsSink<'a> {
     }
 }
 
-impl RecordSink for StatsSink<'_> {
+impl Observer for Stats {
     fn packet(&mut self, rec: &PacketRecord) {
         let r = &self.reg;
         add(&r.packets_seen, 1);
@@ -82,13 +72,12 @@ impl RecordSink for StatsSink<'_> {
             }
             Some(_) => {}
         }
-        self.inner.packet(rec);
     }
 
-    fn segment(&mut self, rec: &SegmentRecord, data: &[u8]) {
+    fn segment(&mut self, rec: &SegmentRecord) {
         trace!(
             flow = %rec.flow,
-            dir = %dir_str(rec.dir),
+            dir = %rec.dir.as_str(),
             stream_off = rec.stream_off,
             len = rec.len,
             window = rec.window_start_ns,
@@ -96,12 +85,11 @@ impl RecordSink for StatsSink<'_> {
             pkt_off = rec.pkt_off,
             "segment"
         );
-        self.inner.segment(rec, data);
     }
 
     fn event(&mut self, rec: &EventRecord) {
         let r = &self.reg;
-        let dir = rec.dir.map(dir_str).unwrap_or("-");
+        let dir = rec.dir.map(Dir::as_str).unwrap_or("-");
         if rec.kind.is_gap() {
             add(&r.gaps, 1);
             add(&r.gap_bytes, rec.len);
@@ -116,7 +104,6 @@ impl RecordSink for StatsSink<'_> {
         } else {
             debug!(flow = %rec.flow, dir = %dir, kind = %kind, stream_off = rec.stream_off, len = rec.len, "event");
         }
-        self.inner.event(rec);
     }
 
     fn flow(&mut self, rec: &FlowRecord) {
@@ -155,15 +142,6 @@ impl RecordSink for StatsSink<'_> {
                 "flow closed"
             );
         }
-        self.inner.flow(rec);
-    }
-
-    fn dns(&mut self, rec: &DnsRecord) {
-        self.inner.dns(rec);
-    }
-
-    fn features(&mut self, rec: &FeaturesRecord) {
-        self.inner.features(rec);
     }
 
     fn exchange(&mut self, rec: &ExchangeRecord) {
@@ -177,7 +155,6 @@ impl RecordSink for StatsSink<'_> {
                 },
             );
         }
-        self.inner.exchange(rec);
     }
 
     fn workunit(&mut self, rec: &WorkunitRecord) {
@@ -192,7 +169,7 @@ impl RecordSink for StatsSink<'_> {
             workunit_id = %rec.workunit_id,
             flow = %rec.flow,
             protocol = %rec.protocol,
-            dir = %req.as_ref().map_or("-", |r| dir_str(r.dir)),
+            dir = %req.as_ref().map_or("-", |r| r.dir.as_str()),
             method = %req.as_ref().and_then(|r| r.method.as_deref()).unwrap_or("-"),
             path = %req.as_ref().and_then(|r| r.target.as_deref()).unwrap_or(rec.endpoint),
             model = %rec.model.as_deref().unwrap_or("-"),
@@ -203,39 +180,6 @@ impl RecordSink for StatsSink<'_> {
             outcome = %outcome.as_str(),
             "workunit"
         );
-        self.inner.workunit(rec);
-    }
-
-    fn body_data(&mut self, key: &BodyKey, data: &[u8]) {
-        self.inner.body_data(key, data);
-    }
-
-    fn body_end(&mut self, key: &BodyKey, hash: Option<&str>) {
-        self.inner.body_end(key, hash);
-    }
-
-    fn captured(&mut self, pkt: &CapturedPacket, at: PacketRef) {
-        self.inner.captured(pkt, at);
-    }
-
-    fn spans(&mut self, flow: &FlowId, dir: Dir, spans: &[Span]) {
-        self.inner.spans(flow, dir, spans);
-    }
-
-    fn chunk(&mut self, rec: &ChunkRecord) {
-        debug!(
-            link = %rec.link,
-            window = %fmt_ts(rec.window_start_ns),
-            packets = rec.packets,
-            truncated = rec.truncated_packets,
-            key = %rec.key,
-            "chunk stored"
-        );
-        self.inner.chunk(rec);
-    }
-
-    fn blob(&mut self, rec: &BlobRecord) {
-        self.inner.blob(rec);
     }
 
     fn window_closed(&mut self, w: &WindowClose) {
@@ -274,7 +218,6 @@ impl RecordSink for StatsSink<'_> {
         );
         r.set_window(ws, lag_s);
         self.prev = now;
-        self.inner.window_closed(w);
     }
 }
 

@@ -29,4 +29,5 @@ getrandom = "0.3"
 [dev-dependencies]
 futures = "0.3"
 bytes = "1"
+proc-macro2 = "1"
 tempfile = "3"

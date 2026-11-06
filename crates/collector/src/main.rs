@@ -9,7 +9,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use collector::observe::{log_summary, StatsSink};
+use collector::observe::{log_summary, Stats};
 use collector::output::JsonlSink;
 use collector::run::run;
 use collector::ship::{self, Ingest, Shipper};
@@ -17,7 +17,7 @@ use collector::sign::{KeyProvider, SoftwareKey};
 use collector::spool::{Spool, Uploaded, Uploader};
 use collector::stats::{serve_metrics, Registry};
 use collector::store::{StoreConfig, StoreSink};
-use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource, RingConfig, RingSource};
+use collector::{AssemblerConfig, DecoderConfig, FileSource, Observed, PacketSource, RingConfig, RingSource};
 
 // Each option's help is one line; docs/spec.md ("Command line") has the
 // details. README.md shows this help, and tests/readme.rs keeps it in step.
@@ -401,7 +401,7 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         window_ns,
         AssemblerConfig::default(),
         decoder_cfg,
-        &mut StatsSink::new(&mut store, registry.clone()),
+        &mut Observed::new(&mut store, Stats::new(registry.clone())),
     )?;
     let stored = store.finish();
     // The uploader gets its time even when the run failed: what is

@@ -11,6 +11,10 @@
 //! manifests, signed and chained ([`manifest`], [`sign`]). Counters and diagnostics
 //! logs ([`stats`], [`observe`]) sit beside the pipeline and never change
 //! its output. See `docs/spec.md` §3–8 and §14.
+//!
+//! Parsing ([`packet`] in, [`assembler`] to [`decode`] and [`wire`]) does no
+//! I/O: rows leave through a [`RecordSink`], counters through an
+//! [`Observer`]. `tests/boundary.rs` holds that line.
 
 pub mod assembler;
 pub mod capture;
@@ -31,6 +35,7 @@ pub mod net;
 pub mod observe;
 pub mod output;
 pub mod pack;
+pub mod packet;
 pub mod ring;
 pub mod run;
 pub mod ship;
@@ -46,7 +51,7 @@ pub mod window;
 pub mod wire;
 
 pub use assembler::{Assembler, AssemblerConfig, FlowSink};
-pub use decode::{Decoder, DecoderConfig, RecordSink};
+pub use decode::{Decoder, DecoderConfig, Observed, Observer, RecordSink};
 pub use ring::{RingConfig, RingSource};
 pub use source::{CapturedPacket, FileSource, LinkId, PacketSource, SourceError};
 pub use window::{PacketRef, Windower};

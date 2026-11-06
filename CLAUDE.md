@@ -13,3 +13,7 @@ The viewer is how people read a capture, so it must understand everything the Co
 Check it with `collector files -o /tmp/x <fixture>.pcapng` on the protocol's fixtures, then open the folder in the viewer: the conversation and the body's **merged** tab must show the reply text, and the Workunit must show its protocol pill. Derived views (merged text, conversations) are never evidence; the raw bodies are.
 
 `node viewer/check.mjs` (run in CI) renders body slots with a stub DOM: captured values such as headers must reach `innerHTML` only through `esc`, and new rendering of Operator bytes gets a check there.
+
+## Keep parsing free of I/O
+
+The parse modules (`PARSE` in `crates/collector/tests/boundary.rs`) will run pinned in two places, on the device and in the Rechecker. They import only each other, and that test fails otherwise. Rows leave through `RecordSink`, counters through an `Observer`, and anything about stored objects through `store::ObjectSink`. A module that belongs to the parser goes on the list; everything else counts as I/O.

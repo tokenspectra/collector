@@ -35,7 +35,7 @@ use crate::decode::{
 use crate::dns::DnsRecord;
 use crate::manifest::{Log, WindowManifest};
 use crate::sign::KeyProvider;
-use crate::store::{BlobRecord, ChunkRecord};
+use crate::store::{BlobRecord, ChunkRecord, ObjectSink};
 use crate::{mh, views};
 
 pub const TABLES: [&str; 10] = [
@@ -230,23 +230,6 @@ impl RecordSink for JsonlSink {
         write_row(&mut self.workunits, &mut self.error, rec);
     }
 
-    fn chunk(&mut self, rec: &ChunkRecord) {
-        write_row(&mut self.chunks, &mut self.error, rec);
-    }
-
-    fn blob(&mut self, rec: &BlobRecord) {
-        write_row(&mut self.blobs, &mut self.error, rec);
-    }
-
-    fn manifest(&mut self, rec: &WindowManifest) {
-        if self.error.is_some() {
-            return;
-        }
-        if let Err(e) = self.log.append(rec) {
-            self.error = Some(e);
-        }
-    }
-
     fn body_data(&mut self, key: &BodyKey, data: &[u8]) {
         if self.error.is_some() {
             return;
@@ -274,6 +257,25 @@ impl RecordSink for JsonlSink {
             Ok(())
         });
         if let Err(e) = res {
+            self.error = Some(e);
+        }
+    }
+}
+
+impl ObjectSink for JsonlSink {
+    fn chunk(&mut self, rec: &ChunkRecord) {
+        write_row(&mut self.chunks, &mut self.error, rec);
+    }
+
+    fn blob(&mut self, rec: &BlobRecord) {
+        write_row(&mut self.blobs, &mut self.error, rec);
+    }
+
+    fn manifest(&mut self, rec: &WindowManifest) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(e) = self.log.append(rec) {
             self.error = Some(e);
         }
     }
