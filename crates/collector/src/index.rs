@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use parquet::basic::{Compression, LogicalType, Repetition, Type as Physical, ZstdLevel};
-use parquet::data_type::{BoolType, ByteArray, ByteArrayType, Int64Type};
+use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int64Type};
 use parquet::errors::Result;
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
@@ -21,23 +21,27 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Int,
+    /// A double, for ratios the Collector computes (entropy, rates).
+    Float,
     Bool,
     Str,
     /// Any JSON value, written as JSON text.
     Json,
 }
 
-use Kind::{Bool, Int, Json, Str};
+use Kind::{Bool, Float, Int, Json, Str};
 
 /// A column: its path in the JSON row (`.` between nested names) and type.
 pub type Column = (&'static str, Kind);
 
 /// Index tables, in the order they are written.
-pub const TABLES: [&str; 8] = [
+pub const TABLES: [&str; 10] = [
     "packets",
     "segments",
     "events",
     "flows",
+    "dns",
+    "features",
     "http",
     "workunits",
     "chunks",
@@ -125,13 +129,60 @@ const FLOWS: &[Column] = &[
     ("orig_bytes.framing", Int),
     ("orig_bytes.unexplained", Int),
     ("orig_bytes.gap", Int),
+    ("orig_bytes.fact", Int),
     ("resp_bytes.workunit", Int),
     ("resp_bytes.http_other", Int),
     ("resp_bytes.framing", Int),
     ("resp_bytes.unexplained", Int),
     ("resp_bytes.gap", Int),
+    ("resp_bytes.fact", Int),
     ("orig_desync", Str),
     ("resp_desync", Str),
+];
+
+const DNS: &[Column] = &[
+    ("window_start_ns", Int),
+    ("index", Int),
+    ("ts_ns", Int),
+    ("flow", Str),
+    ("dir", Str),
+    ("response", Bool),
+    ("qname", Str),
+    ("qtype", Int),
+    ("qclass", Int),
+    ("qname_len", Int),
+    ("labels", Int),
+    ("label_len_max", Int),
+    ("qname_entropy", Float),
+    ("txt_records", Int),
+    ("txt_bytes", Int),
+    ("txt_max", Int),
+    ("size", Int),
+    ("trailing_bytes", Int),
+];
+
+/// One family of columns per decoder (`dns_*` now); a later decoder adds
+/// its own family after these, so earlier columns never move.
+const FEATURES: &[Column] = &[
+    ("window_start_ns", Int),
+    ("flow", Str),
+    ("link", Str),
+    ("dns.messages", Int),
+    ("dns.queries", Int),
+    ("dns.responses", Int),
+    ("dns.other_datagrams", Int),
+    ("dns.query_bytes", Int),
+    ("dns.response_bytes", Int),
+    ("dns.bytes", Int),
+    ("dns.query_rate", Float),
+    ("dns.qname_entropy_max", Float),
+    ("dns.qname_entropy_mean", Float),
+    ("dns.qname_len_max", Int),
+    ("dns.label_len_max", Int),
+    ("dns.label_len_mean", Float),
+    ("dns.txt_records", Int),
+    ("dns.txt_bytes", Int),
+    ("dns.txt_max", Int),
 ];
 
 macro_rules! message {
@@ -239,6 +290,8 @@ pub fn schema(table: &str) -> Vec<Column> {
         "segments" => SEGMENTS.to_vec(),
         "events" => EVENTS.to_vec(),
         "flows" => FLOWS.to_vec(),
+        "dns" => DNS.to_vec(),
+        "features" => FEATURES.to_vec(),
         "http" => [HTTP_HEAD, &REQUEST, &RESPONSE, HTTP_TAIL].concat(),
         "workunits" => WORKUNITS.to_vec(),
         "chunks" => CHUNKS.to_vec(),
@@ -262,6 +315,7 @@ pub fn parquet(table: &str, rows: &[Value]) -> Result<Vec<u8>> {
             let name = path.replace('.', "_");
             let (physical, logical) = match kind {
                 Int => (Physical::INT64, None),
+                Float => (Physical::DOUBLE, None),
                 Bool => (Physical::BOOLEAN, None),
                 Str => (Physical::BYTE_ARRAY, Some(LogicalType::String)),
                 Json => (Physical::BYTE_ARRAY, Some(LogicalType::Json)),
@@ -297,6 +351,10 @@ pub fn parquet(table: &str, rows: &[Value]) -> Result<Vec<u8>> {
                     })
                     .collect();
                 col.typed::<Int64Type>().write_batch(&v, Some(&defs), None)?;
+            }
+            Float => {
+                let v: Vec<f64> = present.map(|v| v.as_f64().unwrap_or_default()).collect();
+                col.typed::<DoubleType>().write_batch(&v, Some(&defs), None)?;
             }
             Bool => {
                 let v: Vec<bool> = present.map(|v| v.as_bool().unwrap_or_default()).collect();
@@ -378,6 +436,27 @@ mod tests {
         assert!(got[0].contains("stream_off: -3"), "{}", got[0]);
         assert!(got[0].contains("flow: null"), "{}", got[0]);
         assert!(got[1].contains("tcp_flags: \"S\""), "{}", got[1]);
+    }
+
+    #[test]
+    fn floats_and_family_columns_round_trip() {
+        let rows = vec![
+            json!({"window_start_ns": 10, "flow": "f", "link": "tap0",
+                   "dns": {"messages": 2, "query_rate": 1.5, "qname_entropy_max": 4.619, "txt_max": null}}),
+            json!({"window_start_ns": 10, "flow": "g", "link": "tap0", "dns": null}),
+        ];
+        assert!(uncovered("features", &rows[0]).is_empty());
+        let bytes = parquet("features", &rows).unwrap();
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+        let got: Vec<String> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(|r| r.unwrap().to_string())
+            .collect();
+        assert!(got[0].contains("dns_query_rate: 1.5"), "{}", got[0]);
+        assert!(got[0].contains("dns_qname_entropy_max: 4.619"), "{}", got[0]);
+        assert!(got[0].contains("dns_txt_max: null"), "{}", got[0]);
+        assert!(got[1].contains("dns_messages: null"), "{}", got[1]);
     }
 
     #[test]

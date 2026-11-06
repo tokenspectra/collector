@@ -2,7 +2,8 @@
 //!
 //! `packets`, `segments` (stream offset → packet), `events` (gaps,
 //! anomalies), `flows` (one row per Flow per Slice, with verdict and byte
-//! accounting), `http` (one row per HTTP exchange), `workunits` (Request
+//! accounting), `dns` (one row per DNS message), `features` (covert-channel
+//! features, one row per Slice that has any), `http` (one row per HTTP exchange), `workunits` (Request
 //! Workunits), and, when a [`StoreSink`](crate::store::StoreSink) writes the
 //! object store in front of this sink, `chunks` (one row per L0 chunk) and
 //! `blobs` (one row per pack item). Rows are written in a fixed order with fixed field order, so
@@ -28,17 +29,22 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
-use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord};
+use crate::decode::{
+    BodyKey, ExchangeRecord, FeaturesRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord,
+};
+use crate::dns::DnsRecord;
 use crate::manifest::{Log, WindowManifest};
 use crate::sign::KeyProvider;
 use crate::store::{BlobRecord, ChunkRecord};
 use crate::{mh, views};
 
-pub const TABLES: [&str; 8] = [
+pub const TABLES: [&str; 10] = [
     "packets",
     "segments",
     "events",
     "flows",
+    "dns",
+    "features",
     "http",
     "workunits",
     "chunks",
@@ -53,6 +59,8 @@ pub struct JsonlSink {
     segments: BufWriter<File>,
     events: BufWriter<File>,
     flows: BufWriter<File>,
+    dns: BufWriter<File>,
+    features: BufWriter<File>,
     http: BufWriter<File>,
     workunits: BufWriter<File>,
     chunks: BufWriter<File>,
@@ -84,6 +92,8 @@ impl JsonlSink {
             segments: open("segments")?,
             events: open("events")?,
             flows: open("flows")?,
+            dns: open("dns")?,
+            features: open("features")?,
             http: open("http")?,
             workunits: open("workunits")?,
             chunks: open("chunks")?,
@@ -139,12 +149,14 @@ impl JsonlSink {
         Ok(())
     }
 
-    fn tables(&mut self) -> [&mut BufWriter<File>; 8] {
+    fn tables(&mut self) -> [&mut BufWriter<File>; 10] {
         [
             &mut self.packets,
             &mut self.segments,
             &mut self.events,
             &mut self.flows,
+            &mut self.dns,
+            &mut self.features,
             &mut self.http,
             &mut self.workunits,
             &mut self.chunks,
@@ -194,6 +206,14 @@ impl RecordSink for JsonlSink {
 
     fn flow(&mut self, rec: &FlowRecord) {
         write_row(&mut self.flows, &mut self.error, rec);
+    }
+
+    fn dns(&mut self, rec: &DnsRecord) {
+        write_row(&mut self.dns, &mut self.error, rec);
+    }
+
+    fn features(&mut self, rec: &FeaturesRecord) {
+        write_row(&mut self.features, &mut self.error, rec);
     }
 
     fn exchange(&mut self, rec: &ExchangeRecord) {

@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord, SliceRecord};
+use collector::decode::FeaturesRecord;
 use collector::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WorkunitRecord};
+use collector::dns::DnsRecord;
 use collector::flow::Dir;
 use collector::manifest::LOG;
 use collector::observe::StatsSink;
@@ -49,6 +51,8 @@ pub struct Collected {
     pub flows: Vec<FlowRecord>,
     pub exchanges: Vec<ExchangeRecord>,
     pub workunits: Vec<WorkunitRecord>,
+    pub dns: Vec<DnsRecord>,
+    pub features: Vec<FeaturesRecord>,
     /// Kept bodies by hash name.
     pub bodies: BTreeMap<String, Vec<u8>>,
     open_bodies: BTreeMap<BodyKey, Vec<u8>>,
@@ -104,6 +108,14 @@ impl RecordSink for Collected {
 
     fn workunit(&mut self, rec: &WorkunitRecord) {
         self.workunits.push(rec.clone());
+    }
+
+    fn dns(&mut self, rec: &DnsRecord) {
+        self.dns.push(rec.clone());
+    }
+
+    fn features(&mut self, rec: &FeaturesRecord) {
+        self.features.push(rec.clone());
     }
 
     fn body_data(&mut self, key: &BodyKey, data: &[u8]) {

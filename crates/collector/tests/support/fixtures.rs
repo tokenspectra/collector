@@ -352,6 +352,122 @@ pub fn udp() -> Fixture {
     }
 }
 
+/// A DNS message: header, one question, then answers of (type, RDATA),
+/// each named by a pointer to the question.
+pub fn dns_msg(id: u16, flags: u16, qname: &[&[u8]], qtype: u16, answers: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    let mut m = Vec::new();
+    for v in [id, flags, 1, answers.len() as u16, 0, 0] {
+        m.extend_from_slice(&v.to_be_bytes());
+    }
+    for l in qname {
+        m.push(l.len() as u8);
+        m.extend_from_slice(l);
+    }
+    m.push(0);
+    m.extend_from_slice(&qtype.to_be_bytes());
+    m.extend_from_slice(&1u16.to_be_bytes());
+    for (ty, rdata) in answers {
+        m.extend_from_slice(&[0xc0, 0x0c]);
+        m.extend_from_slice(&ty.to_be_bytes());
+        m.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(rdata);
+    }
+    m
+}
+
+/// TXT RDATA: each string with its length octet.
+pub fn txt(strings: &[&[u8]]) -> Vec<u8> {
+    let mut r = Vec::new();
+    for s in strings {
+        r.push(s.len() as u8);
+        r.extend_from_slice(s);
+    }
+    r
+}
+
+/// DNS on a UDP Link, for the `dns` and `features` tables:
+/// - a resolver Flow: an A lookup and its answer; a TXT lookup answered
+///   with two big TXT records; tunnel-like queries with long base32 labels
+///   over two windows, one carrying trailing bytes; a datagram that is not
+///   DNS; an UPDATE (not parsed); an answer whose owner points at itself
+///   (walked, not followed); a TXT answer whose string runs past its RDATA
+///   (DNS, with no TXT facts);
+/// - DNS to a non-standard port, which still parses (ports never count);
+/// - a UDP Flow that is not DNS, which gets no `features` row.
+pub fn dns_covert() -> Fixture {
+    const A: u16 = 1;
+    const TXT: u16 = 16;
+    const QUERY: u16 = 0x0100;
+    const ANSWER: u16 = 0x8180;
+    let client = (CLIENT.0, 41000);
+    let tunnel = |i: u8| {
+        let mut l = *b"mfrggzdfmztwq2lknnwg23tpobyxe43uov3ho6dzpi";
+        l[0] = b"abcdefgh"[usize::from(i)];
+        l
+    };
+    let mut f = Vec::new();
+    let mut at = |ms: u64, from: (Ipv4Addr, u16), to: (Ipv4Addr, u16), m: Vec<u8>| {
+        f.push(frame(T0 + ms * MS, udp_frame(from, to, &m)));
+    };
+    let api: &[&[u8]] = &[b"api", b"example"];
+    at(10, client, DNS, dns_msg(1, QUERY, api, A, &[]));
+    at(
+        11,
+        DNS,
+        client,
+        dns_msg(1, ANSWER, api, A, &[(A, vec![10, 0, 0, 2])]),
+    );
+    let t: &[&[u8]] = &[b"_cfg", b"example"];
+    at(20, client, DNS, dns_msg(2, QUERY, t, TXT, &[]));
+    let big = [b'k'; 255];
+    let records = [(TXT, txt(&[&big, &big[..100]])), (TXT, txt(&[b"v=spf1 -all"]))];
+    at(21, DNS, client, dns_msg(2, ANSWER, t, TXT, &records));
+    for i in 0..4u8 {
+        let label = tunnel(i);
+        let q: &[&[u8]] = &[&label, b"t", b"tunnel", b"example"];
+        let mut m = dns_msg(16 + u16::from(i), QUERY, q, TXT, &[]);
+        if i == 3 {
+            m.extend_from_slice(b"\x00hidden");
+        }
+        at(100 + 10 * u64::from(i), client, DNS, m);
+        let reply = txt(&[b"dGhpcyBpcyBhIHJlcGx5IGNodW5r"]);
+        at(
+            101 + 10 * u64::from(i),
+            DNS,
+            client,
+            dns_msg(16 + u16::from(i), ANSWER, q, TXT, &[(TXT, reply)]),
+        );
+    }
+    at(200, client, DNS, b"not a dns message at all".to_vec());
+    let mut looped = dns_msg(9, ANSWER, api, A, &[(A, vec![10, 0, 0, 3])]);
+    let n = looped.len();
+    looped[n - 16..n - 14].copy_from_slice(&(0xc000u16 | (n - 16) as u16).to_be_bytes());
+    at(210, DNS, client, looped);
+    at(220, DNS, client, dns_msg(2, ANSWER, t, TXT, &[(TXT, vec![0xff])]));
+    at(230, client, DNS, dns_msg(5, 0x2800, api, 6, &[(A, Vec::new())]));
+    // The next window.
+    for i in 4..7u8 {
+        let label = tunnel(i);
+        let q: &[&[u8]] = &[&label, b"t", b"tunnel", b"example"];
+        at(
+            1_100 + 10 * u64::from(i),
+            client,
+            DNS,
+            dns_msg(16 + u16::from(i), QUERY, q, TXT, &[]),
+        );
+    }
+    let odd = (Ipv4Addr::new(10, 0, 0, 77), 5300);
+    let w: &[&[u8]] = &[b"www", b"example"];
+    at(300, client, odd, dns_msg(3, QUERY, w, A, &[]));
+    let game = (Ipv4Addr::new(10, 0, 0, 99), 9999);
+    at(400, client, game, vec![0xa5; 64]);
+    Fixture {
+        name: "dns_covert",
+        files: vec![("dns_covert.pcapng", f)],
+    }
+}
+
 pub const REDIS_PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 pub const REDIS_PONG: &[u8] = b"+PONG\r\n";
 
@@ -734,6 +850,7 @@ pub fn all() -> Vec<Fixture> {
         lost_segment(),
         retransmit_differs(),
         udp(),
+        dns_covert(),
         non_http_tcp(),
         http1_edge(),
         tls_plaintext(),

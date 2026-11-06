@@ -51,7 +51,10 @@ use tracing::info;
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use crate::capture::{CaptureConfig, Class};
 use crate::chunk::{self, Packet};
-use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, Span, WindowClose, WorkunitRecord};
+use crate::decode::{
+    BodyKey, ExchangeRecord, FeaturesRecord, FlowRecord, RecordSink, Span, WindowClose, WorkunitRecord,
+};
+use crate::dns::DnsRecord;
 use crate::flow::{Dir, FlowId};
 use crate::manifest::{IndexFile, Totals, WindowManifest};
 use crate::source::{CapturedPacket, LinkId};
@@ -763,6 +766,16 @@ impl RecordSink for StoreSink<'_> {
         self.inner.flow(rec);
     }
 
+    fn dns(&mut self, rec: &DnsRecord) {
+        self.row("dns", Some(rec.window_start_ns), rec);
+        self.inner.dns(rec);
+    }
+
+    fn features(&mut self, rec: &FeaturesRecord) {
+        self.row("features", Some(rec.window_start_ns), rec);
+        self.inner.features(rec);
+    }
+
     fn exchange(&mut self, rec: &ExchangeRecord) {
         let w = self.current();
         self.row("http", w, rec);
@@ -996,6 +1009,8 @@ mod tests {
         fn flow(&mut self, _: &FlowRecord) {}
         fn exchange(&mut self, _: &ExchangeRecord) {}
         fn workunit(&mut self, _: &WorkunitRecord) {}
+        fn dns(&mut self, _: &DnsRecord) {}
+        fn features(&mut self, _: &FeaturesRecord) {}
         fn chunk(&mut self, rec: &ChunkRecord) {
             self.0.push(rec.clone());
         }

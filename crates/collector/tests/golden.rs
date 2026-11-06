@@ -245,6 +245,108 @@ fn udp_datagrams_and_idle_generation() {
 }
 
 #[test]
+fn dns_messages_and_covert_channel_features() {
+    let c = collect_files(&["dns_covert.pcapng"]);
+    let resolver = "tap0|udp|10.0.0.1:41000|10.0.0.53:53|0";
+    let on = |flow: &str| -> Vec<&collector::dns::DnsRecord> {
+        c.dns.iter().filter(|d| d.flow.as_str() == flow).collect()
+    };
+    // 2 + 2 + 8 + 3 messages, the answer with a looped owner and the TXT
+    // answer with a short string; the junk datagram and the UPDATE are not.
+    assert_eq!(on(resolver).len(), 17);
+    let bad_txt = on(resolver)
+        .into_iter()
+        .filter(|d| d.response && d.qname == "_cfg.example")
+        .nth(1)
+        .unwrap();
+    assert_eq!((bad_txt.txt_records, bad_txt.txt_max), (0, None));
+    let txt = on(resolver)
+        .into_iter()
+        .find(|d| d.response && d.qname == "_cfg.example")
+        .unwrap();
+    assert_eq!((txt.txt_records, txt.txt_bytes, txt.txt_max), (2, 369, Some(357)));
+    let hidden = on(resolver).into_iter().find(|d| d.trailing_bytes > 0).unwrap();
+    assert_eq!((hidden.trailing_bytes, hidden.response), (7, false));
+    let tunnel = on(resolver)
+        .into_iter()
+        .find(|d| d.qname.ends_with(".t.tunnel.example"))
+        .unwrap();
+    assert_eq!((tunnel.labels, tunnel.label_len_max, tunnel.qtype), (4, 42, 16));
+    assert!(tunnel.qname_entropy.unwrap() > 4.0, "{tunnel:?}");
+    // Ports never count: DNS to 5300 is DNS; 64 bytes of 0xa5 are not.
+    assert_eq!(on("tap0|udp|10.0.0.1:41000|10.0.0.77:5300|0").len(), 1);
+    assert_eq!(on("tap0|udp|10.0.0.1:41000|10.0.0.99:9999|0").len(), 0);
+
+    let rows: Vec<_> = c
+        .features
+        .iter()
+        .filter(|f| f.flow.as_str() == resolver)
+        .collect();
+    assert_eq!(rows.len(), 2, "one row per Slice");
+    let first = rows[0].dns.as_ref().unwrap();
+    assert_eq!(
+        (
+            first.messages,
+            first.queries,
+            first.responses,
+            first.other_datagrams
+        ),
+        (14, 6, 8, 2)
+    );
+    assert_eq!(first.query_rate, 6.0);
+    assert_eq!((first.txt_records, first.txt_max), (6, Some(357)));
+    assert_eq!(first.label_len_max, Some(42));
+    let second = rows[1].dns.as_ref().unwrap();
+    assert_eq!((second.messages, second.queries, second.query_rate), (3, 3, 3.0));
+    assert_eq!(second.txt_max, None);
+    assert!(c
+        .features
+        .iter()
+        .all(|f| f.flow.as_str() != "tap0|udp|10.0.0.1:41000|10.0.0.99:9999|0"));
+    // Byte accounting: every payload byte of a UDP Flow is in a fact (a
+    // whole DNS message), a gap or unexplained, and the facts are exactly
+    // the DNS messages, per direction.
+    for s in c
+        .flows
+        .iter()
+        .filter(|s| s.slice.kind == collector::flow::FlowKind::Udp)
+    {
+        for (dir, st, b) in [
+            (Dir::Orig, &s.slice.orig_stats, &s.orig_bytes),
+            (Dir::Resp, &s.slice.resp_stats, &s.resp_bytes),
+        ] {
+            assert_eq!(b.fact + b.unexplained + b.gap, st.payload_bytes);
+            let dns: u64 = c
+                .dns
+                .iter()
+                .filter(|m| {
+                    m.flow == s.slice.flow && m.window_start_ns == s.slice.window_start_ns && m.dir == dir
+                })
+                .map(|m| u64::from(m.size))
+                .sum();
+            assert_eq!(b.fact, dns, "{} {dir:?}", s.slice.flow);
+        }
+    }
+    let game = c
+        .flows
+        .iter()
+        .find(|s| s.slice.flow.as_str().ends_with("10.0.0.99:9999|0"))
+        .unwrap();
+    assert_eq!((game.orig_bytes.fact, game.orig_bytes.unexplained), (0, 64));
+    // The bytes of every DNS message add up per Slice.
+    for f in &c.features {
+        let d = f.dns.as_ref().unwrap();
+        let sum: u64 = c
+            .dns
+            .iter()
+            .filter(|m| m.flow == f.flow && m.window_start_ns == f.window_start_ns)
+            .map(|m| u64::from(m.size))
+            .sum();
+        assert_eq!(d.bytes, sum);
+    }
+}
+
+#[test]
 fn non_http_tcp_and_tuple_reuse() {
     let c = collect_files(&["non_http_tcp.pcapng"]);
     let g0 = "tap0|tcp|10.0.0.1:40000|10.0.0.2:6379|0";

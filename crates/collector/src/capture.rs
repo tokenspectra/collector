@@ -83,7 +83,8 @@ impl CaptureConfig {
         let (mut alarm, mut full, mut not_kept) = (false, false, false);
         for (bucket, tag) in labels {
             match (bucket, tag) {
-                (Bucket::Unexplained, _) => alarm = true,
+                // A fact's bytes are the alarm's too: the Classifier decides.
+                (Bucket::Unexplained | Bucket::Fact, _) => alarm = true,
                 (Bucket::HttpOther, _) => full = true,
                 (Bucket::Workunit, Some(t)) if !self.keeps(t, window_ns) => not_kept = true,
                 (Bucket::Workunit, _) => full = true,

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
+use crate::dns::Datagram;
 use crate::flow::{Dir, Endpoint, FlowId, FlowKind, Tuple};
 use crate::mh;
 use crate::net::{self, Decoded, Transport, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
@@ -199,6 +200,8 @@ pub trait FlowSink {
     /// Stream bytes delivered in order, with where they came from.
     fn segment(&mut self, rec: &SegmentRecord, data: &[u8]);
     fn event(&mut self, rec: &EventRecord);
+    /// A UDP datagram, before its packet's record.
+    fn datagram(&mut self, _d: &Datagram<'_>) {}
     fn slice(&mut self, rec: &SliceRecord);
     /// The Flow ended: no more bytes will come for it. `slice_pending` says
     /// whether one last Slice of it will still be emitted.
@@ -505,6 +508,14 @@ impl Assembler {
                 s.datagrams += 1;
                 s.gap_bytes += u64::from(d.payload_len) - d.payload.len() as u64;
                 datagram(&mut flow.chains[dir.idx()], d.payload);
+                sink.datagram(&Datagram {
+                    flow: &flow.id,
+                    dir,
+                    at,
+                    ts_ns: pkt.ts_ns,
+                    payload: d.payload,
+                    payload_len: d.payload_len,
+                });
             }
             _ => {
                 datagram(&mut flow.chains[dir.idx()], d.payload);

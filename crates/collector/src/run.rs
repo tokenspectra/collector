@@ -25,7 +25,7 @@ pub fn run(
 ) -> Result<Summary, SourceError> {
     let mut windower = Windower::new(window_ns);
     let mut assembler = Assembler::new(cfg);
-    let mut decoder = Decoder::new(decoder_cfg, sink);
+    let mut decoder = Decoder::new(decoder_cfg, window_ns, sink);
     let mut summary = Summary::default();
     while let Some(pkt) = source.next() {
         let pkt = pkt?;
