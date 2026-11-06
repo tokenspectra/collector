@@ -1,0 +1,10 @@
+# osv-scanner configuration, read by .github/workflows/deps-audit.yml.
+#
+# Fix what the scan finds, or ignore it here. Each ignore needs a reason saying
+# why the advisory does not apply and an `ignoreUntil` date; past that date the
+# entry stops suppressing and the scan fails again.
+#
+# [[IgnoredVulns]]
+# id = "RUSTSEC-0000-0000"
+# ignoreUntil = 2027-01-01
+# reason = "Why this does not apply here."

@@ -1,0 +1,143 @@
+version: 2
+updates:
+  # Rust (Cargo): the root workspace, whatever crates it holds.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # PKI, TLS, crypto, signatures, hashing and randomness skip the cooldown:
+    # their fixes often ship before a scored advisory. Most are transitive and
+    # the default `allow` is direct-only, so they need the `dependency-type:
+    # "all"` entries to be updated at all. Keep the patterns identical in
+    # `allow`, `cooldown.exclude` and the `pki-crypto` group.
+    allow:
+      - dependency-type: "direct"
+      - dependency-name: "rustls*"
+        dependency-type: "all"
+      - dependency-name: "webpki*"
+        dependency-type: "all"
+      - dependency-name: "tokio-rustls"
+        dependency-type: "all"
+      - dependency-name: "hyper-rustls"
+        dependency-type: "all"
+      - dependency-name: "ring"
+        dependency-type: "all"
+      - dependency-name: "aws-lc-*"
+        dependency-type: "all"
+      - dependency-name: "openssl*"
+        dependency-type: "all"
+      - dependency-name: "schannel"
+        dependency-type: "all"
+      - dependency-name: "security-framework*"
+        dependency-type: "all"
+      - dependency-name: "rcgen"
+        dependency-type: "all"
+      - dependency-name: "x509-*"
+        dependency-type: "all"
+      - dependency-name: "pem*"
+        dependency-type: "all"
+      - dependency-name: "der"
+        dependency-type: "all"
+      - dependency-name: "der-parser"
+        dependency-type: "all"
+      - dependency-name: "asn1-rs*"
+        dependency-type: "all"
+      - dependency-name: "yasna"
+        dependency-type: "all"
+      - dependency-name: "spki"
+        dependency-type: "all"
+      - dependency-name: "pkcs*"
+        dependency-type: "all"
+      - dependency-name: "ed25519*"
+        dependency-type: "all"
+      - dependency-name: "curve25519*"
+        dependency-type: "all"
+      - dependency-name: "x25519*"
+        dependency-type: "all"
+      - dependency-name: "signature"
+        dependency-type: "all"
+      - dependency-name: "blake3"
+        dependency-type: "all"
+      - dependency-name: "sha2"
+        dependency-type: "all"
+      - dependency-name: "md-5"
+        dependency-type: "all"
+      - dependency-name: "digest"
+        dependency-type: "all"
+      - dependency-name: "hmac"
+        dependency-type: "all"
+      - dependency-name: "hkdf"
+        dependency-type: "all"
+      - dependency-name: "hpke"
+        dependency-type: "all"
+      - dependency-name: "chacha20"
+        dependency-type: "all"
+      - dependency-name: "chacha20poly1305"
+        dependency-type: "all"
+      - dependency-name: "subtle"
+        dependency-type: "all"
+      - dependency-name: "getrandom"
+        dependency-type: "all"
+      - dependency-name: "rand"
+        dependency-type: "all"
+      - dependency-name: "rand_core"
+        dependency-type: "all"
+    cooldown:
+      default-days: 7
+      exclude:
+        - "rustls*"
+        - "webpki*"
+        - "tokio-rustls"
+        - "hyper-rustls"
+        - "ring"
+        - "aws-lc-*"
+        - "openssl*"
+        - "schannel"
+        - "security-framework*"
+        - "rcgen"
+        - "x509-*"
+        - "pem*"
+        - "der"
+        - "der-parser"
+        - "asn1-rs*"
+        - "yasna"
+        - "spki"
+        - "pkcs*"
+        - "ed25519*"
+        - "curve25519*"
+        - "x25519*"
+        - "signature"
+        - "blake3"
+        - "sha2"
+        - "md-5"
+        - "digest"
+        - "hmac"
+        - "hkdf"
+        - "hpke"
+        - "chacha20"
+        - "chacha20poly1305"
+        - "subtle"
+        - "getrandom"
+        - "rand"
+        - "rand_core"
+    groups:
+      # Listed first: a dependency joins the first group it matches, so these
+      # bumps get their own PR instead of riding in the weekly bundle.
+      pki-crypto:
+        patterns: ["rustls*", "webpki*", "tokio-rustls", "hyper-rustls", "ring", "aws-lc-*", "openssl*", "schannel", "security-framework*", "rcgen", "x509-*", "pem*", "der", "der-parser", "asn1-rs*", "yasna", "spki", "pkcs*", "ed25519*", "curve25519*", "x25519*", "signature", "blake3", "sha2", "md-5", "digest", "hmac", "hkdf", "hpke", "chacha20", "chacha20poly1305", "subtle", "getrandom", "rand", "rand_core"]
+      cargo-deps:
+        patterns: ["*"]
+
+  # GitHub Actions: pinned to full commit SHAs; Dependabot maintains the SHA
+  # and its version comment, and the cooldown gates every bump.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions-deps:
+        patterns: ["*"]
