@@ -34,15 +34,6 @@ const IO: &[&str] = &[
     "capture", "manifest", "observe", "ring", "run", "ship", "source", "stats", "store", "views", "window",
 ];
 
-/// A module path in a source file, up to its first segment after the root.
-#[derive(Debug, PartialEq, Eq)]
-enum Reach {
-    /// `crate::name`, or `*` for a glob.
-    Crate(String),
-    /// `super::name`, past any further `super`s.
-    Super(String),
-}
-
 fn tokens(source: &str) -> Vec<TokenTree> {
     TokenStream::from_str(source)
         .expect("source lexes")
@@ -60,51 +51,46 @@ fn is_path_sep(ts: &[TokenTree], at: usize) -> bool {
     colon(ts.get(at)) && colon(ts.get(at + 1))
 }
 
-/// The first segment of each path in a `{a, b::c, d::{e}}` use group.
-fn group_heads(ts: &[TokenTree]) -> Vec<String> {
-    ts.split(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
-        .filter_map(|path| path.first().map(TokenTree::to_string))
-        .collect()
-}
-
-/// Every crate-relative path in `ts`. Works on tokens, so it sees grouped
-/// and multi-line imports and paths inside macro calls, and skips comments
-/// and strings.
-fn scan(ts: &[TokenTree], found: &mut Vec<Reach>) {
-    for (i, t) in ts.iter().enumerate() {
-        if let TokenTree::Group(g) = t {
-            scan(&g.stream().into_iter().collect::<Vec<_>>(), found);
+/// Walks a path that is at module depth `level` (0 is the crate root) and
+/// records what it names in the crate root, `*` for a glob or `self` for
+/// the root itself under another name.
+fn follow(ts: &[TokenTree], level: usize, found: &mut Vec<String>) {
+    let next = match ts.first() {
+        Some(t) if is_ident(Some(t), "crate") => 0,
+        Some(t) if is_ident(Some(t), "self") => level,
+        Some(t) if is_ident(Some(t), "super") => level.saturating_sub(1),
+        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
+            let inner: Vec<_> = g.stream().into_iter().collect();
+            let comma = |t: &TokenTree| matches!(t, TokenTree::Punct(p) if p.as_char() == ',');
+            inner.split(comma).for_each(|path| follow(path, level, found));
+            return;
         }
-        let is_crate = is_ident(Some(t), "crate");
-        let continues_a_path = i >= 2 && is_path_sep(ts, i - 2);
-        if !(is_crate || is_ident(Some(t), "super")) || !is_path_sep(ts, i + 1) || continues_a_path {
-            continue;
-        }
-        let mut at = i + 3;
-        while is_ident(ts.get(at), "super") && is_path_sep(ts, at + 1) {
-            at += 3;
-        }
-        let heads = match ts.get(at) {
-            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
-                group_heads(&g.stream().into_iter().collect::<Vec<_>>())
-            }
-            Some(t) => vec![t.to_string()],
-            None => vec![],
-        };
-        for head in heads {
-            found.push(if is_crate {
-                Reach::Crate(head)
-            } else {
-                Reach::Super(head)
-            });
-        }
+        Some(t) if level == 0 => return found.push(t.to_string()),
+        _ => return,
+    };
+    if is_path_sep(ts, 1) {
+        follow(&ts[3..], next, found);
+    } else if next == 0 && (is_ident(ts.get(1), "as") || is_ident(ts.get(1), "self")) {
+        found.push("self".to_string());
     }
 }
 
-fn reaches(source: &str) -> Vec<Reach> {
-    let mut found = Vec::new();
-    scan(&tokens(source), &mut found);
-    found
+/// Every path in `ts`, which sits `depth` modules below the crate root.
+/// Works on tokens, so it sees grouped and multi-line imports and paths
+/// inside macro calls, and skips comments and strings. Only a `mod` block
+/// goes a level down: that is what `super` counts.
+fn scan(ts: &[TokenTree], depth: usize, found: &mut Vec<String>) {
+    for (i, t) in ts.iter().enumerate() {
+        if let TokenTree::Group(g) = t {
+            let in_mod = i >= 2 && is_ident(ts.get(i - 2), "mod");
+            let inner: Vec<_> = g.stream().into_iter().collect();
+            scan(&inner, depth + usize::from(in_mod), found);
+        }
+        let continues_a_path = i >= 2 && is_path_sep(ts, i - 2);
+        if !continues_a_path && ["crate", "super", "self"].iter().any(|r| is_ident(Some(t), r)) {
+            follow(&ts[i..], depth, found);
+        }
+    }
 }
 
 /// The modules `lib.rs` declares.
@@ -114,21 +100,21 @@ fn modules(lib: &str) -> BTreeSet<String> {
     declared.map(|w| w[1].to_string()).collect()
 }
 
-/// What in `source` crosses the boundary. `super::` also names items of
-/// the file's own module, so only the crate's other modules count there.
-fn crossings(source: &str, modules: &BTreeSet<String>) -> Vec<String> {
-    let parse = |name: &str| PARSE.contains(&name);
-    let mut bad = Vec::new();
-    for r in reaches(source) {
-        match r {
-            Reach::Crate(name) if !parse(&name) => bad.push(format!("crate::{name}")),
-            Reach::Super(name) if !parse(&name) && modules.contains(&name) => {
-                bad.push(format!("super::{name}"))
-            }
-            _ => {}
-        }
-    }
-    bad
+/// What crosses the boundary in `source`, a file `depth` modules down: all
+/// it names in the crate root that is not a parse module. A `super` that
+/// stays below the root stays inside the parse module.
+fn crossings(source: &str, depth: usize) -> Vec<String> {
+    let mut found = Vec::new();
+    scan(&tokens(source), depth, &mut found);
+    found.retain(|name| !PARSE.contains(&name.as_str()));
+    found.dedup();
+    found.iter().map(|name| format!("crate::{name}")).collect()
+}
+
+/// How far below the crate root a file under `src` sits.
+fn depth_of(file: &Path) -> usize {
+    let path = file.strip_prefix(src()).expect("under src");
+    path.components().count() - usize::from(path.ends_with("mod.rs"))
 }
 
 fn src() -> PathBuf {
@@ -165,11 +151,10 @@ fn lib_modules() -> BTreeSet<String> {
 
 #[test]
 fn a_parse_module_imports_no_io_module() {
-    let modules = lib_modules();
     let mut bad = Vec::new();
     for file in parse_files() {
         let source = fs::read_to_string(&file).expect("read module");
-        for crossing in crossings(&source, &modules) {
+        for crossing in crossings(&source, depth_of(&file)) {
             bad.push(format!("{}: {crossing}", file.display()));
         }
     }
@@ -194,8 +179,7 @@ fn every_listed_module_exists_on_one_side() {
 
 #[test]
 fn the_scan_sees_every_way_of_naming_a_module() {
-    let modules = lib_modules();
-    let bad = |source: &str| crossings(source, &modules);
+    let bad = |source: &str| crossings(source, 1);
     assert_eq!(bad("use crate::store::StoreSink;"), ["crate::store"]);
     assert_eq!(bad("use crate::{flow::Dir, stats};"), ["crate::stats"]);
     assert_eq!(
@@ -214,18 +198,41 @@ fn the_scan_sees_every_way_of_naming_a_module() {
         bad("#[cfg(test)] mod t { use crate::source::LinkId; }"),
         ["crate::source"]
     );
-    assert_eq!(bad("use super::ship;"), ["super::ship"]);
-    assert_eq!(bad("use super::super::{flow, ring};"), ["super::ring"]);
     assert_eq!(bad("use crate::*;"), ["crate::*"]);
     assert_eq!(bad("use crate::RingSource;"), ["crate::RingSource"]);
 }
 
+/// `use super::*` at a module's root brings in every module of the crate,
+/// and a later `store::…` names no root at all.
+#[test]
+fn a_path_up_to_the_crate_root_counts_as_one_from_it() {
+    let bad = |source: &str| crossings(source, 1);
+    assert_eq!(bad("use super::*;\nfn f(_: store::ChunkRecord) {}"), ["crate::*"]);
+    assert_eq!(crossings("use super::super::*;", 2), ["crate::*"]);
+    assert_eq!(bad("mod t { use super::super::*; }"), ["crate::*"]);
+    assert_eq!(bad("fn f() { use super::*; }"), ["crate::*"]);
+    assert_eq!(bad("use self::super::*;"), ["crate::*"]);
+    assert_eq!(bad("use super::ship;"), ["crate::ship"]);
+    assert_eq!(bad("use super::{flow, ring};"), ["crate::ring"]);
+    assert_eq!(bad("mod t { use super::super::{flow, ring}; }"), ["crate::ring"]);
+    assert_eq!(bad("mod t { use super::{super::store}; }"), ["crate::store"]);
+    assert_eq!(bad("use super as root;"), ["crate::self"]);
+    assert_eq!(bad("use crate as root;"), ["crate::self"]);
+    assert_eq!(bad("use crate::{self as root};"), ["crate::self"]);
+    assert_eq!(bad("extern crate self as root;"), ["crate::self"]);
+}
+
 #[test]
 fn the_scan_leaves_alone_what_is_not_an_import() {
-    let modules = lib_modules();
-    let bad = |source: &str| crossings(source, &modules);
+    let bad = |source: &str| crossings(source, 1);
     assert!(bad("use crate::flow::Dir;\nuse crate::wire::{self, Claim};").is_empty());
     assert!(bad("//! See [`crate::store`].\n/// [`crate::stats`]\nfn f() {}").is_empty());
     assert!(bad("// use crate::store;\nconst S: &str = \"crate::store\";").is_empty());
-    assert!(bad("pub(crate) fn f() {}\nmod tests { use super::*; use super::helper; }").is_empty());
+    assert!(bad("pub(crate) fn f() {}\npub(super) fn g() {}").is_empty());
+    assert!(bad("mod tests { use super::*; use super::helper; }").is_empty());
+    assert!(bad("mod a { mod tests { use super::super::*; } }").is_empty());
+    assert!(crossings("use super::*;\nuse super::framing;", 2).is_empty());
+    assert_eq!(depth_of(&src().join("decode.rs")), 1);
+    assert_eq!(depth_of(&src().join("wire/mod.rs")), 1);
+    assert_eq!(depth_of(&src().join("wire/openai.rs")), 2);
 }
