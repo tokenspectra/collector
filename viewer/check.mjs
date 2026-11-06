@@ -99,6 +99,25 @@ check("a captured DNS name is escaped in the DNS table, the packet's DNS message
   assert.ok(out.includes("TXT"), out);
 });
 
+check("a captured SNI and ALPN are escaped, and a TLS-only features row renders", () => {
+  ctx.tls = { window_start_ns: "1800000000000000000", index: 3, ts_ns: "1800000000010000000", flow: "tap0|tcp|a|b|0", dir: "orig",
+    sni: XSS, sni_len: 29, alpn: [XSS], size: 120, trailing_bytes: 6 };
+  const out = vm.runInContext(`
+    const key = tls.flow + "@" + tls.window_start_ns;
+    const tlsSlice = { flow: tls.flow, link: "tap0", window_start_ns: tls.window_start_ns, verdict: "tls",
+      orig_stats: { packets: 1 }, resp_stats: { packets: 0 }, orig_bytes: { fact: 120 }, resp_bytes: {} };
+    const row = { flow: tls.flow, window_start_ns: tls.window_start_ns, dns: null, tls: { client_hellos: 1, bytes: 120, sni_len: 29 } };
+    D = { base: 0n, flowsById: new Map([[tls.flow, { id: tls.flow, link: "tap0", kind: "tcp", orig: "a", resp: "b", slices: [tlsSlice] }]]),
+      packetsBySlice: new Map(), dnsBySlice: new Map(), featuresBySlice: new Map([[key, row]]) };
+    tlsTable([tls]) + kv(tlsRows(tls)) + featuresTable([row]) + tlsFeaturesTable([row]) + vSlice(tls.flow, tls.window_start_ns);
+  `, ctx);
+  assert.ok(!out.includes("<img"), out);
+  assert.equal(out.split("&lt;img src=x onerror=alert(1)&gt;").length - 1, 4, out);
+  assert.ok(out.includes("6 trailing bytes"), out);
+  assert.ok(out.includes("ClientHellos"), out);
+  assert.ok(out.includes("Covert-channel features: TLS"), out);
+});
+
 let failed = 0;
 for (const [name, fn] of checks) {
   try { await fn(); console.log(`ok   ${name}`); }

@@ -1,0 +1,1 @@
+{"window_start_ns":1800000000000000000,"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","link":"tap0","dns":null,"tls":{"client_hellos":1,"bytes":52,"sni_len":null}}

@@ -553,7 +553,8 @@ pub const TLS_SERVER_HELLO: &[u8] = b"\x16\x03\x03\x00\x0a\x02\x00\x00\x06\x03\x
 pub const TLS_APP_DATA: &[u8] = b"\x17\x03\x03\x00\x05\xde\xad\xbe\xef\x00";
 
 /// A TLS handshake and one application-data record on port 8000 of the
-/// plaintext Link: verdict `tls`, every byte unexplained.
+/// plaintext Link: verdict `tls`; the ClientHello, with no extensions, is a
+/// fact and the rest unexplained.
 pub fn tls_plaintext() -> Fixture {
     let mut c = Conn::new(CLIENT, SERVER, 500, 600);
     let mut f = Vec::new();
@@ -565,6 +566,122 @@ pub fn tls_plaintext() -> Fixture {
     Fixture {
         name: "tls_plaintext",
         files: vec![("tls_plaintext.pcapng", f)],
+    }
+}
+
+/// A TLS extension.
+pub fn tls_ext(kind: u16, data: &[u8]) -> Vec<u8> {
+    [&kind.to_be_bytes()[..], &(data.len() as u16).to_be_bytes(), data].concat()
+}
+
+pub fn tls_sni(name: &[u8]) -> Vec<u8> {
+    let entry = [&[0][..], &(name.len() as u16).to_be_bytes(), name].concat();
+    tls_ext(0, &[&(entry.len() as u16).to_be_bytes()[..], &entry].concat())
+}
+
+pub fn tls_alpn(names: &[&[u8]]) -> Vec<u8> {
+    let list: Vec<u8> = names
+        .iter()
+        .flat_map(|n| [&[n.len() as u8], *n].concat())
+        .collect();
+    tls_ext(16, &[&(list.len() as u16).to_be_bytes()[..], &list].concat())
+}
+
+/// A ClientHello handshake message with these extensions, then `tail`.
+pub fn tls_hello_msg(exts: &[Vec<u8>], tail: &[u8]) -> Vec<u8> {
+    let exts = exts.concat();
+    let body = [
+        &[3, 3][..],
+        &[0x5a; 32],
+        &[0, 0, 2, 0x13, 0x01, 1, 0],
+        &(exts.len() as u16).to_be_bytes(),
+        &exts,
+        tail,
+    ]
+    .concat();
+    [&[1][..], &(body.len() as u32).to_be_bytes()[1..], &body].concat()
+}
+
+/// A TLS handshake record.
+pub fn tls_record(fragment: &[u8]) -> Vec<u8> {
+    [
+        &[0x16, 3, 1][..],
+        &(fragment.len() as u16).to_be_bytes(),
+        fragment,
+    ]
+    .concat()
+}
+
+/// ClientHellos on six Flows of a plaintext Link, for the `tls` table:
+/// - port 41001: SNI and ALPN past another extension, cut over two TCP
+///   segments, then a handshake and data;
+/// - 41002: a message over two records, its second half in the next window,
+///   where every other Flow runs;
+/// - 41003: bytes after the extensions and after the message, odd bytes in
+///   the name;
+/// - 41004: an SNI whose list runs past the extension (not read);
+/// - 41005: a ClientHello that never completes;
+/// - 41006: one with a segment lost in the middle.
+pub fn tls_hello() -> Fixture {
+    let conn = |port, isn| Conn::new((CLIENT.0, port), (SERVER.0, 443), isn, isn + 5000);
+    let exts = [
+        tls_ext(10, &[0, 2, 0, 29]),
+        tls_sni(b"api.example"),
+        tls_alpn(&[b"h2", b"http/1.1"]),
+    ];
+    let hello = tls_record(&tls_hello_msg(&exts, b""));
+    let mut f = Vec::new();
+
+    let mut c = conn(41001, 1000);
+    c.handshake(T0 + 1_010 * MS, &mut f);
+    f.push(c.send(true, T0 + 1_020 * MS, ACK, &hello[..40]));
+    f.push(c.send(true, T0 + 1_021 * MS, PSH | ACK, &hello[40..]));
+    f.push(c.send(false, T0 + 1_022 * MS, PSH | ACK, TLS_SERVER_HELLO));
+    f.push(c.send(true, T0 + 1_023 * MS, PSH | ACK, TLS_APP_DATA));
+    c.close(T0 + 1_030 * MS, &mut f);
+
+    let mut c = conn(41002, 2000);
+    c.handshake(T0 + 100 * MS, &mut f);
+    let m = tls_hello_msg(&[tls_sni(b"split.example")], b"");
+    f.push(c.send(true, T0 + 110 * MS, PSH | ACK, &tls_record(&m[..30])));
+    f.push(c.send(true, T0 + 1_900 * MS, PSH | ACK, &tls_record(&m[30..])));
+    c.close(T0 + 1_910 * MS, &mut f);
+
+    let mut c = conn(41003, 3000);
+    c.handshake(T0 + 1_200 * MS, &mut f);
+    let m = tls_hello_msg(&[tls_sni(b"a\\b \xff.example")], b"hidden");
+    let r = tls_record(&[&m[..], b"after"].concat());
+    f.push(c.send(true, T0 + 1_210 * MS, PSH | ACK, &r));
+    c.close(T0 + 1_220 * MS, &mut f);
+
+    let mut c = conn(41004, 4000);
+    c.handshake(T0 + 1_300 * MS, &mut f);
+    let bad = tls_ext(0, &[0, 9, 0, 0, 1, b'a']);
+    f.push(c.send(
+        true,
+        T0 + 1_310 * MS,
+        PSH | ACK,
+        &tls_record(&tls_hello_msg(&[bad], b"")),
+    ));
+    c.close(T0 + 1_320 * MS, &mut f);
+
+    let mut c = conn(41005, 5000);
+    c.handshake(T0 + 1_400 * MS, &mut f);
+    f.push(c.send(true, T0 + 1_410 * MS, PSH | ACK, &hello[..40]));
+    c.close(T0 + 1_420 * MS, &mut f);
+
+    let mut c = conn(41006, 6000);
+    c.handshake(T0 + 1_500 * MS, &mut f);
+    f.push(c.send(true, T0 + 1_510 * MS, ACK, &hello[..20]));
+    let _lost = c.send(true, T0 + 1_511 * MS, ACK, &hello[20..40]);
+    f.push(c.send(true, T0 + 1_512 * MS, PSH | ACK, &hello[40..]));
+    f.push(c.ack(false, T0 + 1_513 * MS));
+    c.close(T0 + 1_520 * MS, &mut f);
+
+    f.sort_by_key(|fr| fr.ts_ns);
+    Fixture {
+        name: "tls_hello",
+        files: vec![("tls_hello.pcapng", f)],
     }
 }
 
@@ -854,6 +971,7 @@ pub fn all() -> Vec<Fixture> {
         non_http_tcp(),
         http1_edge(),
         tls_plaintext(),
+        tls_hello(),
         grpc_h2c(),
         gzip_h1_json(),
         gzip_h1_sse(),

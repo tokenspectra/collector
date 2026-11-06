@@ -15,7 +15,8 @@
 //!   `framing`, `unexplained`, `gap`) and reports the buckets per Flow,
 //!   direction and Slice.
 //!
-//! For each UDP Flow it tries every datagram as DNS ([`crate::dns`]).
+//! For each UDP Flow it tries every datagram as DNS ([`crate::dns`]); on a
+//! `tls` Flow it reads the ClientHello ([`crate::tls`]).
 //!
 //! A request's bytes are only known to be a Workunit once its response
 //! head arrives, so a Slice's row waits until every byte in it has a
@@ -37,6 +38,7 @@ use crate::http1::{parse_request_line, parse_status_line, H1};
 use crate::http2::{H2, PREFACE};
 use crate::mh;
 use crate::packet::{CapturedPacket, LinkId, PacketRef};
+use crate::tls::{ClientHello, TlsFeatures, TlsRecord};
 use crate::wire::framing::{Framed, Framer};
 use crate::wire::{self, Claim, Frame, Framing, Protocols, ResponseDecoder};
 
@@ -97,7 +99,8 @@ pub enum Bucket {
     Framing,
     Unexplained,
     Gap,
-    /// Inside a protocol fact: a whole DNS message in a UDP datagram.
+    /// Inside a protocol fact: a whole DNS message in a UDP datagram, or a
+    /// TLS ClientHello.
     Fact,
 }
 
@@ -150,6 +153,27 @@ pub struct FeaturesRecord {
     pub flow: FlowId,
     pub link: LinkId,
     pub dns: Option<DnsFeatures>,
+    pub tls: Option<TlsFeatures>,
+}
+
+impl FeaturesRecord {
+    /// Writes the row of `slice`, if any family has something in it.
+    fn emit(
+        slice: &SliceRecord,
+        dns: Option<DnsFeatures>,
+        tls: Option<TlsFeatures>,
+        sink: &mut dyn RecordSink,
+    ) {
+        if dns.is_some() || tls.is_some() {
+            sink.features(&FeaturesRecord {
+                window_start_ns: slice.window_start_ns,
+                flow: slice.flow.clone(),
+                link: slice.link.clone(),
+                dns,
+                tls,
+            });
+        }
+    }
 }
 
 /// One Flow during one window, with its verdict and byte accounting (the
@@ -361,6 +385,8 @@ pub trait RecordSink {
     fn workunit(&mut self, rec: &WorkunitRecord);
     /// A DNS message in a UDP datagram, before its packet's record.
     fn dns(&mut self, rec: &DnsRecord);
+    /// A TLS ClientHello, once all of it is in.
+    fn tls(&mut self, rec: &TlsRecord);
     /// A Slice's covert-channel features, right after its Flow row.
     fn features(&mut self, rec: &FeaturesRecord);
     /// More bytes of a body, as hashed: chunked encoding removed, content
@@ -442,6 +468,10 @@ impl<O: Observer> RecordSink for Observed<'_, O> {
         self.sink.dns(rec);
     }
 
+    fn tls(&mut self, rec: &TlsRecord) {
+        self.sink.tls(rec);
+    }
+
     fn features(&mut self, rec: &FeaturesRecord) {
         self.sink.features(rec);
     }
@@ -501,7 +531,11 @@ impl FlowSink for Decoder<'_> {
             .flows
             .entry(rec.flow.clone())
             .or_insert_with(|| FlowState::new(rec.flow.clone()));
-        f.input(rec.dir, Piece::Data(data, rec.ts_ns), &self.cfg, self.sink);
+        let at = PacketRef {
+            window_start_ns: rec.window_start_ns,
+            index: rec.index,
+        };
+        f.input(rec.dir, Piece::Data(data, rec.ts_ns, at), &self.cfg, self.sink);
     }
 
     fn event(&mut self, rec: &EventRecord) {
@@ -545,14 +579,7 @@ impl FlowSink for Decoder<'_> {
                 orig_desync: None,
                 resp_desync: None,
             });
-            if let dns @ Some(_) = tally.finish(self.window_ns) {
-                self.sink.features(&FeaturesRecord {
-                    window_start_ns: rec.window_start_ns,
-                    flow: rec.flow.clone(),
-                    link: rec.link.clone(),
-                    dns,
-                });
-            }
+            FeaturesRecord::emit(rec, tally.finish(self.window_ns), None, self.sink);
             return;
         }
         let sink = &mut *self.sink;
@@ -597,16 +624,17 @@ impl Decoder<'_> {
     }
 }
 
-/// Bytes (with their capture time) or a gap delivered for one direction.
+/// Bytes (with their capture time and packet) or a gap delivered for one
+/// direction.
 enum Piece<B> {
-    Data(B, u64),
+    Data(B, u64, PacketRef),
     Gap(u64),
 }
 
 impl Piece<Vec<u8>> {
     fn borrowed(&self) -> Piece<&[u8]> {
         match self {
-            Piece::Data(d, ts) => Piece::Data(d, *ts),
+            Piece::Data(d, ts, at) => Piece::Data(d, *ts, *at),
             Piece::Gap(n) => Piece::Gap(*n),
         }
     }
@@ -615,17 +643,23 @@ impl Piece<Vec<u8>> {
 enum Parser {
     H1(H1),
     H2(H2),
+    Tls(ClientHello),
     Opaque,
 }
 
 impl Parser {
     fn feed(&mut self, piece: Piece<&[u8]>, out: &mut dyn Out) {
         match (self, piece) {
-            (Parser::H1(p), Piece::Data(d, ts)) => p.data(d, ts, out),
+            (Parser::H1(p), Piece::Data(d, ts, _)) => p.data(d, ts, out),
             (Parser::H1(p), Piece::Gap(n)) => p.gap(n, out),
-            (Parser::H2(p), Piece::Data(d, ts)) => p.data(d, ts, out),
+            (Parser::H2(p), Piece::Data(d, ts, _)) => p.data(d, ts, out),
             (Parser::H2(p), Piece::Gap(n)) => p.gap(n, out),
-            (Parser::Opaque, Piece::Data(d, _)) => out.span(d.len() as u64, Lab::Unexplained),
+            (Parser::Tls(p), Piece::Data(d, ts, at)) => p.data(d, ts, at, out),
+            (Parser::Tls(p), Piece::Gap(n)) => {
+                p.stop(out);
+                out.span(n, Lab::Gap);
+            }
+            (Parser::Opaque, Piece::Data(d, ..)) => out.span(d.len() as u64, Lab::Unexplained),
             (Parser::Opaque, Piece::Gap(n)) => out.span(n, Lab::Gap),
         }
     }
@@ -634,6 +668,7 @@ impl Parser {
         match self {
             Parser::H1(p) => p.finish(out),
             Parser::H2(p) => p.finish(out),
+            Parser::Tls(p) => p.stop(out),
             Parser::Opaque => {}
         }
     }
@@ -1117,6 +1152,8 @@ struct FlowState {
     dead: [Option<&'static str>; 2],
     ended: bool,
     held: VecDeque<SliceRecord>,
+    /// The ClientHello's features, until the Slice of its first byte.
+    hello: Option<TlsFeatures>,
 }
 
 impl FlowState {
@@ -1138,6 +1175,7 @@ impl FlowState {
             dead: [None, None],
             ended: false,
             held: VecDeque::new(),
+            hello: None,
         }
     }
 
@@ -1146,9 +1184,9 @@ impl FlowState {
             return self.feed(dir, piece, cfg, sink);
         }
         let owned = match piece {
-            Piece::Data(d, ts) => {
+            Piece::Data(d, ts, at) => {
                 self.detect_bytes[dir.idx()] += d.len();
-                Piece::Data(d.to_vec(), ts)
+                Piece::Data(d.to_vec(), ts, at)
             }
             Piece::Gap(n) => Piece::Gap(n),
         };
@@ -1175,7 +1213,7 @@ impl FlowState {
         let mut out = Vec::new();
         for p in &self.detect[dir.idx()] {
             match p {
-                Piece::Data(d, _) => out.extend_from_slice(d),
+                Piece::Data(d, ..) => out.extend_from_slice(d),
                 Piece::Gap(_) => return (out, true),
             }
         }
@@ -1224,7 +1262,14 @@ impl FlowState {
                 dir.other(),
                 [Parser::H1(H1::new(true)), Parser::H1(H1::new(false))],
             ),
-            Detect::Tls => (Verdict::Tls, Dir::Orig, [Parser::Opaque, Parser::Opaque]),
+            Detect::Tls => (
+                Verdict::Tls,
+                dir,
+                [
+                    Parser::Tls(ClientHello::new(self.id.clone(), dir)),
+                    Parser::Opaque,
+                ],
+            ),
             Detect::Opaque | Detect::Need => (Verdict::Opaque, Dir::Orig, [Parser::Opaque, Parser::Opaque]),
         };
         self.verdict = Some(verdict);
@@ -1289,14 +1334,22 @@ impl FlowState {
             } else {
                 self.verdict
             };
-            sink.flow(&FlowRecord {
+            let client = [(os, oe), (rs, re)][self.client.idx()];
+            let hello = if client.0 < client.1 {
+                self.hello.take()
+            } else {
+                None
+            };
+            let row = FlowRecord {
                 slice,
                 verdict,
                 orig_bytes: ob,
                 resp_bytes: rb,
                 orig_desync: self.dead[0],
                 resp_desync: self.dead[1],
-            });
+            };
+            sink.flow(&row);
+            FeaturesRecord::emit(&row.slice, None, hello, sink);
         }
     }
 
@@ -1609,8 +1662,14 @@ impl Ctx<'_> {
 }
 
 impl Out for Ctx<'_> {
+    fn client_hello(&mut self, rec: &TlsRecord) {
+        self.f.hello = Some(rec.features());
+        self.sink.tls(rec);
+    }
+
     fn span(&mut self, len: u64, lab: Lab) {
         let label = match lab {
+            Lab::Fact => Label::Bucket(Bucket::Fact),
             Lab::Framing => Label::Bucket(Bucket::Framing),
             Lab::Other => Label::Bucket(Bucket::HttpOther),
             Lab::Unexplained => Label::Bucket(Bucket::Unexplained),
@@ -1839,6 +1898,7 @@ mod tests {
             fn exchange(&mut self, _: &ExchangeRecord) {}
             fn workunit(&mut self, _: &WorkunitRecord) {}
             fn dns(&mut self, _: &DnsRecord) {}
+            fn tls(&mut self, _: &TlsRecord) {}
             fn features(&mut self, _: &FeaturesRecord) {}
         }
         let mut nop = Nop;

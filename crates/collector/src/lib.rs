@@ -3,7 +3,7 @@
 //! Packet input ([`source`], [`ring`]), windowing ([`window`]), Flow
 //! assembly ([`assembler`]), and protocol identification, byte accounting,
 //! HTTP/1.1 and h2c ([`decode`]), DNS and per-Slice covert-channel features
-//! ([`dns`]), Wire Protocols, their response framing
+//! ([`dns`]), TLS ClientHellos ([`tls`]), Wire Protocols, their response framing
 //! (SSE, NDJSON) and Request Workunits ([`wire`]), multihash
 //! names ([`mh`]) and body views ([`views`]). Hashing, the Capture Rate
 //! cut and the object store: L0 chunks ([`chunk`], [`capture`]), packs
@@ -45,6 +45,7 @@ pub mod spool;
 pub mod stats;
 pub mod store;
 mod tcp;
+pub mod tls;
 #[cfg(unix)]
 pub mod views;
 pub mod window;

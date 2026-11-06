@@ -1,0 +1,1 @@
+{"window_start_ns":1800000000000000000,"index":3,"ts_ns":1800000000020000000,"flow":"tap0|tcp|10.0.0.1:40000|10.0.0.2:8000|0","dir":"orig","sni":null,"sni_len":null,"alpn":[],"size":52,"trailing_bytes":0}

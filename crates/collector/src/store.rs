@@ -60,6 +60,7 @@ use crate::manifest::{IndexFile, Totals, WindowManifest};
 use crate::source::{CapturedPacket, LinkId};
 use crate::spool::Spool;
 use crate::stats::{add, Registry};
+use crate::tls::TlsRecord;
 use crate::window::PacketRef;
 use crate::{index, mh, pack};
 
@@ -781,6 +782,11 @@ impl RecordSink for StoreSink<'_> {
         self.inner.dns(rec);
     }
 
+    fn tls(&mut self, rec: &TlsRecord) {
+        self.row("tls", Some(rec.window_start_ns), rec);
+        self.inner.tls(rec);
+    }
+
     fn features(&mut self, rec: &FeaturesRecord) {
         self.row("features", Some(rec.window_start_ns), rec);
         self.inner.features(rec);
@@ -1020,6 +1026,7 @@ mod tests {
         fn exchange(&mut self, _: &ExchangeRecord) {}
         fn workunit(&mut self, _: &WorkunitRecord) {}
         fn dns(&mut self, _: &DnsRecord) {}
+        fn tls(&mut self, _: &TlsRecord) {}
         fn features(&mut self, _: &FeaturesRecord) {}
     }
 

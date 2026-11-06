@@ -275,19 +275,19 @@ fn txt_is_well_formed(rdata: &[u8]) -> bool {
 }
 
 /// A message being read front to back.
-struct Msg<'a> {
-    m: &'a [u8],
-    pos: usize,
+pub(crate) struct Msg<'a> {
+    pub m: &'a [u8],
+    pub pos: usize,
 }
 
 impl<'a> Msg<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let b = self.m.get(self.pos..self.pos.checked_add(n)?)?;
         self.pos += n;
         Some(b)
     }
 
-    fn u16(&mut self) -> Option<u16> {
+    pub fn u16(&mut self) -> Option<u16> {
         let b = self.take(2)?;
         Some(u16::from_be_bytes([b[0], b[1]]))
     }

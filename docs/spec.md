@@ -32,6 +32,7 @@ Everything below these eight points is proposal, not settled.
   - OpenAI Chat Completions and legacy Completions (TS-29);
   - OpenAI Responses, Anthropic Messages and Ollama native, one module each (TS-30 to TS-32);
 - DNS over UDP, and per-Slice covert-channel features, as tables (§5, TS-51);
+- TLS ClientHello SNI and ALPN, as a table (§5, TS-52);
 - hashing, the Capture Rate cut, the object-store layout;
 - metadata and records sent to the control plane.
 
@@ -106,7 +107,7 @@ Ports and ALPN are hints at most. A Flow is a protocol only when its bytes parse
 |---|---|
 | `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` preface | `http2` |
 | HTTP/1.x request or status line | `http1` |
-| TLS handshake record header (`0x16 0x03` then a version byte) | `tls` (opaque in v1; suspicious on a plaintext Link) |
+| TLS handshake record header (`0x16 0x03` then a version byte) | `tls` (opaque past the ClientHello in v1; suspicious on a plaintext Link) |
 | refines `http2`: `content-type: application/grpc` | `grpc` (parsed as HTTP/2, payload opaque) |
 | none of these | `opaque` |
 
@@ -179,6 +180,17 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 - **A fact is not a check of the bytes.** `fact` says a datagram walked as DNS, not that its RDATA is what its type claims: data can ride in any record, and it counts in the byte columns but in no content feature except TXT sizes. A bound on what a Flow can carry comes from all its bytes, not from what parsed.
 - **Not in TS-51:** DNS over TCP (it stays `opaque`), DNS over TLS or HTTPS (opaque by design), non-QUERY opcodes, names and RDATA outside the first question and TXT sizes, EDNS options, mDNS-specific fields.
 
+**TLS ClientHello (TS-52).** Decoded for the same reason as DNS, and as facts too: Allowlist rules ("TLS to these names") and statuses stay in the Classifier. The verdict stays `tls` whatever the parse finds, and the Capture Rate keeps the Flow as an alarm Flow (§7).
+- **Which bytes.** The direction that gave the `tls` verdict is the client. Its stream, from its first byte, is read as handshake records holding one ClientHello (RFC 8446 §4.1.2), over any number of TCP segments and records. Only the first ClientHello of a Flow is read, so a second one after a HelloRetryRequest is `unexplained`. Ports never count.
+- **Narrow on purpose.** It reads what a rule on names needs. It is not a TLS parser, and nothing here says a handshake is valid.
+  - **Strict:** each record's content type is handshake, the message's type is ClientHello, and the `server_name` and ALPN extensions are well formed. `server_name` holds exactly one non-empty `host_name` and fills its extension; ALPN holds one or more non-empty names and fills its extension. Either extension sent twice is rejected: the copies could disagree.
+  - **By bounds only:** record versions, the legacy version, random, session id, cipher suites, compression methods and every other extension. Each length must fit in the message; their contents are not read.
+  - Bytes in the message after its extensions do not stop the parse; they are counted in `trailing_bytes`.
+- **Not read.** Bytes that fail any of this get no row and stay `unexplained`. So does a ClientHello over 16 KiB, one that never completes, and one a gap cuts.
+- **Byte accounting.** Each byte of a `tls` Flow is in exactly one bucket: `fact` from the first record header to the end of the ClientHello message, record headers included; `gap` when never captured; `unexplained` otherwise, which is everything after the message, even in its last record. Per Flow and direction, `fact` equals the row's `size`.
+- **A pure parse.** `tls.rs` is a parse module (§5 "DNS", [hardware-collector §4, §7](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/hardware-collector.md#protocol-facts-dns-tls-clienthello-ntp)). A fact is not a check of the bytes: data can ride in any field the parse walks by bounds.
+- **Not in TS-52:** ServerHello and certificates, ECH's inner name, JA3-style fingerprints, SNI on QUIC, TLS on a `http1`, `http2` or `opaque` verdict.
+
 `dns`: one row per DNS message, in its packet's window.
 
 | Column | Meaning |
@@ -191,7 +203,16 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 | `txt_records`, `txt_bytes`, `txt_max` | TXT records in any section; the sum and largest of their RDATA lengths (`null` with none) |
 | `size`, `trailing_bytes` | The message's bytes (the UDP payload); bytes after the last record |
 
-`features`: one row per Flow per Slice that has any feature, after the Flow's row. Columns come in **families**, one per decoder, named `{family}_{feature}`; a family is `null` when its decoder saw nothing in the Slice. TS-51 adds `dns_*`; TLS ClientHello and NTP (TS-52, TS-53) add their own families after it, so existing columns never move or change type. The row is keyed by `window_start_ns`, `flow` and `link`, which join `flows`.
+`tls`: at most one row per Flow, in the window of the packet that carried the ClientHello's first byte.
+
+| Column | Meaning |
+|---|---|
+| `window_start_ns`, `index`, `ts_ns`, `flow`, `dir` | The packet that carried its first byte (joins `packets`) and its direction |
+| `sni`, `sni_len` | The `host_name` as sent, a byte outside `!`..`~` as `\DDD` and `\` as `\\`; its bytes on the wire. `null` without the extension |
+| `alpn` | The offered protocols in order, escaped like `sni`; a JSON list, empty without the extension |
+| `size`, `trailing_bytes` | Stream bytes from the first record header to the end of the message; bytes of the message after its extensions |
+
+`features`: one row per Flow per Slice that has any feature, after the Flow's row. Columns come in **families**, one per decoder, named `{family}_{feature}`; a family is `null` when its decoder saw nothing in the Slice. TS-51 adds `dns_*`, TS-52 `tls_*`; NTP (TS-53) adds its own family after them, so existing columns never move or change type. The row is keyed by `window_start_ns`, `flow` and `link`, which join `flows`.
 
 | Column | Meaning |
 |---|---|
@@ -202,6 +223,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 | `dns_qname_entropy_max`, `dns_qname_entropy_mean` | Over the queries' `qname_entropy` |
 | `dns_qname_len_max`, `dns_label_len_max`, `dns_label_len_mean` | Over the queries' names; the mean is over every label of every query name |
 | `dns_txt_records`, `dns_txt_bytes`, `dns_txt_max` | Over every message's TXT records |
+| `tls_client_hellos`, `tls_bytes`, `tls_sni_len` | The ClientHello whose first byte is in the Slice: 1, its `size`, its `sni_len`. A ClientHello over two Slices counts in the first; its `fact` bytes stay in the Slice that carried them |
 
 Name features are taken over queries only, so a name its response repeats counts once. Content features (`dns_qname_*`, `dns_label_*`, `dns_txt_*`) belong to the parse; the rate and volume ones (`dns_query_rate`, `dns_*bytes`) are to come from the commit layer's per-Flow counters (TS-57), under the same columns, so the Classifier can rely on them without relying on the parse. Ratios are rounded to 3 decimals so they print the same on every platform; they are computed from the capture alone, so two runs give the same rows (§3).
 
@@ -212,8 +234,8 @@ Name features are taken over queries only, so a name its response repeats counts
 | `workunit` | Inside a Request Workunit's HTTP message (headers and body) |
 | `http_other` | Inside a parsed HTTP message that is not a Workunit |
 | `framing` | Protocol overhead around messages: HTTP/2 frame headers, SETTINGS, PING, chunked-encoding lines |
-| `fact` | Inside a protocol fact: a UDP datagram that is a whole DNS message (TS-51) |
-| `unexplained` | Everything else, plus every byte of `tls`/`opaque`/`grpc` Flows and of UDP datagrams that are not facts |
+| `fact` | Inside a protocol fact: a UDP datagram that is a whole DNS message (TS-51), or a TLS ClientHello (TS-52) |
+| `unexplained` | Everything else, plus every byte of `opaque`/`grpc` Flows, of `tls` Flows outside the ClientHello, and of UDP datagrams that are not facts |
 | `gap` | Bytes counted by sequence numbers (TCP) or by length (UDP) but never captured |
 
 - The Collector reports buckets and verdicts. **It never assigns a status.**
@@ -354,7 +376,7 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
   - `packets`: chunk, packet index, timestamp, Flow, direction, stream offset, captured and original length, packet hash;
   - `workunits`: L3 records;
   - `blobs`: hash → pack location;
-  - `dns` and `features` (TS-51, §5): DNS messages, and covert-channel features per Flow per Slice.
+  - `dns`, `tls` and `features` (TS-51, TS-52, §5): DNS messages, TLS ClientHellos, and covert-channel features per Flow per Slice.
   - As built (TS-26), also `segments`, `events` and `http`, the same tables as the local JSONL, and `chunks`: one row per L0 chunk with its key, chunk hash, Merkle root, packet count and the Capture Rate's kept and truncated bytes, and (TS-38) the number of `parts` it is stored in.
   - Each table has a fixed schema, so a column keeps its type in every window. Nested records are flattened (`orig_stats.packets` → `orig_stats_packets`, `dns.query_rate` → `dns_query_rate`). Ratios (entropy, rates) are doubles. Values the Operator sends as arbitrary JSON (`usage`, `seed`, `n`), and lists, are JSON text. Every column is optional.
   - A row goes in the window it belongs to (a packet's, a Slice's) while that window is held; otherwise, and for `http`, `workunits` and pack items, in the newest window held when it is written.
@@ -443,6 +465,7 @@ _As built (TS-27): 1, 2, 4 and 6 run in CI over the whole golden set, all four W
    - HTTP/1.1 JSON, HTTP/1.1 SSE with chunked encoding, h2c JSON and SSE;
    - a Flow spanning windows, a mid-stream start, a lost segment, a retransmit with different bytes;
    - `/health`, a TLS Flow on the plaintext Link, a non-HTTP TCP Flow, UDP;
+   - TLS ClientHello (TS-52): SNI and ALPN over two TCP segments, a message over two records and two windows, trailing bytes and odd name bytes, a malformed SNI, a ClientHello that never completes, one cut by a gap;
    - DNS (TS-51): A and TXT lookups, big TXT answers, tunnel-like names over two windows, trailing bytes, a datagram that is not DNS, an UPDATE, an owner name that points at itself, a malformed TXT, DNS to a non-standard port;
    - content codings (TS-37): gzip JSON, gzip SSE flushed per event, and one Flow with `deflate` (zlib and raw), `br`, `zstd`, a gzip request body, an unknown coding, a gzip bomb and a cut-off gzip stream.
 2. **Determinism:** two runs over the same files give byte-identical tables.
