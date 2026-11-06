@@ -35,96 +35,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+pub use bundle::manifest::*;
 use ed25519_dalek::{Signature, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::debug;
 
 use crate::mh;
 use crate::sign::{hex, parse_hex, KeyProvider};
-use crate::source::LinkId;
-use crate::store::ChunkRecord;
-
-/// The log of window manifests, inside the output directory.
-pub const LOG: &str = "manifests.jsonl";
-
-/// One index table of a window: where it is and how many rows it holds.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct IndexFile {
-    pub table: String,
-    pub key: String,
-    pub rows: u64,
-}
-
-/// What a window holds, summed over its rows.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub struct Totals {
-    pub packets: u64,
-    /// Wire bytes of those packets (`orig_len`).
-    pub bytes: u64,
-    /// Captured bytes written to chunks, and captured bytes the Capture Rate
-    /// cut.
-    pub kept_bytes: u64,
-    pub truncated_bytes: u64,
-    /// Flow rows: one per Flow per Slice.
-    pub flows: u64,
-    pub exchanges: u64,
-    pub workunits: u64,
-    pub events: u64,
-    /// Pack items: bodies and Request Workunit records.
-    pub blobs: u64,
-}
-
-/// One sealed window, as sent to the control plane (spec §11).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct WindowManifest {
-    pub site: String,
-    pub collector: String,
-    pub window_start_ns: u64,
-    pub window_ns: u64,
-    pub links: Vec<LinkId>,
-    pub chunks: Vec<ChunkRecord>,
-    /// The window's pack, if it has items.
-    pub pack: Option<String>,
-    pub index: Vec<IndexFile>,
-    pub totals: Totals,
-}
-
-impl WindowManifest {
-    /// What the ingest deduplicates on: Collector and window.
-    pub fn dedup_key(&self) -> String {
-        format!("{}/{}", self.collector, self.window_start_ns)
-    }
-}
-
-/// What every signature covers first, so a signed line can't pass for
-/// anything else the key signs.
-pub const SIG_CONTEXT: &[u8] = b"tokenspectra/window-manifest/v1\n";
-
-/// What the signature is spliced in as, before the line's closing brace.
-const SIG_FIELD: &[u8] = b",\"sig\":\"";
-
-/// A line's place in the log's chain (the `chain` field).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Chain {
-    /// Position in the log, from 0. It keeps counting across restarts.
-    pub seq: u64,
-    /// The BLAKE3 hash of the line before, as logged (signature included,
-    /// newline not), as a multihash name; `null` only on the first line.
-    pub prev: Option<String>,
-    /// The first line a run appended to an existing log. No run saw the
-    /// windows between `prev`'s and this one.
-    pub restart: bool,
-    /// The Ed25519 public key that signed the line, 64 hex digits.
-    pub key: String,
-}
-
-/// A manifest with its chain: the bytes the signature covers.
-#[derive(Serialize)]
-struct Unsigned<'a> {
-    #[serde(flatten)]
-    manifest: &'a WindowManifest,
-    chain: &'a Chain,
-}
 
 /// The append-only manifest log.
 pub struct Log {
@@ -262,10 +179,6 @@ struct Head {
     collector: String,
     window_start_ns: u64,
     chain: Chain,
-}
-
-fn signed_message(unsigned: &[u8]) -> Vec<u8> {
-    [SIG_CONTEXT, unsigned].concat()
 }
 
 /// A logged line's dedup key, and the hash of its manifest without chain

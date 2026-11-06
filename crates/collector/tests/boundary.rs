@@ -2,13 +2,19 @@
 //! parser will run pinned in two places, so a parse module reaches only
 //! other parse modules. Everything else in the crate is off limits: a new
 //! module counts as I/O until it is listed in [`PARSE`].
+//!
+//! The `commit` and `bundle` crates sit below all of it: they may depend
+//! only on what [`CRATES`] lists, so never on this crate, and their sources
+//! reach no I/O in `std`.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use serde_json::Value;
 
 /// The modules that will become the `parse` crate.
 const PARSE: &[&str] = &[
@@ -22,7 +28,6 @@ const PARSE: &[&str] = &[
     "http",
     "http1",
     "http2",
-    "mh",
     "net",
     "packet",
     "tcp",
@@ -32,6 +37,18 @@ const PARSE: &[&str] = &[
 /// Modules that must never join [`PARSE`].
 const IO: &[&str] = &[
     "capture", "manifest", "observe", "ring", "run", "ship", "source", "stats", "store", "views", "window",
+];
+
+/// The crates below the Collector, and all they may depend on, dev and
+/// build dependencies included.
+const CRATES: &[(&str, &[&str])] = &[
+    ("bundle", &["serde", "serde_json"]),
+    ("commit", &["blake3", "multihash"]),
+];
+
+/// What in `std` reaches the outside world, or a clock.
+const STD_IO: &[&str] = &[
+    "env", "fs", "io", "net", "os", "path", "process", "thread", "time",
 ];
 
 fn tokens(source: &str) -> Vec<TokenTree> {
@@ -149,6 +166,123 @@ fn lib_modules() -> BTreeSet<String> {
     modules(&fs::read_to_string(src().join("lib.rs")).expect("read lib.rs"))
 }
 
+/// The first segment of every path in `ts` that starts at `std`: a module,
+/// `*` for a glob, or `self` for `std` itself under another name.
+fn std_paths(ts: &[TokenTree], found: &mut Vec<String>) {
+    for (i, t) in ts.iter().enumerate() {
+        if let TokenTree::Group(g) = t {
+            std_paths(&g.stream().into_iter().collect::<Vec<_>>(), found);
+        }
+        if !is_ident(Some(t), "std") {
+            continue;
+        }
+        match ts.get(i + 3) {
+            Some(TokenTree::Group(g)) if is_path_sep(ts, i + 1) && g.delimiter() == Delimiter::Brace => {
+                let inner: Vec<_> = g.stream().into_iter().collect();
+                let comma = |t: &TokenTree| matches!(t, TokenTree::Punct(p) if p.as_char() == ',');
+                let heads = inner.split(comma).filter_map(|path| path.first());
+                found.extend(heads.map(ToString::to_string));
+            }
+            Some(next) if is_path_sep(ts, i + 1) => found.push(next.to_string()),
+            _ => found.push("self".to_string()),
+        }
+    }
+}
+
+/// What `source` takes from `std` that `name` may not: everything in
+/// `commit`, which is `no_std`, and I/O in the rest.
+fn std_crossings(name: &str, source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    std_paths(&tokens(source), &mut found);
+    found.retain(|m| name == "commit" || m == "*" || m == "self" || STD_IO.contains(&m.as_str()));
+    found.iter().map(|m| format!("std::{m}")).collect()
+}
+
+fn crate_src(name: &str) -> PathBuf {
+    src().join("../..").join(name).join("src")
+}
+
+/// Every declared dependency of the workspace's `name`, as `cargo` reads
+/// them: of any kind and under any target, by real name.
+fn dependencies(metadata: &Value, name: &str) -> BTreeSet<String> {
+    let packages = metadata["packages"].as_array().expect("packages");
+    let package = packages.iter().find(|p| p["name"] == name);
+    let deps = package.unwrap_or_else(|| panic!("{name} is not in the workspace"))["dependencies"]
+        .as_array()
+        .expect("dependencies");
+    let names = deps.iter().map(|d| d["name"].as_str().expect("dependency name"));
+    names.map(str::to_owned).collect()
+}
+
+#[test]
+fn commit_and_bundle_depend_only_on_what_they_list() {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let out = Command::new(cargo)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run cargo metadata");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let metadata: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata is JSON");
+    for (name, allowed) in CRATES {
+        let deps = dependencies(&metadata, name);
+        let extra: Vec<_> = deps.iter().filter(|d| !allowed.contains(&d.as_str())).collect();
+        assert!(extra.is_empty(), "{name} may not depend on {extra:?}");
+    }
+}
+
+#[test]
+fn commit_and_bundle_reach_no_io_in_std() {
+    let mut bad = Vec::new();
+    for (name, _) in CRATES {
+        let mut files = Vec::new();
+        rust_files(&crate_src(name), &mut files);
+        assert!(!files.is_empty(), "{name} has no sources");
+        for file in files {
+            let source = fs::read_to_string(&file).expect("read module");
+            for crossing in std_crossings(name, &source) {
+                bad.push(format!("{}: {crossing}", file.display()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "I/O below the Collector:\n{}", bad.join("\n"));
+}
+
+#[test]
+fn commit_stays_no_std() {
+    let lib = fs::read_to_string(crate_src("commit").join("lib.rs")).expect("read lib.rs");
+    let ts = tokens(&lib);
+    let attribute = |g: &TokenTree| matches!(g, TokenTree::Group(g) if g.to_string() == "[no_std]");
+    assert!(ts.iter().any(attribute), "commit lost #![no_std]");
+}
+
+#[test]
+fn the_std_scan_sees_every_way_of_naming_io() {
+    let bad = |source: &str| std_crossings("bundle", source);
+    assert_eq!(bad("use std::fs::File;"), ["std::fs"]);
+    assert_eq!(bad("use std::{fmt, io::Read};"), ["std::io"]);
+    assert_eq!(bad("use ::std::net::TcpStream;"), ["std::net"]);
+    assert_eq!(
+        bad("fn f() { let _ = std::time::Instant::now(); }"),
+        ["std::time"]
+    );
+    assert_eq!(bad("#[cfg(test)] mod t { use std::env; }"), ["std::env"]);
+    assert_eq!(bad("use std::*;"), ["std::*"]);
+    assert_eq!(bad("use std as s;"), ["std::self"]);
+    assert_eq!(bad("extern crate std as s;"), ["std::self"]);
+    assert_eq!(bad("use std::{self as s};"), ["std::self"]);
+}
+
+#[test]
+fn the_std_scan_leaves_alone_what_is_not_io() {
+    let bad = |source: &str| std_crossings("bundle", source);
+    assert!(bad("use std::fmt;\nuse std::sync::Arc;").is_empty());
+    assert!(bad("use std::{collections::BTreeMap, fmt};").is_empty());
+    assert!(bad("// use std::fs;\nconst S: &str = \"std::fs\";").is_empty());
+    assert_eq!(std_crossings("commit", "use std::fmt;"), ["std::fmt"]);
+    assert!(std_crossings("commit", "use alloc::vec::Vec;").is_empty());
+}
+
 #[test]
 fn a_parse_module_imports_no_io_module() {
     let mut bad = Vec::new();
@@ -183,7 +317,7 @@ fn the_scan_sees_every_way_of_naming_a_module() {
     assert_eq!(bad("use crate::store::StoreSink;"), ["crate::store"]);
     assert_eq!(bad("use crate::{flow::Dir, stats};"), ["crate::stats"]);
     assert_eq!(
-        bad("use crate::{\n    mh,\n    window::{self},\n};"),
+        bad("use crate::{\n    flow,\n    window::{self},\n};"),
         ["crate::window"]
     );
     assert_eq!(

@@ -16,4 +16,8 @@ Check it with `collector files -o /tmp/x <fixture>.pcapng` on the protocol's fix
 
 ## Keep parsing free of I/O
 
-The parse modules (`PARSE` in `crates/collector/tests/boundary.rs`) will run pinned in two places, on the device and in the Rechecker. They import only each other, and that test fails otherwise. Rows leave through `RecordSink`, counters through an `Observer`, and anything about stored objects through `store::ObjectSink`. A module that belongs to the parser goes on the list; everything else counts as I/O.
+The parse modules (`PARSE` in `crates/collector/tests/boundary.rs`) will run pinned in two places, on the device and in the Rechecker. They import only each other and the `commit` and `bundle` crates, and that test fails otherwise. Rows leave through `RecordSink`, counters through an `Observer`, and anything about stored objects through `store::ObjectSink`. A module that belongs to the parser goes on the list; everything else counts as I/O.
+
+## Keep the core crates below the Collector
+
+`commit` (the trusted core: Merkle tree, hash names) and `bundle` (the manifest and index-table formats) never depend on `collector`, and neither reaches I/O. `commit` stays `no_std` and builds for `wasm32-unknown-unknown`. Their allowed dependencies are `CRATES` in `crates/collector/tests/boundary.rs`; a new one goes on that list, reviewed hardest for `commit`. Signing keys, the on-disk log and writing Parquet stay in `collector`.

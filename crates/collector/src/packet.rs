@@ -1,37 +1,8 @@
 //! What the parser is handed: a packet as captured, its Link and its place
 //! in L0. Sources and windowing produce these; nothing here does I/O.
 
-use std::fmt;
-use std::sync::Arc;
-
+pub use bundle::manifest::LinkId;
 use serde::Serialize;
-
-/// A Link, named after the capture interface (`if_name` in the pcapng
-/// Interface Description Block, or `if<N>` when the block has no name).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LinkId(pub Arc<str>);
-
-impl LinkId {
-    pub fn new(name: &str) -> Self {
-        LinkId(Arc::from(name))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for LinkId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl serde::Serialize for LinkId {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.0)
-    }
-}
 
 /// One packet as captured on a Link.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -26,6 +26,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use commit::mh;
 use serde::Serialize;
 
 use crate::assembler::{EventRecord, FlowSink, PacketRecord, SegmentRecord, SliceRecord};
@@ -35,7 +36,6 @@ use crate::flow::{Dir, FlowId, FlowKind};
 use crate::http::{Head, HeadReply, Lab, Out, StartLine};
 use crate::http1::{parse_request_line, parse_status_line, H1};
 use crate::http2::{H2, PREFACE};
-use crate::mh;
 use crate::packet::{CapturedPacket, LinkId, PacketRef};
 use crate::wire::framing::{Framed, Framer};
 use crate::wire::{self, Claim, Frame, Framing, Protocols, ResponseDecoder};

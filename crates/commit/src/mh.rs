@@ -2,6 +2,10 @@
 //! written as multibase base16 lowercase. A BLAKE3 hash is `f1e20` followed
 //! by the 64 hex digits `b3sum` prints.
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use multihash::Multihash;
 
 /// Multicodec code of BLAKE3.
@@ -49,6 +53,8 @@ pub fn parse(s: &str) -> Option<blake3::Hash> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]

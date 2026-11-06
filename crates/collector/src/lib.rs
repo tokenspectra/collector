@@ -15,6 +15,9 @@
 //! Parsing ([`packet`] in, [`assembler`] to [`decode`] and [`wire`]) does no
 //! I/O: rows leave through a [`RecordSink`], counters through an
 //! [`Observer`]. `tests/boundary.rs` holds that line.
+//!
+//! Hash names and the Merkle tree live in the `commit` crate, the manifest
+//! and index-table formats in the `bundle` crate.
 
 pub mod assembler;
 pub mod capture;
@@ -30,7 +33,6 @@ mod http1;
 mod http2;
 pub mod index;
 pub mod manifest;
-pub mod mh;
 pub mod net;
 pub mod observe;
 pub mod output;
@@ -51,6 +53,7 @@ pub mod window;
 pub mod wire;
 
 pub use assembler::{Assembler, AssemblerConfig, FlowSink};
+pub use commit::mh;
 pub use decode::{Decoder, DecoderConfig, Observed, Observer, RecordSink};
 pub use ring::{RingConfig, RingSource};
 pub use source::{CapturedPacket, FileSource, LinkId, PacketSource, SourceError};
