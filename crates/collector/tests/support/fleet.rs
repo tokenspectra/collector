@@ -11,7 +11,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use collector::fleet::{
     report_data, seed_aad, Signed, CERT_CONTEXT, CONFIG_CONTEXT, SEED_CONTEXT, SEED_INFO,
@@ -58,7 +58,8 @@ pub struct State {
     pub answer: Answer,
     pub nonces: HashSet<String>,
     pub attested: Vec<Attested>,
-    /// The mTLS validity to issue, as seconds from now.
+    /// The mTLS validity to issue, as seconds from now, in the leaf and in
+    /// the reply.
     pub cert_from: i64,
     pub cert_to: i64,
     pub config: Value,
@@ -293,17 +294,19 @@ impl Server {
 
     fn route(&self, path: &str, key: &str, body: &[u8], client_cert: bool) -> (&'static str, String) {
         let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-        match path {
-            "/fleet/hello" => {
+        // Exact routes under either root, as a real server's would be: a
+        // doubled slash is a 404.
+        match path.strip_prefix("/fleet").unwrap_or(path) {
+            "/hello" => {
                 let mut nonce = [0u8; 32];
                 getrandom::fill(&mut nonce).unwrap();
                 let nonce = hex(&nonce);
                 self.state.lock().unwrap().nonces.insert(nonce.clone());
                 ("200 OK", json!({ "nonce": nonce }).to_string())
             }
-            "/fleet/enrol" => self.enrol(&v, client_cert),
-            "/fleet/pull" if !client_cert => ("403 Forbidden", "no client certificate".into()),
-            "/fleet/pull" => {
+            "/enrol" => self.enrol(&v, client_cert),
+            "/pull" if !client_cert => ("403 Forbidden", "no client certificate".into()),
+            "/pull" => {
                 let mut s = self.state.lock().unwrap();
                 s.pulls.push(v);
                 let reply = json!({
@@ -374,11 +377,11 @@ impl Server {
 
         let (ca_params, ca_key) = &*self.client_ca;
         let issuer = Issuer::from_params(ca_params, ca_key);
-        let leaf = CertificateParams::new(Vec::<String>::new())
-            .unwrap()
-            .signed_by(&RawEd25519(tls_key.to_vec()), &issuer)
-            .unwrap();
         let now = now_s();
+        let at = |s: i64| rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs((now + s) as u64);
+        let mut leaf = CertificateParams::new(Vec::<String>::new()).unwrap();
+        (leaf.not_before, leaf.not_after) = (at(s.cert_from), at(s.cert_to));
+        let leaf = leaf.signed_by(&RawEd25519(tls_key.to_vec()), &issuer).unwrap();
         let reply = json!({
             "member": MEMBER,
             "site": SITE,

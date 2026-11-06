@@ -132,6 +132,12 @@ fn dedup_key(line: &[u8]) -> Option<String> {
 /// and stops at the first failure. The cursor advances past each line the
 /// ingest accepts.
 pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Shipped, ShipError> {
+    ship_from(out, &|| ingest.clone(), timeout)
+}
+
+/// [`ship_pending`], asking `ingest` where to ship before each line: a long
+/// drain can outlast the certificate it started with.
+pub fn ship_from(out: &Path, ingest: &dyn Fn() -> Ingest, timeout: Duration) -> Result<Shipped, ShipError> {
     ship_within(out, ingest, timeout, &mut || None)
 }
 
@@ -142,7 +148,7 @@ pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Sh
 /// read the rest of the log.
 fn ship_within(
     out: &Path,
-    ingest: &Ingest,
+    ingest: &dyn Fn() -> Ingest,
     timeout: Duration,
     shutdown: &mut dyn FnMut() -> Option<Instant>,
 ) -> Result<Shipped, ShipError> {
@@ -189,7 +195,7 @@ fn ship_within(
         let request = Instant::now() + timeout;
         let sent = match dedup_key(body) {
             None => Err(ShipError::BadLine(offset)),
-            Some(key) => post(ingest, &key, body, &mut || {
+            Some(key) => post(&ingest(), &key, body, &mut || {
                 shutdown().map_or(request, |d| d.min(request))
             })
             .and_then(|(status, text)| match status {
@@ -233,7 +239,7 @@ impl Shipper {
     }
 
     /// As [`Shipper::spawn`], asking `ingest` where to ship before each
-    /// pass: the Fleet can move the ingest and renews the certificate.
+    /// line: the Fleet can move the ingest and renews the certificate.
     pub fn spawn_with(
         out: PathBuf,
         ingest: Box<dyn Fn() -> Ingest + Send>,
@@ -273,7 +279,7 @@ fn run(
     loop {
         // A shutdown request is taken up between lines and mid-request, not
         // only between passes.
-        let pass = ship_within(out, &ingest(), TIMEOUT, &mut || {
+        let pass = ship_within(out, ingest, TIMEOUT, &mut || {
             if deadline.is_none() {
                 match stopped.try_recv() {
                     Ok(d) => deadline = Some(d),
@@ -437,6 +443,19 @@ mod tests {
             }
         });
         Ingest::plain(&format!("http://127.0.0.1:{port}/")).unwrap()
+    }
+
+    #[test]
+    fn the_ingest_is_asked_again_for_each_line() {
+        let dir = log_of(3);
+        let ingest = slow_ingest(Some(Duration::ZERO));
+        let asked = std::cell::Cell::new(0);
+        let from = || {
+            asked.set(asked.get() + 1);
+            ingest.clone()
+        };
+        let s = ship_from(dir.path(), &from, Duration::from_secs(5)).unwrap();
+        assert_eq!((s.sent, asked.get()), (3, 3));
     }
 
     #[test]

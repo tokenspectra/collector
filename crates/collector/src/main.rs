@@ -329,9 +329,20 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Cmd::Ship { out } => {
-            let ingest = fleet.as_ref().map(|f| f.ingest()).or(ingest);
-            let ingest = ingest.ok_or("`collector ship` needs --fleet or --ingest")?;
-            let s = ship::ship_pending(&out, &ingest, Duration::from_secs(10))?;
+            // The channel first: a certificate that ran out during a long
+            // cut renews before the first line, and a long drain goes on
+            // renewing.
+            let channel = fleet.clone().map(Channel::spawn).transpose()?;
+            let ingest: Box<dyn Fn() -> Ingest> = match (fleet, ingest) {
+                (Some(f), _) => Box::new(move || f.ingest()),
+                (None, Some(i)) => Box::new(move || i.clone()),
+                (None, None) => return Err("`collector ship` needs --fleet or --ingest".into()),
+            };
+            let shipped = ship::ship_from(&out, &*ingest, Duration::from_secs(10));
+            if let Some(channel) = channel {
+                channel.finish();
+            }
+            let s = shipped?;
             // No deadline here, so the count is always known.
             info!(
                 sent = s.sent,

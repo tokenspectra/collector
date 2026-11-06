@@ -300,13 +300,39 @@ fn a_certificate_that_ran_out_is_renewed_without_it() {
     mock.state.lock().unwrap().cert_from = -3600;
     let dir = tempfile::tempdir().unwrap();
     let fleet = enrol(&mock, dir.path());
+
+    // The leaf itself has run out, so TLS refuses it.
+    let until = Instant::now() + Duration::from_secs(5);
+    let body = b"{}";
+    assert!(fleet.ingest().post("", &[], body, 1024, &mut || until).is_err());
+    assert!(mock.state.lock().unwrap().windows.is_empty());
+
     mock.state.lock().unwrap().cert_to = 3600;
     let channel = Channel::spawn(fleet.clone()).unwrap();
     wait_for("a renewal", || mock.state.lock().unwrap().attested.len() >= 2);
+    wait_for("a pull on the new certificate", || {
+        !mock.state.lock().unwrap().pulls.is_empty()
+    });
     channel.finish();
     let attested = mock.state.lock().unwrap().attested.clone();
     assert!(!attested[1].client_cert);
     assert_eq!(attested[1].member.as_deref(), Some(MEMBER));
+}
+
+#[test]
+fn a_fleet_url_may_have_no_path_or_end_in_a_slash() {
+    let mock = MockFleet::start();
+    let host = mock.url.strip_suffix("/fleet").unwrap().to_string();
+    for url in [host.clone(), format!("{host}/"), format!("{}/", mock.url)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(&mock, dir.path());
+        opts.url = url.clone();
+        let fleet = Fleet::open(opts).unwrap_or_else(|e| panic!("{url}: {e}"));
+        let pulls = mock.state.lock().unwrap().pulls.len();
+        let channel = Channel::spawn(fleet).unwrap();
+        wait_for("a heartbeat", || mock.state.lock().unwrap().pulls.len() > pulls);
+        channel.finish();
+    }
 }
 
 #[test]
@@ -424,6 +450,40 @@ fn a_run_enrols_ships_over_mtls_and_says_what_it_ran_under() {
 
     let held = mock.state.lock().unwrap().windows.clone();
     assert_eq!(held.len(), lines.len());
+}
+
+#[test]
+fn ship_renews_a_certificate_that_ran_out_before_it_drains_the_log() {
+    let mock = MockFleet::start();
+    {
+        let mut s = mock.state.lock().unwrap();
+        (s.cert_from, s.cert_to) = (-3600, -1);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let mut cmd = cli(&mock, &out);
+    cmd.args(["--ship-wait-s", "0"]);
+    files(&mut cmd, &out);
+    let run = cmd.output().unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stdout));
+    let lines = manifests(&out);
+    assert!(!lines.is_empty());
+    assert!(
+        mock.state.lock().unwrap().windows.is_empty(),
+        "TLS refused the leaf"
+    );
+
+    {
+        let mut s = mock.state.lock().unwrap();
+        (s.cert_from, s.cert_to) = (-60, 3600);
+    }
+    let ship = cli(&mock, &out).arg("ship").arg(&out).output().unwrap();
+    assert!(ship.status.success(), "{}", String::from_utf8_lossy(&ship.stdout));
+
+    let s = mock.state.lock().unwrap();
+    assert_eq!(s.windows.len(), lines.len());
+    assert!(!s.attested.last().unwrap().client_cert);
+    assert_eq!(pending_lines(&out).unwrap(), 0);
 }
 
 #[test]

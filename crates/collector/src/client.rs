@@ -95,6 +95,15 @@ impl Endpoint {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// The endpoint's path plus `suffix`, with one slash where they meet: a
+    /// URL with no path parses to `/`.
+    fn target(&self, suffix: &str) -> String {
+        match suffix {
+            "" => self.path.clone(),
+            _ => format!("{}{suffix}", self.path.trim_end_matches('/')),
+        }
+    }
+
     /// POSTs `body` to the endpoint's path plus `suffix` and returns the
     /// status and at most `limit` bytes of the response. Gives up once
     /// `until()` has passed; it is asked again at least every [`SLICE`]
@@ -133,7 +142,8 @@ impl Endpoint {
         } else {
             self.authority()
         };
-        let mut head = format!("POST {}{suffix} HTTP/1.1\r\nHost: {host}\r\n", self.path);
+        let target = self.target(suffix);
+        let mut head = format!("POST {target} HTTP/1.1\r\nHost: {host}\r\n");
         for (name, value) in headers {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -417,6 +427,17 @@ mod tests {
         let i = Endpoint::tls("https://cp.local/in", tls.clone()).unwrap();
         assert_eq!((i.port, i.path.as_str()), (443, "/in"));
         assert!(Endpoint::tls("http://cp.local/", tls).is_err());
+    }
+
+    #[test]
+    fn a_suffix_joins_the_path_with_one_slash() {
+        let target = |url, suffix| Endpoint::plain(url).unwrap().target(suffix);
+        assert_eq!(target("http://h", "/hello"), "/hello");
+        assert_eq!(target("http://h/", "/hello"), "/hello");
+        assert_eq!(target("http://h/fleet", "/hello"), "/fleet/hello");
+        assert_eq!(target("http://h/fleet/", "/hello"), "/fleet/hello");
+        assert_eq!(target("http://h/ingest/", ""), "/ingest/");
+        assert_eq!(target("http://h", ""), "/");
     }
 
     #[test]
