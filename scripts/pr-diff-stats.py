@@ -52,8 +52,8 @@ TEST_FILE_RE = re.compile(
     r"""(?x)
     ^(
         test_.*            # test_foo.py
-      | .*[._-]test\..*    # foo.test.ts, foo_test.rs
-      | .*[._-]spec\..*    # foo.spec.ts
+      | .*[._-]test(\..*)? # foo.test.ts, foo_test.rs, foo.test.d.ts
+      | .*[._-]spec(\..*)? # foo.spec.ts, foo.spec.d.ts
       | testing            # mock harnesses sitting next to production code
       | test_utils
       | test_helpers
@@ -449,6 +449,17 @@ def self_test() -> None:
     code (rename pairing, test stripping, path recovery from `--no-index`) can
     sit broken and green.
     """
+    # Test files by name alone, next to production code. Every one changes
+    # between the two commits, and none may count.
+    test_files = [
+        "crate/src/foo.test.ts",
+        "crate/src/foo.spec.ts",
+        "crate/src/foo_test.rs",
+        "crate/src/foo-test.tsx",
+        "crate/src/test_foo.py",
+        "crate/src/foo.test.d.ts",
+    ]
+
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp) / "repo"
         repo.mkdir()
@@ -472,6 +483,8 @@ def self_test() -> None:
         write("crates/collector/src/lib.rs", "pub fn ping() -> u32 { 1 }\n")
         write("crates/shipper/src/lib.rs", "pub fn tick() -> u32 { 1 }\n")
         write("crates/collector/tests/golden/case/flows.jsonl", "{}\n")
+        for path in test_files:
+            write(path, "one\n")
         run(*git, "add", "-A")
         run(*git, "commit", "-qm", "base")
         base = run(*git, "rev-parse", "HEAD").strip()
@@ -486,6 +499,8 @@ def self_test() -> None:
         write("crates/collector/src/lib.rs", "pub fn ping() -> u32 { 2 }\n")
         write("crates/shipper/src/lib.rs", "pub fn tick() -> u32 { 2 }\n")
         write("crates/collector/tests/golden/case/flows.jsonl", "{}\n{}\n")
+        for path in test_files:
+            write(path, "one\ntwo\n")
         run(*git, "add", "-A")
         run(*git, "commit", "-qm", "head")
         head = run(*git, "rev-parse", "HEAD").strip()
@@ -519,9 +534,11 @@ def self_test() -> None:
     if stats != expected:
         problems.append(f"stats mismatch\n  got:      {stats}\n  expected: {expected}")
     # `crate/tests/it.rs`, `docs/readme.md`, `crate/src/styles.css` and the
-    # golden table changed too; all four must land in the uncounted bucket.
-    if len(files) - len(code) != 4:
-        problems.append(f"expected 4 uncounted files, got {len(files) - len(code)}")
+    # golden table changed too; all four must land in the uncounted bucket,
+    # along with `test_files`.
+    uncounted = 4 + len(test_files)
+    if len(files) - len(code) != uncounted:
+        problems.append(f"expected {uncounted} uncounted files, got {len(files) - len(code)}")
     report = render(stats, skipped=len(files) - len(code))
     if "**+8 / −6**" not in report:
         problems.append(f"unexpected totals in report:\n{report}")
