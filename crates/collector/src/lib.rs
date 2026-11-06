@@ -8,9 +8,10 @@
 //! names ([`mh`]) and body views ([`views`]). Hashing, the Capture Rate
 //! cut and the object store: L0 chunks ([`chunk`], [`capture`]), packs
 //! ([`pack`]), Parquet index tables ([`index`]), all written by [`store`]; window
-//! manifests, signed and chained ([`manifest`], [`sign`]). Counters and diagnostics
+//! manifests, signed and chained ([`manifest`], [`sign`]). The Fleet
+//! channel to the control plane ([`fleet`], [`client`]). Counters and diagnostics
 //! logs ([`stats`], [`observe`]) sit beside the pipeline and never change
-//! its output. See `docs/spec.md` §3–8 and §14.
+//! its output. See `docs/spec.md` §3–8, §14 and §15.
 //!
 //! Parsing ([`packet`] in, [`assembler`] to [`decode`] and [`wire`]) does no
 //! I/O: rows leave through a [`RecordSink`], counters through an
@@ -22,9 +23,11 @@
 pub mod assembler;
 pub mod capture;
 pub mod chunk;
+pub mod client;
 pub mod coding;
 pub mod decode;
 pub mod dns;
+pub mod fleet;
 pub mod flow;
 mod hpack;
 mod hpack_huffman;

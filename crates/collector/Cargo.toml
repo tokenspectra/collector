@@ -26,9 +26,12 @@ flate2 = "1"
 brotli = "9"
 ed25519-dalek = "3"
 getrandom = "0.4"
+hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
 
 [dev-dependencies]
 futures = "0.3"
 bytes = "1"
 proc-macro2 = "1"
 tempfile = "3"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

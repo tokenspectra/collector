@@ -105,6 +105,37 @@ pub struct WindowManifest {
     pub pack: Option<String>,
     pub index: Vec<IndexFile>,
     pub totals: Totals,
+    /// What the Fleet has to say about the window; absent in a run with no
+    /// Fleet. These fields aren't what was captured: a re-run under
+    /// another config repeats the window, it doesn't conflict with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<Observed>,
+}
+
+/// Who wrote the window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Identity {
+    /// The multihash of the signed config this window was cut under.
+    pub config: String,
+}
+
+/// How the window was cut.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CaptureInfo {
+    /// The seed epoch of the window's capture secret; never the secret.
+    pub epoch: Option<u64>,
+}
+
+/// Live-only health, as the run saw it when it sealed the window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Observed {
+    /// The control channel was down: the run went on with its last config
+    /// and current seed epoch.
+    pub channel_cut: bool,
 }
 
 impl WindowManifest {

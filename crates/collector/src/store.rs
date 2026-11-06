@@ -56,6 +56,7 @@ use crate::decode::{
     BodyKey, ExchangeRecord, FeaturesRecord, FlowRecord, RecordSink, Span, WindowClose, WorkunitRecord,
 };
 use crate::dns::DnsRecord;
+use crate::fleet::{Fleet, Stamp};
 use crate::flow::{Dir, FlowId};
 use crate::manifest::{IndexFile, Totals, WindowManifest};
 use crate::source::{CapturedPacket, LinkId};
@@ -102,6 +103,9 @@ pub struct StoreConfig {
     /// `-partN` objects of this size, the last one shorter. S3 takes at
     /// most 5 GiB in one put.
     pub part_bytes: u64,
+    /// The Fleet, when the run has one: each window is cut under the config
+    /// in force when it is sealed, and its manifest says which.
+    pub fleet: Option<Arc<Fleet>>,
 }
 
 impl StoreConfig {
@@ -114,6 +118,7 @@ impl StoreConfig {
             hold_windows: 2,
             zstd_level: 3,
             part_bytes: 1 << 30,
+            fleet: None,
         }
     }
 }
@@ -206,6 +211,8 @@ pub struct StoreSink<'a> {
     reg: Option<Arc<Registry>>,
     windows: BTreeMap<u64, Window>,
     sealed_through: Option<u64>,
+    /// What the Fleet said as the window being written was sealed.
+    stamp: Option<Stamp>,
     spans: HashMap<(FlowId, Dir), DirSpans>,
     /// TCP Flows whose last row is out: no more spans will come.
     done: HashSet<FlowId>,
@@ -229,6 +236,7 @@ impl<'a> StoreSink<'a> {
             reg,
             windows: BTreeMap::new(),
             sealed_through: None,
+            stamp: None,
             spans: HashMap::new(),
             done: HashSet::new(),
             bodies: HashMap::new(),
@@ -367,6 +375,9 @@ impl<'a> StoreSink<'a> {
             return;
         };
         self.sealed_through = Some(w);
+        if let Some(fleet) = self.cfg.fleet.clone() {
+            self.stamp = Some(fleet.seal(w, &mut self.cfg.capture));
+        }
         if self.error.is_none() {
             if let Err(e) = self.write_window(w, &mut win) {
                 self.error = Some(e);
@@ -465,6 +476,9 @@ impl<'a> StoreSink<'a> {
             pack,
             index,
             totals,
+            identity: self.stamp.as_ref().map(|s| s.identity.clone()),
+            capture: self.stamp.as_ref().map(|s| s.capture.clone()),
+            observed: self.stamp.as_ref().map(|s| s.observed.clone()),
         }
     }
 
