@@ -390,8 +390,9 @@ pub fn txt(strings: &[&[u8]]) -> Vec<u8> {
 /// - a resolver Flow: an A lookup and its answer; a TXT lookup answered
 ///   with two big TXT records; tunnel-like queries with long base32 labels
 ///   over two windows, one carrying trailing bytes; a datagram that is not
-///   DNS; an answer whose name is a compression loop and a TXT answer whose
-///   string runs past its RDATA (neither is DNS);
+///   DNS; an UPDATE (not parsed); an answer whose owner points at itself
+///   (walked, not followed); a TXT answer whose string runs past its RDATA
+///   (DNS, with no TXT facts);
 /// - DNS to a non-standard port, which still parses (ports never count);
 /// - a UDP Flow that is not DNS, which gets no `features` row.
 pub fn dns_covert() -> Fixture {
@@ -444,6 +445,7 @@ pub fn dns_covert() -> Fixture {
     looped[n - 16..n - 14].copy_from_slice(&(0xc000u16 | (n - 16) as u16).to_be_bytes());
     at(210, DNS, client, looped);
     at(220, DNS, client, dns_msg(2, ANSWER, t, TXT, &[(TXT, vec![0xff])]));
+    at(230, client, DNS, dns_msg(5, 0x2800, api, 6, &[(A, Vec::new())]));
     // The next window.
     for i in 4..7u8 {
         let label = tunnel(i);

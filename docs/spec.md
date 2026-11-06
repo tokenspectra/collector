@@ -167,14 +167,17 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 
 **DNS and covert-channel features (TS-51).** Decoded at the edge, at 100%, because they are parsers of adversary bytes that are cheap here and expensive to rebuild from L0 later ([verification-pipeline §5](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/verification-pipeline.md)). They are facts: Allowlist rules ("DNS to resolver X, zones in Y, ≤ N B/s"), Signatures and statuses stay in the Classifier.
 - **Which datagrams.** Every UDP datagram, on any port, is tried as one DNS message (RFC 1035 §4.1); a datagram is DNS only when it parses. Ports never count: DNS to a non-standard port is DNS, and a datagram to port 53 that does not parse is not.
-- **Strict parse.** A 12-byte header with a known opcode (QUERY, IQUERY, STATUS, NOTIFY, UPDATE, DSO) and at least one question; then every question and resource record the header counts must parse. A datagram the capture cut is not read.
-  - **Names** are read label by label: 63 bytes a label, 255 a name; label types `01` and `10` are rejected. A compression pointer must target the start of a label, or of a pointer, in an **earlier** name of the same message: never the header, a label's bytes, a root octet, other data or its own name (which would loop). At most 128 pointers are followed per name.
-  - **RDATA** must fit its RDLENGTH, and the types with a fixed format are checked inside it: A (4 bytes) and AAAA (16); TXT and SPF as one or more character-strings that fill it exactly; the name-bearing types (NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME; MINFO; MX, AFSDB, RT, KX; SOA; SRV) as their fixed fields and names, which end at RDLENGTH and whose pointers follow the rule above; OPT as options that fill it. Other types stay opaque.
+- **Narrow on purpose.** The parse reads what a rule like "DNS to resolver X, zones in Y, ≤ N B/s" needs (the resolver is the Flow's endpoint, the zone comes from the qname, the rate from byte counts), plus the content features below. It is not a full DNS parser, and nothing here says a message is valid DNS beyond these checks.
+  - **Header and first question: strict.** A 12-byte header with opcode QUERY and at least one question, then the qname, qtype and qclass. A qname has at most 63 bytes a label and 255 a name; label types `01` and `10` are rejected. Only the header comes before the first qname, so a compression pointer in it could reach only the header or the name's own labels: any pointer there is rejected. A datagram the capture cut is not read.
+  - **Everything after it: by bounds only.** Further questions and every resource record are walked: each owner name, fixed field and RDLENGTH must fit in the message. A name is skipped up to its root or a pointer, which ends it and is not followed, so its target is not checked. A name that uses label type `01` or `10` has no length to walk, so the message is rejected. RDATA is not read, whatever the record's type.
+  - **TXT is the exception, for its sizes.** A TXT record counts in the `txt_*` columns only when it holds one or more character-strings that fill its RDATA exactly. A malformed TXT adds no TXT facts; the message is still DNS.
+  - **Other opcodes are not parsed.** UPDATE, NOTIFY and the rest give their sections other meanings and no rule reads them, so their datagrams are not DNS here: their bytes are `unexplained`.
   - Bytes after the last record do not stop the parse; they are counted in `trailing_bytes`, since data hidden there is worth seeing.
-- **Byte accounting.** Each payload byte of a UDP Flow is in exactly one bucket (below): `fact` when its datagram is a whole DNS message, `gap` when the capture cut it, `unexplained` otherwise. So the bytes of a UDP/53 Flow are all in a DNS fact or explicitly unexplained, and per direction and Slice `fact` equals the `size` of that direction's `dns` rows.
+- **Byte accounting.** Each payload byte of a UDP Flow is in exactly one bucket (below): `fact` when its datagram walks as a whole DNS message, `gap` when the capture cut it, `unexplained` otherwise. So the bytes of a UDP/53 Flow are all in a DNS fact or explicitly unexplained, and per direction and Slice `fact` equals the `size` of that direction's `dns` rows.
 - **Not changed:** a UDP Flow's verdict stays `opaque`, and the Capture Rate keeps it as an alarm Flow whatever its buckets (§7). The Classifier reads the `dns` and `features` tables to match an Allowlist rule.
 - **A pure parse.** `dns.rs` reads bytes and returns rows: no clock, no I/O, no store, stats or manifest; it is meant for the `parse` crate ([hardware-collector §4, §7](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/hardware-collector.md#protocol-facts-dns-tls-clienthello-ntp)).
-- **Not in TS-51:** DNS over TCP (it stays `opaque`), DNS over TLS or HTTPS (opaque by design), EDNS options, mDNS-specific fields.
+- **A fact is not a check of the bytes.** `fact` says a datagram walked as DNS, not that its RDATA is what its type claims: data can ride in any record, and it counts in the byte columns but in no content feature except TXT sizes. A bound on what a Flow can carry comes from all its bytes, not from what parsed.
+- **Not in TS-51:** DNS over TCP (it stays `opaque`), DNS over TLS or HTTPS (opaque by design), non-QUERY opcodes, names and RDATA outside the first question and TXT sizes, EDNS options, mDNS-specific fields.
 
 `dns`: one row per DNS message, in its packet's window.
 
@@ -182,7 +185,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 |---|---|
 | `window_start_ns`, `index`, `ts_ns`, `flow`, `dir` | The packet that carried it (joins `packets`) and its direction |
 | `id`, `response`, `opcode`, `rcode`, `aa`, `tc`, `rd`, `ra` | Header fields; `response` is QR; `rcode` is the header's 4 bits (no EDNS extension) |
-| `questions`, `answers`, `authority`, `additional` | Section counts, as the header gives them |
+| `questions`, `answers`, `authority`, `additional` | Section counts, as the header gives them. `opcode` is always 0 (QUERY) today |
 | `qname`, `qtype`, `qclass` | The first question. `qname` is in presentation form (RFC 1035 §5.1): bytes outside `!`..`~` are `\DDD`, `.` and `\` inside a label are escaped, the root is `.`; case as sent |
 | `qname_len`, `labels`, `label_len_max` | Label bytes plus the dots between them; label count; longest label |
 | `qname_entropy` | Shannon entropy of the name's label bytes, ASCII letters folded to lower case (so 0x20 case randomisation adds nothing), in bits per byte, rounded to 3 decimals; `null` for the root |
@@ -441,7 +444,7 @@ _As built (TS-27): 1, 2, 4 and 6 run in CI over the whole golden set, all four W
    - HTTP/1.1 JSON, HTTP/1.1 SSE with chunked encoding, h2c JSON and SSE;
    - a Flow spanning windows, a mid-stream start, a lost segment, a retransmit with different bytes;
    - `/health`, a TLS Flow on the plaintext Link, a non-HTTP TCP Flow, UDP;
-   - DNS (TS-51): A and TXT lookups, big TXT answers, tunnel-like names over two windows, trailing bytes, a datagram that is not DNS, a compression loop, DNS to a non-standard port;
+   - DNS (TS-51): A and TXT lookups, big TXT answers, tunnel-like names over two windows, trailing bytes, a datagram that is not DNS, an UPDATE, an owner name that points at itself, a malformed TXT, DNS to a non-standard port;
    - content codings (TS-37): gzip JSON, gzip SSE flushed per event, and one Flow with `deflate` (zlib and raw), `br`, `zstd`, a gzip request body, an unknown coding, a gzip bomb and a cut-off gzip stream.
 2. **Determinism:** two runs over the same files give byte-identical tables.
 3. **Live equals offline:** a live `RingSource` run and a `FileSource` run over the same dumpcap files give the same output.

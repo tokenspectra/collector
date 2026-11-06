@@ -251,9 +251,18 @@ fn dns_messages_and_covert_channel_features() {
     let on = |flow: &str| -> Vec<&collector::dns::DnsRecord> {
         c.dns.iter().filter(|d| d.flow.as_str() == flow).collect()
     };
-    // 2 + 2 + 8 + 3 messages; the junk datagram, the looped answer and the
-    // TXT answer with a short string are not DNS.
-    assert_eq!(on(resolver).len(), 15);
+    // 2 + 2 + 8 + 3 messages, the answer with a looped owner and the TXT
+    // answer with a short string; the junk datagram and the UPDATE are not.
+    assert_eq!(on(resolver).len(), 17);
+    let bad_txt = on(resolver)
+        .into_iter()
+        .filter(|d| d.response && d.qname == "_cfg.example")
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        (bad_txt.answers, bad_txt.txt_records, bad_txt.txt_max),
+        (1, 0, None)
+    );
     let txt = on(resolver)
         .into_iter()
         .find(|d| d.response && d.qname == "_cfg.example")
@@ -285,7 +294,7 @@ fn dns_messages_and_covert_channel_features() {
             first.responses,
             first.other_datagrams
         ),
-        (12, 6, 6, 3)
+        (14, 6, 8, 2)
     );
     assert_eq!(first.query_rate, 6.0);
     assert_eq!((first.txt_records, first.txt_max), (6, Some(357)));

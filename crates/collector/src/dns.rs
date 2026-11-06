@@ -1,18 +1,20 @@
 //! DNS over UDP and the per-Slice covert-channel features (spec §5, "DNS").
 //!
 //! Every UDP datagram, on any port, is tried as a DNS message (RFC 1035
-//! §4): a datagram is DNS only when its bytes parse as DNS. The parse is
-//! strict: a header with a known opcode and at least one question, then
-//! every question and resource record the header counts.
-//! - Names are checked label by label: at most 63 bytes a label, 255 a
-//!   name. A compression pointer must point at the start of a label, or of
-//!   a pointer, in an earlier name of the same message, never into the
-//!   header, a label's bytes or other data, and at most [`MAX_HOPS`] are
-//!   followed per name.
-//! - The RDATA of the types whose format is fixed is checked within its
-//!   RDLENGTH: A and AAAA by length, TXT as character-strings that fill it,
-//!   the name-bearing types (NS, CNAME, PTR, DNAME, MX, SOA, SRV, …) as
-//!   their fields and names, OPT as options. Other types stay opaque.
+//! §4): a datagram is DNS only when its bytes parse as DNS. The parse reads
+//! what a rule like "DNS to resolver X, zones in Y, at most N B/s" needs,
+//! plus the content features, and no more:
+//! - The header and the first question are strict: opcode QUERY, at least
+//!   one question, and a qname of at most 63 bytes a label and 255 a name.
+//!   Nothing comes before that name but the header, so a compression
+//!   pointer in it could only reach the header or its own labels: any
+//!   pointer there is malformed.
+//! - Everything after it is walked by bounds only: each name, fixed field
+//!   and RDLENGTH must fit in the message. Names are skipped, pointers are
+//!   not followed, and RDATA is not read, so a record's type says nothing
+//!   about its bytes being well formed.
+//! - The one exception is TXT, for its sizes: a TXT record whose
+//!   character-strings do not fill its RDATA exactly adds no TXT facts.
 //! - Bytes left after the last record are counted, not rejected: they are
 //!   a fact worth seeing on a Link.
 //!
@@ -26,13 +28,9 @@ use serde::Serialize;
 use crate::flow::{Dir, FlowId};
 use crate::window::PacketRef;
 
-/// Compression pointers followed per name before the name is malformed.
-/// A name has at most 127 labels, and real encoders use one pointer.
-const MAX_HOPS: usize = 128;
 /// Longest name on the wire, length octets and the root included.
 const MAX_NAME: usize = 255;
 const TYPE_TXT: u16 = 16;
-const TYPE_SPF: u16 = 99;
 
 /// One UDP datagram as captured, handed to [`FlowSink::datagram`](crate::FlowSink::datagram).
 #[derive(Clone, Copy, Debug)]
@@ -193,23 +191,22 @@ pub fn decode(d: &Datagram<'_>) -> Option<DnsRecord> {
     let m = d.payload;
     let h = Header::parse(m)?;
     let mut p = Msg::new(m);
-    let q = p.name()?;
+    let q = p.qname()?;
     let qtype = p.u16()?;
     let qclass = p.u16()?;
     for _ in 1..h.questions {
-        p.name()?;
+        p.skip_name()?;
         p.take(4)?;
     }
     let (mut txt_records, mut txt_bytes, mut txt_max) = (0u32, 0u64, None);
     let records = u32::from(h.answers) + u32::from(h.authority) + u32::from(h.additional);
     for _ in 0..records {
-        p.name()?;
+        p.skip_name()?;
         let rtype = p.u16()?;
         p.take(6)?; // class, TTL
         let rdlen = usize::from(p.u16()?);
-        let end = p.pos.checked_add(rdlen).filter(|&e| e <= m.len())?;
-        p.rdata(rtype, end)?;
-        if rtype == TYPE_TXT {
+        let rdata = p.take(rdlen)?;
+        if rtype == TYPE_TXT && txt_is_well_formed(rdata) {
             txt_records += 1;
             txt_bytes += rdlen as u64;
             txt_max = txt_max.max(Some(rdlen as u32));
@@ -268,9 +265,9 @@ impl Header {
             authority: u16_at(m, 8)?,
             additional: u16_at(m, 10)?,
         };
-        // QUERY, IQUERY, STATUS, NOTIFY, UPDATE, DSO; 3 and 7–15 are unassigned.
-        let known = matches!(h.opcode(), 0 | 1 | 2 | 4 | 5 | 6);
-        (known && h.questions > 0).then_some(h)
+        // Only QUERY: UPDATE and the rest give their sections other meanings,
+        // and no rule reads them, so they stay `unexplained`.
+        (h.opcode() == 0 && h.questions > 0).then_some(h)
     }
 
     fn opcode(&self) -> u8 {
@@ -341,22 +338,24 @@ impl Name<'_> {
     }
 }
 
+/// One or more character-strings that fill `rdata` exactly.
+fn txt_is_well_formed(rdata: &[u8]) -> bool {
+    let mut at = 0;
+    while at < rdata.len() {
+        at += 1 + usize::from(rdata[at]);
+    }
+    at == rdata.len() && !rdata.is_empty()
+}
+
 /// A message being read front to back.
 struct Msg<'a> {
     m: &'a [u8],
     pos: usize,
-    /// Where each label and pointer of the names read so far begins, in
-    /// increasing order: the only places a compression pointer may target.
-    starts: Vec<usize>,
 }
 
 impl<'a> Msg<'a> {
     fn new(m: &'a [u8]) -> Self {
-        Msg {
-            m,
-            pos: 12,
-            starts: Vec::new(),
-        }
+        Msg { m, pos: 12 }
     }
 
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -370,97 +369,52 @@ impl<'a> Msg<'a> {
         Some(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    /// Reads the name at the cursor and moves past it.
-    fn name(&mut self) -> Option<Name<'a>> {
-        let first = self.starts.len();
+    /// Reads the first question's name, label by label.
+    fn qname(&mut self) -> Option<Name<'a>> {
         let mut labels = Vec::new();
-        let mut at = self.pos;
-        let mut resume = None;
-        let mut hops = 0;
         let mut wire = 1; // the root's length octet
         loop {
-            let len = *self.m.get(at)?;
-            if resume.is_none() && len != 0 {
-                self.starts.push(at);
+            let len = *self.m.get(self.pos)?;
+            if len == 0 {
+                self.pos += 1;
+                return Some(Name { labels });
             }
+            // 0b11 is a pointer (see the module docs); 0b01 and 0b10 are not
+            // in use.
+            if len >> 6 != 0 {
+                return None;
+            }
+            let len = usize::from(len);
+            wire += 1 + len;
+            if wire > MAX_NAME {
+                return None;
+            }
+            self.pos += 1;
+            labels.push(self.take(len)?);
+        }
+    }
+
+    /// Moves past a name without reading it: its labels up to the root, or
+    /// up to a pointer, which ends it and is not followed.
+    fn skip_name(&mut self) -> Option<()> {
+        loop {
+            let len = *self.m.get(self.pos)?;
             match len >> 6 {
-                0 if len == 0 => break,
+                0 if len == 0 => {
+                    self.pos += 1;
+                    return Some(());
+                }
                 0 => {
-                    let len = usize::from(len);
-                    labels.push(self.m.get(at + 1..at + 1 + len)?);
-                    wire += 1 + len;
-                    if wire > MAX_NAME {
-                        return None;
-                    }
-                    at += 1 + len;
+                    self.take(1 + usize::from(len))?;
                 }
                 3 => {
-                    let target = usize::from(u16_at(self.m, at)? & 0x3fff);
-                    hops += 1;
-                    // Earlier names only: one that points into itself loops.
-                    let earlier = &self.starts[..first];
-                    if hops > MAX_HOPS || earlier.binary_search(&target).is_err() {
-                        return None;
-                    }
-                    resume.get_or_insert(at + 2);
-                    at = target;
+                    self.take(2)?;
+                    return Some(());
                 }
-                // 0b01 (extended label types) and 0b10 are not in use.
+                // 0b01 and 0b10 have no length to walk.
                 _ => return None,
             }
         }
-        self.pos = resume.unwrap_or(at + 1);
-        Some(Name { labels })
-    }
-
-    /// Checks the RDATA of `rtype` that ends at `end`, and moves past it.
-    fn rdata(&mut self, rtype: u16, end: usize) -> Option<()> {
-        let len = end - self.pos;
-        let names = |p: &mut Self, fixed_before: usize, names: usize, fixed_after: usize| {
-            p.take(fixed_before)?;
-            for _ in 0..names {
-                p.name()?;
-            }
-            p.take(fixed_after)?;
-            (p.pos == end).then_some(())
-        };
-        match rtype {
-            // A, AAAA
-            1 | 28 if len == if rtype == 1 { 4 } else { 16 } => self.pos = end,
-            1 | 28 => return None,
-            // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME: one name.
-            2..=5 | 7..=9 | 12 | 39 => names(self, 0, 1, 0)?,
-            // SOA: two names, then serial, refresh, retry, expire, minimum.
-            6 => names(self, 0, 2, 20)?,
-            // MINFO: two names.
-            14 => names(self, 0, 2, 0)?,
-            // MX, AFSDB, RT, KX: a 16-bit preference, then a name.
-            15 | 18 | 21 | 36 => names(self, 2, 1, 0)?,
-            // SRV: priority, weight, port, then a name.
-            33 => names(self, 6, 1, 0)?,
-            // TXT, SPF: one or more character-strings, filling the RDATA.
-            TYPE_TXT | TYPE_SPF => {
-                if len == 0 {
-                    return None;
-                }
-                while self.pos < end {
-                    let n = usize::from(*self.m.get(self.pos)?);
-                    self.take(1 + n)?;
-                }
-                (self.pos == end).then_some(())?
-            }
-            // OPT: options of (code, length, data), filling the RDATA.
-            41 => {
-                while self.pos < end {
-                    self.take(2)?;
-                    let n = usize::from(self.u16()?);
-                    self.take(n)?;
-                }
-                (self.pos == end).then_some(())?
-            }
-            _ => self.pos = end,
-        }
-        Some(())
     }
 }
 
@@ -619,56 +573,6 @@ mod tests {
         assert!(decode(&dg(&f, &ntp)).is_none());
     }
 
-    #[test]
-    fn compression_pointers_go_backwards_only() {
-        let f = flow();
-        // The question's name is a pointer to itself, then one forwards.
-        let mut m = header(0x0100, 1, 0);
-        m.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1]);
-        assert!(decode(&dg(&f, &m)).is_none());
-        let mut m = header(0x0100, 1, 0);
-        m.extend_from_slice(&[0xc0, 14, 0, 0, 1, 0, 1]);
-        assert!(decode(&dg(&f, &m)).is_none());
-        // An answer's name: one more label in front of the question's 193
-        // bytes, through a pointer. 254 bytes parse; 256 do not.
-        let named = |extra: usize| {
-            let mut m = header(0x8180, 1, 1);
-            qname(&mut m, &[&[b'a'; 63], &[b'b'; 63], &[b'c'; 63]]);
-            m.extend_from_slice(&[0, 1, 0, 1]);
-            m.push(extra as u8);
-            m.extend(std::iter::repeat_n(b'd', extra));
-            // HINFO with empty RDATA: a type this parser leaves opaque.
-            m.extend_from_slice(&[0xc0, 12, 0, 13, 0, 1, 0, 0, 0, 0, 0, 0]);
-            m
-        };
-        assert!(decode(&dg(&f, &named(60))).is_some());
-        assert!(decode(&dg(&f, &named(62))).is_none());
-    }
-
-    #[test]
-    fn a_pointer_chain_is_bounded() {
-        let f = flow();
-        // Questions 2.. each point at the one before: MAX_HOPS + 2 hops for
-        // the last name.
-        let n = MAX_HOPS + 2;
-        let mut m = header(0x0100, n as u16, 0);
-        qname(&mut m, &[b"x"]);
-        m.extend_from_slice(&[0, 1, 0, 1]);
-        let mut prev = 12u16;
-        for _ in 1..n {
-            let at = m.len() as u16;
-            m.extend_from_slice(&(0xc000 | prev).to_be_bytes());
-            m.extend_from_slice(&[0, 1, 0, 1]);
-            prev = at;
-        }
-        assert!(decode(&dg(&f, &m)).is_none());
-        let ok = n - 2;
-        let mut m2 = m.clone();
-        m2[4..6].copy_from_slice(&(ok as u16).to_be_bytes());
-        let cut = 12 + 7 + (ok - 1) * 6;
-        assert!(decode(&dg(&f, &m2[..cut])).is_some());
-    }
-
     /// An answer to `api.example A` whose record is `rtype` with `rdata`.
     fn answer(rtype: u16, rdata: &[u8]) -> Vec<u8> {
         let mut m = header(0x8180, 1, 1);
@@ -682,91 +586,142 @@ mod tests {
     }
 
     #[test]
-    fn pointers_must_target_an_earlier_name() {
+    fn a_pointer_in_the_qname_is_malformed() {
         let f = flow();
         // Review round 1: a question pointing at the transaction ID.
         let header_target = b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\xc0\x00\x00\x01\x00\x01";
         assert!(decode(&dg(&f, header_target)).is_none());
-        // Into the middle of a label (offset 13 is "pi" of "api").
-        let mut m = header(0x0100, 2, 0);
-        qname(&mut m, &[b"api", b"example"]);
-        m.extend_from_slice(&[0, 1, 0, 1]);
-        let ok = m.len();
-        m.extend_from_slice(&[0xc0, 13, 0, 1, 0, 1]);
-        assert!(decode(&dg(&f, &m)).is_none());
-        // To each label start of the first name: fine.
-        for target in [12u8, 16] {
-            m[ok + 1] = target;
-            assert!(decode(&dg(&f, &m)).is_some(), "{target}");
+        // At itself, forwards, and after a label: at its own start, and into
+        // the label's bytes.
+        for name in [
+            &[0xc0, 12][..],
+            &[0xc0, 14, 0],
+            &[1, b'a', 0xc0, 12],
+            &[3, b'a', b'b', b'c', 0xc0, 13],
+        ] {
+            let mut m = header(0x0100, 1, 0);
+            m.extend_from_slice(name);
+            m.extend_from_slice(&[0, 1, 0, 1]);
+            assert!(decode(&dg(&f, &m)).is_none(), "{name:?}");
         }
-        // At the first name's root octet, or past it into its type.
-        for target in [24u8, 25] {
-            m[ok + 1] = target;
-            assert!(decode(&dg(&f, &m)).is_none(), "{target}");
-        }
-        // A label, then a pointer back into the same name: a loop.
-        let mut m = header(0x0100, 1, 0);
-        m.extend_from_slice(&[1, b'a', 0xc0, 12, 0, 1, 0, 1]);
-        assert!(decode(&dg(&f, &m)).is_none());
-        // A pointer to a pointer of an earlier name is a valid chain.
-        let mut m = header(0x0100, 3, 0);
-        qname(&mut m, &[b"x"]);
-        m.extend_from_slice(&[0, 1, 0, 1]);
-        let second = m.len() as u8;
-        m.extend_from_slice(&[1, b'y', 0xc0, 12, 0, 1, 0, 1]);
-        m.extend_from_slice(&[0xc0, second + 2, 0, 1, 0, 1]);
-        assert!(decode(&dg(&f, &m)).is_some());
     }
 
     #[test]
-    fn rdata_of_known_types_is_checked() {
+    fn the_qname_is_limited_to_255_bytes() {
         let f = flow();
-        let ok = |rtype: u16, rdata: &[u8]| decode(&dg(&f, &answer(rtype, rdata))).is_some();
-        // TXT: strings must fill RDLENGTH exactly (review round 1: `ff`
-        // alone claims 255 bytes that are not there).
-        assert!(!ok(16, b"\xff"));
-        assert!(!ok(16, b""));
-        assert!(!ok(16, b"\x03ab"));
-        assert!(!ok(16, b"\x01ab"));
-        assert!(ok(16, b"\x02ab\x00\x01c"));
-        assert!(!ok(99, b"\x05abc"));
-        // A and AAAA by length.
-        assert!(ok(1, &[10, 0, 0, 2]));
-        let a = decode(&dg(&f, &answer(1, &[10, 0, 0, 2]))).unwrap();
-        assert_eq!(a.trailing_bytes, 0, "RDATA is consumed");
-        assert!(!ok(1, &[10, 0, 0]));
-        assert!(ok(28, &[0; 16]));
-        assert!(!ok(28, &[0; 4]));
-        // Name-bearing RDATA: the name must parse, compress validly and end
-        // at RDLENGTH.
-        assert!(ok(5, &[0xc0, 0x0c]));
-        assert!(ok(5, &[3, b'w', b'w', b'w', 0xc0, 0x0c]));
-        assert!(!ok(5, &[0xc0, 0x00]), "CNAME into the header");
-        assert!(!ok(5, &[0xc0, 0x0d]), "CNAME into a label");
-        assert!(!ok(5, &[0xc0, 0x0c, 0]), "a byte after the name");
-        assert!(!ok(5, &[3, b'w', b'w']), "a name cut by RDLENGTH");
-        assert!(ok(15, &[0, 10, 0xc0, 0x0c]));
-        assert!(!ok(15, &[0, 10]));
-        assert!(ok(33, &[0, 1, 0, 1, 0, 53, 0xc0, 0x0c]));
-        let mut soa = vec![0xc0, 0x0c, 0xc0, 0x0c];
-        soa.extend_from_slice(&[0; 20]);
-        assert!(ok(6, &soa));
-        assert!(!ok(6, &soa[..23]));
-        // OPT options must fill the RDATA.
-        assert!(ok(41, &[0, 10, 0, 2, 1, 2]));
-        assert!(!ok(41, &[0, 10, 0, 3, 1, 2]));
-        // Unknown types stay opaque.
-        assert!(ok(65280, &[0xff; 7]));
-        // A name in RDATA is a valid compression target for later records.
-        let mut m = answer(5, &[3, b'w', b'w', b'w', 0xc0, 0x0c]);
-        m[7] = 2;
-        let www = (m.len() - 6) as u8;
-        m.extend_from_slice(&[0xc0, www, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 0, 0, 2]);
-        assert!(decode(&dg(&f, &m)).is_some());
+        // Three labels of 63 and one of `last`: 193 + 1 + last on the wire
+        // with the root, so 61 makes 255 and 62 makes 256.
+        let named = |last: usize| query(&[&[b'a'; 63], &[b'b'; 63], &[b'c'; 63], &vec![b'd'; last]], A);
+        assert_eq!(decode(&dg(&f, &named(61))).unwrap().qname_len, 253);
+        assert!(decode(&dg(&f, &named(62))).is_none());
+        // A label of 64 is a label type not in use.
+        assert!(decode(&dg(&f, &query(&[&[b'a'; 64]], A))).is_none());
     }
 
-    /// Valid messages to mutate: a query, A and AAAA answers, an answer with
-    /// compression in RDATA, TXT, SOA, OPT and SRV records.
+    #[test]
+    fn names_after_the_qname_are_skipped_not_followed() {
+        let f = flow();
+        // Review round 2: a TXT owner that points into an RP record's RDATA.
+        // The RP's mailbox `txt.x` is at the offset noted below.
+        let mut m = header(0x8180, 1, 2);
+        qname(&mut m, &[b"x"]);
+        m.extend_from_slice(&[0, 16, 0, 1]);
+        m.extend_from_slice(&[0xc0, 12, 0, 17, 0, 1, 0, 0, 0, 60, 0, 7]);
+        let mailbox = m.len() as u8;
+        m.extend_from_slice(&[3, b't', b'x', b't', 0xc0, 12, 0]);
+        m.extend_from_slice(&[0xc0, mailbox, 0, 16, 0, 1, 0, 0, 0, 60, 0, 3, 2, b'o', b'k']);
+        let r = decode(&dg(&f, &m)).expect("RP owner");
+        assert_eq!((r.txt_records, r.txt_bytes, r.trailing_bytes), (1, 3, 0));
+        // Review round 2: an owner that points at the question's root octet.
+        let mut m = answer(1, &[10, 0, 0, 2]);
+        let at = m.len() - 16;
+        m[at + 1] = 24;
+        assert!(decode(&dg(&f, &m)).is_some());
+        // A second question may point at the first, as mDNS does; its target
+        // is not checked.
+        let mut m = header(0x0100, 2, 0);
+        qname(&mut m, &[b"api", b"example"]);
+        m.extend_from_slice(&[0, 1, 0, 1, 0xc0, 16, 0, 1, 0, 1]);
+        let r = decode(&dg(&f, &m)).expect("two questions");
+        assert_eq!((r.questions, r.qname.as_str()), (2, "api.example"));
+        // Owner names are walked, so they must still fit: cut by the end of
+        // the message, or a label type with no length to walk.
+        let mut m = header(0x8180, 1, 1);
+        qname(&mut m, &[b"x"]);
+        m.extend_from_slice(&[0, 1, 0, 1, 9, b'a']);
+        assert!(decode(&dg(&f, &m)).is_none());
+        let at = m.len() - 2;
+        m[at] = 0x41;
+        m.extend_from_slice(&[0; 12]);
+        assert!(decode(&dg(&f, &m)).is_none());
+    }
+
+    #[test]
+    fn rdata_is_walked_by_its_length_only() {
+        let f = flow();
+        let ok = |rtype: u16, rdata: &[u8]| decode(&dg(&f, &answer(rtype, rdata))).is_some();
+        // Any bytes fit: the type does not say how they must look.
+        assert!(ok(1, &[10, 0, 0, 2]));
+        assert!(ok(1, &[10, 0, 0]));
+        assert!(ok(1, &[]));
+        assert!(ok(28, &[0; 4]));
+        assert!(ok(5, &[0xc0, 0x00]), "a CNAME into the header");
+        assert!(ok(41, &[0, 10, 0, 3, 1, 2]));
+        assert!(ok(65280, &[0xff; 7]));
+        let a = decode(&dg(&f, &answer(1, &[10, 0, 0, 2]))).unwrap();
+        assert_eq!(a.trailing_bytes, 0, "RDATA is consumed");
+        // RDLENGTH must fit in the message.
+        let mut m = answer(1, &[10, 0, 0, 2]);
+        let n = m.len();
+        m[n - 5] = 5;
+        assert!(decode(&dg(&f, &m)).is_none());
+    }
+
+    #[test]
+    fn a_malformed_txt_adds_no_txt_facts() {
+        let f = flow();
+        let txt = |rdata: &[u8]| {
+            let r = decode(&dg(&f, &answer(16, rdata))).expect("still DNS");
+            assert_eq!(r.trailing_bytes, 0);
+            (r.txt_records, r.txt_bytes, r.txt_max)
+        };
+        // Review round 1: `ff` alone claims 255 bytes that are not there.
+        assert_eq!(txt(b"\xff"), (0, 0, None));
+        assert_eq!(txt(b""), (0, 0, None));
+        assert_eq!(txt(b"\x03ab"), (0, 0, None));
+        assert_eq!(txt(b"\x01ab"), (0, 0, None));
+        assert_eq!(txt(b"\x02ab\x00\x01c"), (1, 6, Some(6)));
+        // A good record beside a bad one: only the good one counts.
+        let mut m = answer(16, b"\xff");
+        m[7] = 2;
+        m.extend_from_slice(&[0xc0, 0x0c, 0, 16, 0, 1, 0, 0, 0, 60, 0, 3, 2, b'o', b'k']);
+        let r = decode(&dg(&f, &m)).unwrap();
+        assert_eq!((r.txt_records, r.txt_bytes, r.txt_max), (1, 3, Some(3)));
+    }
+
+    #[test]
+    fn only_query_is_parsed() {
+        let f = flow();
+        // Review round 2: an UPDATE deleting an A RRset. Zone `example`, then
+        // in the update section: CLASS ANY, TTL 0, RDLENGTH 0.
+        let mut m = header(0x2800, 1, 0);
+        m[9] = 1;
+        qname(&mut m, &[b"example"]);
+        m.extend_from_slice(&[0, 6, 0, 1]);
+        m.extend_from_slice(&[0xc0, 12, 0, 1, 0, 255, 0, 0, 0, 0, 0, 0]);
+        assert!(decode(&dg(&f, &m)).is_none());
+        // The same bytes as a QUERY walk fine: only the opcode decides.
+        m[2] = 0x00;
+        assert!(decode(&dg(&f, &m)).is_some());
+        let q = query(&[b"x"], A);
+        for opcode in 1..16u8 {
+            let mut x = q.clone();
+            x[2] = (x[2] & 0x87) | (opcode << 3);
+            assert!(decode(&dg(&f, &x)).is_none(), "{opcode}");
+        }
+    }
+
+    /// Messages to mutate: a query, and answers of several types.
     fn corpus() -> Vec<Vec<u8>> {
         let mut soa = vec![0xc0, 0x0c, 2, b'n', b's', 0xc0, 0x10];
         soa.extend_from_slice(&[0; 20]);
@@ -857,8 +812,8 @@ mod tests {
             }
         }
         assert_eq!(plain, 0);
-        // Random names do sometimes parse (a short label run ending in 0);
-        // those are well-formed queries, so they are counted, not refused.
+        // Random names do sometimes parse (a short label run ending in 0),
+        // with the rest as trailing bytes: facts, not protocol certainty.
         assert!(shaped < 2_000, "{shaped}");
     }
 
