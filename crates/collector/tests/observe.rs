@@ -19,12 +19,13 @@ use std::time::Duration;
 use collector::assembler::{EventRecord, PacketRecord, SegmentRecord};
 use collector::decode::FeaturesRecord;
 use collector::decode::{
-    BodyKey, Bucket, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord,
+    BodyKey, Bucket, ExchangeRecord, FlowRecord, Observed, RecordSink, Span, WindowClose, WorkunitRecord,
 };
 use collector::dns::DnsRecord;
-use collector::flow::FlowKind;
-use collector::observe::StatsSink;
+use collector::flow::{Dir, FlowId, FlowKind};
+use collector::observe::Stats;
 use collector::output::TABLES;
+use collector::packet::{CapturedPacket, PacketRef};
 use collector::run::run;
 use collector::stats::{serve_metrics, HttpClass, Outcome, Registry, Snapshot, VerdictLabel, BUCKETS, DIRS};
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource};
@@ -214,7 +215,7 @@ fn expected_counter_tables() {
     assert_eq!((s.mid_stream_starts, s.windows_closed), (1, 3));
 }
 
-/// Wrapping the sink in a [`StatsSink`] changes no table and no body.
+/// Wrapping the sink in a [`Stats`] changes no table and no body.
 #[test]
 fn counting_changes_no_output() {
     for (case, files) in cases() {
@@ -263,11 +264,17 @@ impl RecordSink for Recording {
     fn window_closed(&mut self, w: &WindowClose) {
         self.0.push(format!("window_closed {w:?}"));
     }
+    fn captured(&mut self, pkt: &CapturedPacket, at: PacketRef) {
+        self.0.push(format!("captured {pkt:?} {at:?}"));
+    }
+    fn spans(&mut self, flow: &FlowId, dir: Dir, spans: &[Span]) {
+        self.0.push(format!("spans {flow:?} {dir:?} {spans:?}"));
+    }
 }
 
-/// A [`StatsSink`] passes every call through, `window_closed` included.
+/// [`Observed`] passes every call through, `window_closed` included.
 #[test]
-fn stats_sink_forwards_every_call() {
+fn observed_forwards_every_call() {
     let record = |files: &[String], observe: bool| {
         let names: Vec<&str> = files.iter().map(String::as_str).collect();
         let cfg = DecoderConfig {
@@ -277,7 +284,7 @@ fn stats_sink_forwards_every_call() {
         let mut sink = Recording::default();
         let source = &mut FileSource::new(fixture_paths(&names));
         if observe {
-            let mut stats = StatsSink::new(&mut sink, Registry::new());
+            let mut stats = Observed::new(&mut sink, Stats::new(Registry::new()));
             run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut stats).expect("run");
         } else {
             run(source, WINDOW_NS, AssemblerConfig::default(), cfg, &mut sink).expect("run");
@@ -356,7 +363,7 @@ fn metrics_endpoint_is_scraped_and_parses() {
         WINDOW_NS,
         AssemblerConfig::default(),
         DecoderConfig::default(),
-        &mut StatsSink::new(&mut sink, reg.clone()),
+        &mut Observed::new(&mut sink, Stats::new(reg.clone())),
     )
     .unwrap();
     let (head, body) = http_get(addr, "/metrics");
@@ -391,7 +398,7 @@ fn metrics_endpoint_is_scraped_and_parses() {
             let k = format!(
                 "ts_collector_accounted_bytes_total{{bucket=\"{}\",direction=\"{}\"}}",
                 collector::stats::bucket_str(b),
-                collector::stats::dir_str(d)
+                d.as_str()
             );
             assert_eq!(v(&k), s.accounted_by(b, d) as f64, "{k}");
         }

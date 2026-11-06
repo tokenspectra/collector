@@ -36,8 +36,7 @@ use crate::http::{Head, HeadReply, Lab, Out, StartLine};
 use crate::http1::{parse_request_line, parse_status_line, H1};
 use crate::http2::{H2, PREFACE};
 use crate::mh;
-use crate::source::{CapturedPacket, LinkId};
-use crate::window::PacketRef;
+use crate::packet::{CapturedPacket, LinkId, PacketRef};
 use crate::wire::framing::{Framed, Framer};
 use crate::wire::{self, Claim, Frame, Framing, Protocols, ResponseDecoder};
 
@@ -284,11 +283,37 @@ pub struct WorkunitRecord {
     pub response_parsed: bool,
 }
 
+/// How a Request Workunit ended (the `outcome` label).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Request and response fully parsed, no gap.
+    Ok,
+    /// A gap, or the Flow ended mid-message.
+    Incomplete,
+    /// The response could not be read as OpenAI JSON.
+    Errored,
+}
+
+impl Outcome {
+    pub const ALL: [Outcome; 3] = [Outcome::Ok, Outcome::Incomplete, Outcome::Errored];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Ok => "ok",
+            Outcome::Incomplete => "incomplete",
+            Outcome::Errored => "errored",
+        }
+    }
+
+    pub(crate) fn idx(self) -> usize {
+        self as usize
+    }
+}
+
 impl WorkunitRecord {
     /// `incomplete` on a gap or a message cut short, else `errored` when the
     /// response could not be read, else `ok`.
-    pub fn outcome(&self) -> crate::stats::Outcome {
-        use crate::stats::Outcome;
+    pub fn outcome(&self) -> Outcome {
         if !self.complete {
             Outcome::Incomplete
         } else if !self.response_parsed {
@@ -326,7 +351,7 @@ pub struct Span {
     pub workunit: Option<Arc<WorkunitTag>>,
 }
 
-/// Receives everything the Collector produces.
+/// Receives everything the parser produces.
 pub trait RecordSink {
     fn packet(&mut self, rec: &PacketRecord);
     fn segment(&mut self, rec: &SegmentRecord, data: &[u8]);
@@ -354,12 +379,93 @@ pub trait RecordSink {
     /// The bucketed spans of one TCP direction covered by the Flow row that
     /// follows, in stream order.
     fn spans(&mut self, _flow: &FlowId, _dir: Dir, _spans: &[Span]) {}
-    /// An L0 chunk was written (spec §6–8).
-    fn chunk(&mut self, _rec: &crate::store::ChunkRecord) {}
-    /// A pack item was written (spec §8).
-    fn blob(&mut self, _rec: &crate::store::BlobRecord) {}
-    /// A window was sealed: every object it names is written (spec §11).
-    fn manifest(&mut self, _rec: &crate::manifest::WindowManifest) {}
+}
+
+/// Watches rows on their way to a sink, for counters and logs (spec §14).
+/// It gets a shared look at a row and gives nothing back, and it holds no
+/// sink: [`Observed`] forwards, so an observer can't change the output.
+pub trait Observer {
+    fn packet(&mut self, _rec: &PacketRecord) {}
+    fn segment(&mut self, _rec: &SegmentRecord) {}
+    fn event(&mut self, _rec: &EventRecord) {}
+    fn flow(&mut self, _rec: &FlowRecord) {}
+    fn exchange(&mut self, _rec: &ExchangeRecord) {}
+    fn workunit(&mut self, _rec: &WorkunitRecord) {}
+    fn window_closed(&mut self, _w: &WindowClose) {}
+}
+
+/// A [`RecordSink`] that shows each row to an [`Observer`], then hands it,
+/// untouched, to the sink it wraps.
+pub struct Observed<'a, O> {
+    sink: &'a mut dyn RecordSink,
+    observer: O,
+}
+
+impl<'a, O: Observer> Observed<'a, O> {
+    pub fn new(sink: &'a mut dyn RecordSink, observer: O) -> Self {
+        Observed { sink, observer }
+    }
+}
+
+impl<O: Observer> RecordSink for Observed<'_, O> {
+    fn packet(&mut self, rec: &PacketRecord) {
+        self.observer.packet(rec);
+        self.sink.packet(rec);
+    }
+
+    fn segment(&mut self, rec: &SegmentRecord, data: &[u8]) {
+        self.observer.segment(rec);
+        self.sink.segment(rec, data);
+    }
+
+    fn event(&mut self, rec: &EventRecord) {
+        self.observer.event(rec);
+        self.sink.event(rec);
+    }
+
+    fn flow(&mut self, rec: &FlowRecord) {
+        self.observer.flow(rec);
+        self.sink.flow(rec);
+    }
+
+    fn exchange(&mut self, rec: &ExchangeRecord) {
+        self.observer.exchange(rec);
+        self.sink.exchange(rec);
+    }
+
+    fn workunit(&mut self, rec: &WorkunitRecord) {
+        self.observer.workunit(rec);
+        self.sink.workunit(rec);
+    }
+
+    fn dns(&mut self, rec: &DnsRecord) {
+        self.sink.dns(rec);
+    }
+
+    fn features(&mut self, rec: &FeaturesRecord) {
+        self.sink.features(rec);
+    }
+
+    fn body_data(&mut self, key: &BodyKey, data: &[u8]) {
+        self.sink.body_data(key, data);
+    }
+
+    fn body_end(&mut self, key: &BodyKey, hash: Option<&str>) {
+        self.sink.body_end(key, hash);
+    }
+
+    fn window_closed(&mut self, w: &WindowClose) {
+        self.observer.window_closed(w);
+        self.sink.window_closed(w);
+    }
+
+    fn captured(&mut self, pkt: &CapturedPacket, at: PacketRef) {
+        self.sink.captured(pkt, at);
+    }
+
+    fn spans(&mut self, flow: &FlowId, dir: Dir, spans: &[Span]) {
+        self.sink.spans(flow, dir, spans);
+    }
 }
 
 pub struct Decoder<'a> {
@@ -1292,7 +1398,7 @@ impl FlowState {
                 tracing::warn!(
                     flow = %self.id,
                     exchange = ex.seq,
-                    dir = %crate::stats::dir_str(m.dir),
+                    dir = %m.dir.as_str(),
                     body_bytes = m.body.len,
                     "body over the size cap: hashed and counted, not read as JSON"
                 );
@@ -1303,7 +1409,7 @@ impl FlowState {
                 tracing::warn!(
                     flow = %self.id,
                     exchange = ex.seq,
-                    dir = %crate::stats::dir_str(m.dir),
+                    dir = %m.dir.as_str(),
                     body_bytes = m.body.len,
                     decoded_bytes = m.body.decoding.as_ref().and_then(Decoding::decoded_len).unwrap_or(0),
                     cap = e.as_str(),

@@ -367,6 +367,7 @@ dependencies = [
  "object_store",
  "parquet",
  "pcap-file",
+ "proc-macro2",
  "serde",
  "serde_json",
  "signal-hook",

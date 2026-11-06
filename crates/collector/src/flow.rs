@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::net::{IPPROTO_TCP, IPPROTO_UDP};
-use crate::source::LinkId;
+use crate::packet::LinkId;
 
 /// One end of a Flow. `port` is 0 for protocols without ports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -126,6 +126,13 @@ pub enum Dir {
 }
 
 impl Dir {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dir::Orig => "orig",
+            Dir::Resp => "resp",
+        }
+    }
+
     pub fn idx(self) -> usize {
         match self {
             Dir::Orig => 0,

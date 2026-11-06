@@ -1,5 +1,5 @@
 //! The counter registry (spec §14): one set of counters, updated by the
-//! pipeline through [`StatsSink`](crate::observe::StatsSink) and read by
+//! pipeline through [`Stats`](crate::observe::Stats) and read by
 //! three views: the INFO line per closed window, the on-demand snapshot
 //! table ([`render_table`]) and Prometheus `/metrics` ([`render_prometheus`],
 //! [`serve_metrics`]).
@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use crate::decode::Outcome;
 use crate::decode::{Bucket, Verdict};
 use crate::flow::{Dir, FlowKind};
 
@@ -101,40 +102,6 @@ fn bucket_idx(b: Bucket) -> usize {
 }
 
 pub const DIRS: [Dir; 2] = [Dir::Orig, Dir::Resp];
-
-pub fn dir_str(d: Dir) -> &'static str {
-    match d {
-        Dir::Orig => "orig",
-        Dir::Resp => "resp",
-    }
-}
-
-/// How a Request Workunit ended (the `outcome` label).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Outcome {
-    /// Request and response fully parsed, no gap.
-    Ok,
-    /// A gap, or the Flow ended mid-message.
-    Incomplete,
-    /// The response could not be read as OpenAI JSON.
-    Errored,
-}
-
-impl Outcome {
-    pub const ALL: [Outcome; 3] = [Outcome::Ok, Outcome::Incomplete, Outcome::Errored];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Outcome::Ok => "ok",
-            Outcome::Incomplete => "incomplete",
-            Outcome::Errored => "errored",
-        }
-    }
-
-    fn idx(self) -> usize {
-        self as usize
-    }
-}
 
 /// The `http_class` label, from the response status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -733,7 +700,7 @@ pub fn render_prometheus(s: &Snapshot) -> String {
     );
     for b in BUCKETS {
         for d in DIRS {
-            let labels = format!("bucket=\"{}\",direction=\"{}\"", bucket_str(b), dir_str(d));
+            let labels = format!("bucket=\"{}\",direction=\"{}\"", bucket_str(b), d.as_str());
             p.sample(name, &labels, s.accounted_by(b, d));
         }
     }

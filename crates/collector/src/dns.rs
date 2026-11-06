@@ -10,7 +10,7 @@
 use serde::Serialize;
 
 use crate::flow::{Dir, FlowId};
-use crate::window::PacketRef;
+use crate::packet::PacketRef;
 
 /// Longest name on the wire, length octets and the root included.
 const MAX_NAME: usize = 255;
@@ -347,7 +347,7 @@ mod tests {
 
     use super::*;
     use crate::flow::{Endpoint, FlowKind, Tuple};
-    use crate::source::LinkId;
+    use crate::packet::LinkId;
 
     fn flow() -> FlowId {
         let end = |port| Endpoint {

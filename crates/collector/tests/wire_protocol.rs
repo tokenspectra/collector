@@ -11,8 +11,8 @@ mod collect;
 #[path = "support/fixtures.rs"]
 mod fixtures;
 
-use collector::decode::{Bucket, WorkunitRecord};
-use collector::observe::StatsSink;
+use collector::decode::{Bucket, Observed, WorkunitRecord};
+use collector::observe::Stats;
 use collector::run::run;
 use collector::stats::Registry;
 use collector::{AssemblerConfig, DecoderConfig, FileSource, Protocols};
@@ -304,7 +304,7 @@ fn collect(protocols: Protocols) -> (Collected, std::sync::Arc<Registry>) {
         WINDOW_NS,
         AssemblerConfig::default(),
         cfg,
-        &mut StatsSink::new(&mut sink, reg.clone()),
+        &mut Observed::new(&mut sink, Stats::new(reg.clone())),
     )
     .expect("run");
     (sink, reg)
