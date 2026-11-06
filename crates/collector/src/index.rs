@@ -146,18 +146,7 @@ const DNS: &[Column] = &[
     ("ts_ns", Int),
     ("flow", Str),
     ("dir", Str),
-    ("id", Int),
     ("response", Bool),
-    ("opcode", Int),
-    ("rcode", Int),
-    ("aa", Bool),
-    ("tc", Bool),
-    ("rd", Bool),
-    ("ra", Bool),
-    ("questions", Int),
-    ("answers", Int),
-    ("authority", Int),
-    ("additional", Int),
     ("qname", Str),
     ("qtype", Int),
     ("qclass", Int),
@@ -388,8 +377,8 @@ pub fn parquet(table: &str, rows: &[Value]) -> Result<Vec<u8>> {
 }
 
 /// Fields of `row` with no column in `table`: names of leaves, flattening
-/// nested objects unless their column is `Json`; a null object is covered
-/// by its columns. Empty when the schema covers the row.
+/// nested objects unless their column is `Json`. Empty when the schema
+/// covers the row.
 pub fn uncovered(table: &str, row: &Value) -> Vec<String> {
     let columns = schema(table);
     let mut out = Vec::new();
@@ -398,11 +387,6 @@ pub fn uncovered(table: &str, row: &Value) -> Vec<String> {
             .iter()
             .any(|&(p, k)| p == path && (k == Json || !v.is_object()))
         {
-            return;
-        }
-        // A null family (`"dns": null`) is covered by its columns.
-        let prefix = format!("{path}.");
-        if v.is_null() && columns.iter().any(|&(p, _)| p.starts_with(&prefix)) {
             return;
         }
         match v {
@@ -461,7 +445,7 @@ mod tests {
                    "dns": {"messages": 2, "query_rate": 1.5, "qname_entropy_max": 4.619, "txt_max": null}}),
             json!({"window_start_ns": 10, "flow": "g", "link": "tap0", "dns": null}),
         ];
-        assert!(rows.iter().all(|r| uncovered("features", r).is_empty()));
+        assert!(uncovered("features", &rows[0]).is_empty());
         let bytes = parquet("features", &rows).unwrap();
         let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
         let got: Vec<String> = reader

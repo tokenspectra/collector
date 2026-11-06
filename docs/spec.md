@@ -184,8 +184,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 | Column | Meaning |
 |---|---|
 | `window_start_ns`, `index`, `ts_ns`, `flow`, `dir` | The packet that carried it (joins `packets`) and its direction |
-| `id`, `response`, `opcode`, `rcode`, `aa`, `tc`, `rd`, `ra` | Header fields; `response` is QR; `rcode` is the header's 4 bits (no EDNS extension) |
-| `questions`, `answers`, `authority`, `additional` | Section counts, as the header gives them. `opcode` is always 0 (QUERY) today |
+| `response` | The header's QR bit: a response, else a query. No other header field is kept: no rule reads them |
 | `qname`, `qtype`, `qclass` | The first question. `qname` is in presentation form (RFC 1035 §5.1): bytes outside `!`..`~` are `\DDD`, `.` and `\` inside a label are escaped, the root is `.`; case as sent |
 | `qname_len`, `labels`, `label_len_max` | Label bytes plus the dots between them; label count; longest label |
 | `qname_entropy` | Shannon entropy of the name's label bytes, ASCII letters folded to lower case (so 0x20 case randomisation adds nothing), in bits per byte, rounded to 3 decimals; `null` for the root |

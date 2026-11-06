@@ -14,9 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 
 use crate::assembler::{EventKind, EventRecord, PacketRecord, SegmentRecord};
-use crate::decode::FeaturesRecord;
 use crate::decode::{
-    BodyKey, Bucket, ExchangeRecord, FlowRecord, RecordSink, Span, WindowClose, WorkunitRecord,
+    BodyKey, Bucket, ExchangeRecord, FeaturesRecord, FlowRecord, RecordSink, Span, WindowClose,
+    WorkunitRecord,
 };
 use crate::dns::DnsRecord;
 use crate::flow::{Dir, FlowId};

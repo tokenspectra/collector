@@ -79,7 +79,7 @@ check("the Workunit page's coding note and the exchange's decoded cell escape ca
 
 check("a captured DNS name is escaped in the DNS table, the packet's DNS message and the Slice page", () => {
   ctx.dns = { window_start_ns: "1800000000000000000", index: 3, ts_ns: "1800000000010000000", flow: "tap0|udp|a|b|0", dir: "orig",
-    id: 7, response: false, opcode: 0, rcode: 0, rd: true, questions: 1, answers: 0, authority: 0, additional: 0,
+    response: false,
     qname: XSS, qtype: 16, qclass: 1, qname_len: 29, labels: 1, label_len_max: 29, qname_entropy: 3.9,
     txt_records: 0, txt_bytes: 0, txt_max: null, size: 47, trailing_bytes: 4 };
   const out = vm.runInContext(`

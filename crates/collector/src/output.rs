@@ -29,8 +29,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::assembler::{EventRecord, PacketRecord, SegmentRecord};
-use crate::decode::FeaturesRecord;
-use crate::decode::{BodyKey, ExchangeRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord};
+use crate::decode::{
+    BodyKey, ExchangeRecord, FeaturesRecord, FlowRecord, RecordSink, WindowClose, WorkunitRecord,
+};
 use crate::dns::DnsRecord;
 use crate::manifest::{Log, WindowManifest};
 use crate::sign::KeyProvider;

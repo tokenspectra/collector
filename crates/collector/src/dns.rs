@@ -1,26 +1,10 @@
 //! DNS over UDP and the per-Slice covert-channel features (spec §5, "DNS").
 //!
-//! Every UDP datagram, on any port, is tried as a DNS message (RFC 1035
-//! §4): a datagram is DNS only when its bytes parse as DNS. The parse reads
-//! what a rule like "DNS to resolver X, zones in Y, at most N B/s" needs,
-//! plus the content features, and no more:
-//! - The header and the first question are strict: opcode QUERY, at least
-//!   one question, and a qname of at most 63 bytes a label and 255 a name.
-//!   Nothing comes before that name but the header, so a compression
-//!   pointer in it could only reach the header or its own labels: any
-//!   pointer there is malformed.
-//! - Everything after it is walked by bounds only: each name, fixed field
-//!   and RDLENGTH must fit in the message. Names are skipped, pointers are
-//!   not followed, and RDATA is not read, so a record's type says nothing
-//!   about its bytes being well formed.
-//! - The one exception is TXT, for its sizes: a TXT record whose
-//!   character-strings do not fill its RDATA exactly adds no TXT facts.
-//! - Bytes left after the last record are counted, not rejected: they are
-//!   a fact worth seeing on a Link.
-//!
-//! Each message becomes a [`DnsRecord`] (the `dns` table) and adds to the
-//! Slice's [`DnsFeatures`] (the `dns_*` columns of `features`). This
-//! module is a pure parse: bytes in, rows out, no I/O. These are facts;
+//! Every UDP datagram, on any port, is tried as a DNS message. The parse
+//! reads what a rule like "DNS to resolver X, zones in Y, at most N B/s"
+//! needs, plus the content features, and no more: the header and first
+//! question strictly, everything after by bounds only (spec §5 has the
+//! rules). A pure parse: bytes in, rows out, no I/O. These are facts;
 //! Allowlist rules and statuses are the Classifier's.
 
 use serde::Serialize;
@@ -54,21 +38,8 @@ pub struct DnsRecord {
     pub ts_ns: u64,
     pub flow: FlowId,
     pub dir: Dir,
-    pub id: u16,
     /// QR: a response, else a query.
     pub response: bool,
-    pub opcode: u8,
-    /// The header's RCODE (EDNS extended bits not added).
-    pub rcode: u8,
-    pub aa: bool,
-    pub tc: bool,
-    pub rd: bool,
-    pub ra: bool,
-    /// Section counts, as the header gives them (all parsed).
-    pub questions: u16,
-    pub answers: u16,
-    pub authority: u16,
-    pub additional: u16,
     /// The first question's name in presentation form (RFC 1035 §5.1):
     /// a byte outside `!`..`~` is `\DDD`, `.` and `\` inside a label are
     /// escaped, the root is `.`. Case is kept as sent.
@@ -95,29 +66,23 @@ pub struct DnsRecord {
 }
 
 /// Per-Slice DNS features of one Flow (the `dns_*` columns of `features`).
-/// Name features are taken over queries only, so a name is counted once per
-/// exchange. Content features (names, TXT sizes) belong to the parse; the
-/// rate and volume ones (`query_rate`, the byte counts) are to come from the
-/// commit layer's per-Flow counters later (TS-57), with the same columns.
+/// Name features are taken over queries only. The rate and volume ones are
+/// to come from the commit layer's per-Flow counters (TS-57).
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct DnsFeatures {
     pub messages: u64,
     pub queries: u64,
     pub responses: u64,
-    /// Datagrams of the Flow in this Slice that are not DNS: they did not
-    /// parse, or the capture cut them.
+    /// Datagrams of the Flow in this Slice that are not DNS.
     pub other_datagrams: u64,
-    /// DNS message bytes, queries and responses, and both together.
     pub query_bytes: u64,
     pub response_bytes: u64,
     pub bytes: u64,
-    /// Queries per second of the window, rounded to 3 decimals.
     pub query_rate: f64,
     pub qname_entropy_max: Option<f64>,
     pub qname_entropy_mean: Option<f64>,
     pub qname_len_max: Option<u32>,
     pub label_len_max: Option<u32>,
-    /// Mean length of every label of every query name.
     pub label_len_mean: Option<f64>,
     pub txt_records: u64,
     pub txt_bytes: u64,
@@ -127,6 +92,8 @@ pub struct DnsFeatures {
 /// What one Flow's datagrams added up to in the current Slice.
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
+    /// Bytes of DNS messages per direction: the `fact` bucket.
+    pub fact: [u64; 2],
     f: DnsFeatures,
     entropy_sum: f64,
     entropy_n: u64,
@@ -140,6 +107,7 @@ impl Tally {
     }
 
     pub fn add(&mut self, r: &DnsRecord) {
+        self.fact[r.dir.idx()] += u64::from(r.size);
         let f = &mut self.f;
         f.messages += 1;
         f.bytes += u64::from(r.size);
@@ -189,17 +157,22 @@ pub fn decode(d: &Datagram<'_>) -> Option<DnsRecord> {
         return None;
     }
     let m = d.payload;
-    let h = Header::parse(m)?;
-    let mut p = Msg::new(m);
+    let mut p = Msg { m, pos: 2 };
+    let flags = p.u16()?;
+    let questions = p.u16()?;
+    let records = u32::from(p.u16()?) + u32::from(p.u16()?) + u32::from(p.u16()?);
+    // Only QUERY: other opcodes give their sections other meanings.
+    if flags & 0x7800 != 0 || questions == 0 {
+        return None;
+    }
     let q = p.qname()?;
     let qtype = p.u16()?;
     let qclass = p.u16()?;
-    for _ in 1..h.questions {
+    for _ in 1..questions {
         p.skip_name()?;
         p.take(4)?;
     }
     let (mut txt_records, mut txt_bytes, mut txt_max) = (0u32, 0u64, None);
-    let records = u32::from(h.answers) + u32::from(h.authority) + u32::from(h.additional);
     for _ in 0..records {
         p.skip_name()?;
         let rtype = p.u16()?;
@@ -212,25 +185,13 @@ pub fn decode(d: &Datagram<'_>) -> Option<DnsRecord> {
             txt_max = txt_max.max(Some(rdlen as u32));
         }
     }
-    let pos = p.pos;
     Some(DnsRecord {
         window_start_ns: d.at.window_start_ns,
         index: d.at.index,
         ts_ns: d.ts_ns,
         flow: d.flow.clone(),
         dir: d.dir,
-        id: h.id,
-        response: h.flags & 0x8000 != 0,
-        opcode: h.opcode(),
-        rcode: (h.flags & 0x000f) as u8,
-        aa: h.flags & 0x0400 != 0,
-        tc: h.flags & 0x0200 != 0,
-        rd: h.flags & 0x0100 != 0,
-        ra: h.flags & 0x0080 != 0,
-        questions: h.questions,
-        answers: h.answers,
-        authority: h.authority,
-        additional: h.additional,
+        response: flags & 0x8000 != 0,
         qname: q.presentation(),
         qtype,
         qclass,
@@ -242,42 +203,8 @@ pub fn decode(d: &Datagram<'_>) -> Option<DnsRecord> {
         txt_bytes,
         txt_max,
         size: m.len() as u32,
-        trailing_bytes: (m.len() - pos) as u32,
+        trailing_bytes: (m.len() - p.pos) as u32,
     })
-}
-
-struct Header {
-    id: u16,
-    flags: u16,
-    questions: u16,
-    answers: u16,
-    authority: u16,
-    additional: u16,
-}
-
-impl Header {
-    fn parse(m: &[u8]) -> Option<Header> {
-        let h = Header {
-            id: u16_at(m, 0)?,
-            flags: u16_at(m, 2)?,
-            questions: u16_at(m, 4)?,
-            answers: u16_at(m, 6)?,
-            authority: u16_at(m, 8)?,
-            additional: u16_at(m, 10)?,
-        };
-        // Only QUERY: UPDATE and the rest give their sections other meanings,
-        // and no rule reads them, so they stay `unexplained`.
-        (h.opcode() == 0 && h.questions > 0).then_some(h)
-    }
-
-    fn opcode(&self) -> u8 {
-        ((self.flags >> 11) & 0x0f) as u8
-    }
-}
-
-fn u16_at(m: &[u8], at: usize) -> Option<u16> {
-    let b = m.get(at..at.checked_add(2)?)?;
-    Some(u16::from_be_bytes([b[0], b[1]]))
 }
 
 /// A domain name's labels, borrowed from the message.
@@ -354,10 +281,6 @@ struct Msg<'a> {
 }
 
 impl<'a> Msg<'a> {
-    fn new(m: &'a [u8]) -> Self {
-        Msg { m, pos: 12 }
-    }
-
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let b = self.m.get(self.pos..self.pos.checked_add(n)?)?;
         self.pos += n;
@@ -369,7 +292,9 @@ impl<'a> Msg<'a> {
         Some(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    /// Reads the first question's name, label by label.
+    /// Reads the first question's name. Only the header comes before it, so
+    /// a compression pointer here could only reach the header or the name's
+    /// own labels: malformed.
     fn qname(&mut self) -> Option<Name<'a>> {
         let mut labels = Vec::new();
         let mut wire = 1; // the root's length octet
@@ -379,8 +304,6 @@ impl<'a> Msg<'a> {
                 self.pos += 1;
                 return Some(Name { labels });
             }
-            // 0b11 is a pointer (see the module docs); 0b01 and 0b10 are not
-            // in use.
             if len >> 6 != 0 {
                 return None;
             }
@@ -483,7 +406,7 @@ mod tests {
         let f = flow();
         let q = query(&[b"api", b"example"], A);
         let r = decode(&dg(&f, &q)).expect("query");
-        assert!(!r.response && r.rd && !r.ra);
+        assert!(!r.response);
         assert_eq!((r.qname.as_str(), r.qtype, r.qclass), ("api.example", 1, 1));
         assert_eq!((r.qname_len, r.labels, r.label_len_max), (11, 2, 7));
         assert_eq!(r.size as usize, q.len());
@@ -493,8 +416,7 @@ mod tests {
         a.extend_from_slice(&q[12..]);
         a.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 0, 0, 2]);
         let r = decode(&dg(&f, &a)).expect("answer");
-        assert!(r.response && r.ra);
-        assert_eq!(r.answers, 1);
+        assert!(r.response);
         assert_eq!((r.txt_records, r.txt_max), (0, None));
     }
 
@@ -643,7 +565,7 @@ mod tests {
         qname(&mut m, &[b"api", b"example"]);
         m.extend_from_slice(&[0, 1, 0, 1, 0xc0, 16, 0, 1, 0, 1]);
         let r = decode(&dg(&f, &m)).expect("two questions");
-        assert_eq!((r.questions, r.qname.as_str()), (2, "api.example"));
+        assert_eq!(r.qname, "api.example");
         // Owner names are walked, so they must still fit: cut by the end of
         // the message, or a label type with no length to walk.
         let mut m = header(0x8180, 1, 1);

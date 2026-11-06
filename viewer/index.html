@@ -1016,26 +1016,16 @@ function eventTable(ev) {
 const FEATURES_NOTE = `<p class="note">Facts per Slice from the Collector; Allowlist rules and statuses are the Classifier's. Name features are over queries.</p>`;
 const QTYPES = { 1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV",
   35: "NAPTR", 41: "OPT", 43: "DS", 46: "RRSIG", 48: "DNSKEY", 64: "SVCB", 65: "HTTPS", 99: "SPF", 255: "ANY" };
-const RCODES = { 0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED" };
-const OPCODES = { 0: "QUERY", 1: "IQUERY", 2: "STATUS", 4: "NOTIFY", 5: "UPDATE", 6: "DSO" };
 const qtypeLabel = t => QTYPES[t] ?? "TYPE" + t;
 const ratio = x => x == null ? "—" : esc(Number(x).toFixed(3).replace(/\.?0+$/, ""));
 const dnsPill = id => D.dnsByFlow?.has(id) ? `<span class="pill" title="UDP datagrams on this Flow parse as DNS">dns</span>` : "";
 const linkOf = flow => D.flowsById.get(flow)?.link ?? String(flow).split("|")[0];
-function dnsFlags(d) {
-  const f = [];
-  if (d.opcode) f.push(pill(OPCODES[d.opcode] ?? "opcode " + d.opcode));
-  if (d.aa) f.push(pill("AA")); if (d.rd) f.push(pill("RD")); if (d.ra) f.push(pill("RA"));
-  if (d.tc) f.push(pill("TC", "warn"));
-  if (d.trailing_bytes) f.push(pill(`${d.trailing_bytes} trailing bytes`, "bad"));
-  return f.join(" ");
-}
+const dnsFlags = d => d.trailing_bytes ? pill(`${d.trailing_bytes} trailing bytes`, "bad") : "";
 function dnsTable(rows, limit = 300) {
-  return `<table><tr><th>time</th><th>dir</th><th></th><th>qname</th><th>qtype</th><th>rcode</th><th class="num">an/ns/ar</th>
+  return `<table><tr><th>time</th><th>dir</th><th></th><th>qname</th><th>qtype</th>
       <th class="num">labels · longest</th><th class="num">entropy</th><th class="num">TXT</th><th class="num">size</th><th>flags</th><th>packet</th></tr>` +
     rows.slice(0, limit).map(d => `<tr><td>${time(d.ts_ns)}</td><td>${esc(d.dir)}</td><td>${pill(d.response ? "response" : "query")}</td>
-      <td class="mono">${esc(d.qname)}</td><td>${esc(qtypeLabel(d.qtype))}</td><td>${d.response ? esc(RCODES[d.rcode] ?? d.rcode) : ""}</td>
-      <td class="num">${num(d.answers)}/${num(d.authority)}/${num(d.additional)}</td>
+      <td class="mono">${esc(d.qname)}</td><td>${esc(qtypeLabel(d.qtype))}</td>
       <td class="num">${num(d.labels)} · ${num(d.label_len_max)}</td><td class="num">${ratio(d.qname_entropy)}</td>
       <td class="num">${d.txt_records ? `${num(d.txt_records)} · ${bytes(d.txt_bytes)}` : ""}</td><td class="num">${bytes(d.size)}</td>
       <td>${dnsFlags(d)}</td><td>${a(R.packet(linkOf(d.flow), d.window_start_ns, d.index), "#" + esc(d.index))}</td></tr>`).join("") + `</table>` +
@@ -1043,10 +1033,8 @@ function dnsTable(rows, limit = 300) {
 }
 function dnsRows(d) {
   return [
-    ["kind", pill(d.response ? "response" : "query") + " " + dnsFlags(d)], ["id", esc(d.id)],
-    ["opcode / rcode", `${esc(OPCODES[d.opcode] ?? d.opcode)} / ${esc(RCODES[d.rcode] ?? d.rcode)}`],
+    ["kind", pill(d.response ? "response" : "query") + " " + dnsFlags(d)],
     ["qname", `<span class="mono">${esc(d.qname)}</span>`], ["qtype / qclass", `${esc(qtypeLabel(d.qtype))} / ${num(d.qclass)}`],
-    ["questions / answers / authority / additional", [d.questions, d.answers, d.authority, d.additional].map(num).join(" / ")],
     ["qname length / labels / longest label", `${num(d.qname_len)} / ${num(d.labels)} / ${num(d.label_len_max)}`],
     ["qname entropy (bits/byte)", ratio(d.qname_entropy)],
     ["TXT records / bytes / largest", `${num(d.txt_records)} / ${bytes(d.txt_bytes)} / ${bytes(d.txt_max)}`],

@@ -15,9 +15,7 @@
 //!   `framing`, `unexplained`, `gap`) and reports the buckets per Flow,
 //!   direction and Slice.
 //!
-//! For each UDP Flow it tries every datagram as DNS ([`crate::dns`]) and
-//! reports each message, plus one row of features per Slice that carried
-//! one.
+//! For each UDP Flow it tries every datagram as DNS ([`crate::dns`]).
 //!
 //! A request's bytes are only known to be a Workunit once its response
 //! head arrives, so a Slice's row waits until every byte in it has a
@@ -146,23 +144,13 @@ impl Buckets {
 }
 
 /// Covert-channel features of one Flow during one Slice (the `features`
-/// table). One family of columns per protocol-fact decoder, each `null`
-/// when that decoder saw nothing in the Slice; a row is written when any
-/// family has facts. Later decoders (TLS ClientHello, NTP) add their own
-/// family.
+/// table): one family of columns per protocol-fact decoder.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FeaturesRecord {
     pub window_start_ns: u64,
     pub flow: FlowId,
     pub link: LinkId,
     pub dns: Option<DnsFeatures>,
-}
-
-impl FeaturesRecord {
-    /// Whether any family has facts: only then is the row written.
-    pub fn any(&self) -> bool {
-        self.dns.is_some()
-    }
 }
 
 /// One Flow during one window, with its verdict and byte accounting (the
@@ -380,7 +368,7 @@ pub struct Decoder<'a> {
     sink: &'a mut dyn RecordSink,
     flows: HashMap<FlowId, FlowState>,
     /// What each UDP Flow's datagrams added up to in the current Slice.
-    udp: HashMap<FlowId, UdpSlice>,
+    udp: HashMap<FlowId, Tally>,
 }
 
 impl<'a> Decoder<'a> {
@@ -422,20 +410,19 @@ impl FlowSink for Decoder<'_> {
     }
 
     fn datagram(&mut self, d: &Datagram<'_>) {
-        let u = self.udp.entry(d.flow.clone()).or_default();
+        let tally = self.udp.entry(d.flow.clone()).or_default();
         match dns::decode(d) {
             Some(r) => {
-                u.fact[d.dir.idx()] += u64::from(d.payload_len);
-                u.dns.add(&r);
+                tally.add(&r);
                 self.sink.dns(&r);
             }
-            None => u.dns.other(),
+            None => tally.other(),
         }
     }
 
     fn slice(&mut self, rec: &SliceRecord) {
         if rec.kind != FlowKind::Tcp {
-            let u = self.udp.remove(&rec.flow).unwrap_or_default();
+            let tally = self.udp.remove(&rec.flow).unwrap_or_default();
             // Every payload byte is a fact (a whole DNS message), a gap (cut
             // by the capture) or unexplained.
             let bytes = |s: &crate::assembler::DirStats, fact: u64| Buckets {
@@ -447,19 +434,18 @@ impl FlowSink for Decoder<'_> {
             self.sink.flow(&FlowRecord {
                 slice: rec.clone(),
                 verdict: Some(Verdict::Opaque),
-                orig_bytes: bytes(&rec.orig_stats, u.fact[0]),
-                resp_bytes: bytes(&rec.resp_stats, u.fact[1]),
+                orig_bytes: bytes(&rec.orig_stats, tally.fact[0]),
+                resp_bytes: bytes(&rec.resp_stats, tally.fact[1]),
                 orig_desync: None,
                 resp_desync: None,
             });
-            let features = FeaturesRecord {
-                window_start_ns: rec.window_start_ns,
-                flow: rec.flow.clone(),
-                link: rec.link.clone(),
-                dns: u.dns.finish(self.window_ns),
-            };
-            if features.any() {
-                self.sink.features(&features);
+            if let dns @ Some(_) = tally.finish(self.window_ns) {
+                self.sink.features(&FeaturesRecord {
+                    window_start_ns: rec.window_start_ns,
+                    flow: rec.flow.clone(),
+                    link: rec.link.clone(),
+                    dns,
+                });
             }
             return;
         }
@@ -503,14 +489,6 @@ impl Decoder<'_> {
     pub fn open_flows(&self) -> usize {
         self.flows.len() + self.udp.len()
     }
-}
-
-/// What one UDP Flow's datagrams added up to in the current Slice.
-#[derive(Default)]
-struct UdpSlice {
-    dns: Tally,
-    /// Payload bytes of datagrams that are protocol facts, per direction.
-    fact: [u64; 2],
 }
 
 /// Bytes (with their capture time) or a gap delivered for one direction.

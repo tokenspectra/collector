@@ -259,10 +259,7 @@ fn dns_messages_and_covert_channel_features() {
         .filter(|d| d.response && d.qname == "_cfg.example")
         .nth(1)
         .unwrap();
-    assert_eq!(
-        (bad_txt.answers, bad_txt.txt_records, bad_txt.txt_max),
-        (1, 0, None)
-    );
+    assert_eq!((bad_txt.txt_records, bad_txt.txt_max), (0, None));
     let txt = on(resolver)
         .into_iter()
         .find(|d| d.response && d.qname == "_cfg.example")
