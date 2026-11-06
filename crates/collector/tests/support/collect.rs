@@ -17,6 +17,7 @@ use collector::run::run;
 use collector::sign::{KeyProvider, SoftwareKey};
 use collector::stats::{Registry, Snapshot};
 use collector::store::{StoreConfig, StoreError, StoreSink, StoreSummary};
+use collector::tls::TlsRecord;
 use collector::{AssemblerConfig, DecoderConfig, FileSource, PacketSource};
 
 pub const WINDOW_NS: u64 = 1_000_000_000;
@@ -52,6 +53,7 @@ pub struct Collected {
     pub exchanges: Vec<ExchangeRecord>,
     pub workunits: Vec<WorkunitRecord>,
     pub dns: Vec<DnsRecord>,
+    pub tls: Vec<TlsRecord>,
     pub features: Vec<FeaturesRecord>,
     /// Kept bodies by hash name.
     pub bodies: BTreeMap<String, Vec<u8>>,
@@ -112,6 +114,10 @@ impl RecordSink for Collected {
 
     fn dns(&mut self, rec: &DnsRecord) {
         self.dns.push(rec.clone());
+    }
+
+    fn tls(&mut self, rec: &TlsRecord) {
+        self.tls.push(rec.clone());
     }
 
     fn features(&mut self, rec: &FeaturesRecord) {

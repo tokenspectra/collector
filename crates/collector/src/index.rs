@@ -161,7 +161,20 @@ const DNS: &[Column] = &[
     ("trailing_bytes", Int),
 ];
 
-/// One family of columns per decoder (`dns_*` now); a later decoder adds
+const TLS: &[Column] = &[
+    ("window_start_ns", Int),
+    ("index", Int),
+    ("ts_ns", Int),
+    ("flow", Str),
+    ("dir", Str),
+    ("sni", Str),
+    ("sni_len", Int),
+    ("alpn", Json),
+    ("size", Int),
+    ("trailing_bytes", Int),
+];
+
+/// One family of columns per decoder (`dns_*`, `tls_*`); a later decoder adds
 /// its own family after these, so earlier columns never move.
 const FEATURES: &[Column] = &[
     ("window_start_ns", Int),
@@ -183,6 +196,9 @@ const FEATURES: &[Column] = &[
     ("dns.txt_records", Int),
     ("dns.txt_bytes", Int),
     ("dns.txt_max", Int),
+    ("tls.client_hellos", Int),
+    ("tls.bytes", Int),
+    ("tls.sni_len", Int),
 ];
 
 macro_rules! message {
@@ -291,6 +307,7 @@ pub fn schema(table: &str) -> Vec<Column> {
         "events" => EVENTS.to_vec(),
         "flows" => FLOWS.to_vec(),
         "dns" => DNS.to_vec(),
+        "tls" => TLS.to_vec(),
         "features" => FEATURES.to_vec(),
         "http" => [HTTP_HEAD, &REQUEST, &RESPONSE, HTTP_TAIL].concat(),
         "workunits" => WORKUNITS.to_vec(),
@@ -390,6 +407,8 @@ pub fn uncovered(table: &str, row: &Value) -> Vec<String> {
             return;
         }
         match v {
+            // A `null` family: its columns stay null.
+            Value::Null if columns.iter().any(|&(p, _)| p.starts_with(&format!("{path}."))) => {}
             Value::Object(m) if !m.is_empty() => {
                 for (k, x) in m {
                     let p = if path.is_empty() {
@@ -445,7 +464,7 @@ mod tests {
                    "dns": {"messages": 2, "query_rate": 1.5, "qname_entropy_max": 4.619, "txt_max": null}}),
             json!({"window_start_ns": 10, "flow": "g", "link": "tap0", "dns": null}),
         ];
-        assert!(uncovered("features", &rows[0]).is_empty());
+        assert!(rows.iter().all(|r| uncovered("features", r).is_empty()));
         let bytes = parquet("features", &rows).unwrap();
         let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
         let got: Vec<String> = reader
@@ -457,6 +476,24 @@ mod tests {
         assert!(got[0].contains("dns_qname_entropy_max: 4.619"), "{}", got[0]);
         assert!(got[0].contains("dns_txt_max: null"), "{}", got[0]);
         assert!(got[1].contains("dns_messages: null"), "{}", got[1]);
+    }
+
+    #[test]
+    fn a_tls_row_keeps_its_alpn_list_as_json() {
+        let row = json!({"window_start_ns": 1, "index": 2, "ts_ns": 3, "flow": "g", "dir": "orig",
+                         "sni": null, "sni_len": null, "alpn": ["h2"], "size": 52, "trailing_bytes": 0});
+        assert!(uncovered("tls", &row).is_empty());
+        let bytes = parquet("tls", &[row]).unwrap();
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+        let got = reader
+            .get_row_iter(None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .to_string();
+        assert!(got.contains("sni: null"), "{got}");
+        assert!(got.contains(r#"alpn: "["h2"]""#), "{got}");
     }
 
     #[test]

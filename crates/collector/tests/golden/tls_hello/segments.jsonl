@@ -1,0 +1,11 @@
+{"flow":"tap0|tcp|10.0.0.1:41002|10.0.0.2:443|0","dir":"orig","stream_off":0,"len":35,"window_start_ns":1800000000000000000,"index":3,"pkt_off":54,"ts_ns":1800000000110000000}
+{"flow":"tap0|tcp|10.0.0.1:41001|10.0.0.2:443|0","dir":"orig","stream_off":0,"len":40,"window_start_ns":1800000001000000000,"index":3,"pkt_off":54,"ts_ns":1800000001020000000}
+{"flow":"tap0|tcp|10.0.0.1:41001|10.0.0.2:443|0","dir":"orig","stream_off":40,"len":58,"window_start_ns":1800000001000000000,"index":4,"pkt_off":54,"ts_ns":1800000001021000000}
+{"flow":"tap0|tcp|10.0.0.1:41001|10.0.0.2:443|0","dir":"resp","stream_off":0,"len":15,"window_start_ns":1800000001000000000,"index":5,"pkt_off":54,"ts_ns":1800000001022000000}
+{"flow":"tap0|tcp|10.0.0.1:41001|10.0.0.2:443|0","dir":"orig","stream_off":98,"len":10,"window_start_ns":1800000001000000000,"index":6,"pkt_off":54,"ts_ns":1800000001023000000}
+{"flow":"tap0|tcp|10.0.0.1:41003|10.0.0.2:443|0","dir":"orig","stream_off":0,"len":85,"window_start_ns":1800000001000000000,"index":13,"pkt_off":54,"ts_ns":1800000001210000000}
+{"flow":"tap0|tcp|10.0.0.1:41004|10.0.0.2:443|0","dir":"orig","stream_off":0,"len":62,"window_start_ns":1800000001000000000,"index":20,"pkt_off":54,"ts_ns":1800000001310000000}
+{"flow":"tap0|tcp|10.0.0.1:41005|10.0.0.2:443|0","dir":"orig","stream_off":0,"len":40,"window_start_ns":1800000001000000000,"index":27,"pkt_off":54,"ts_ns":1800000001410000000}
+{"flow":"tap0|tcp|10.0.0.1:41006|10.0.0.2:443|0","dir":"orig","stream_off":0,"len":20,"window_start_ns":1800000001000000000,"index":34,"pkt_off":54,"ts_ns":1800000001510000000}
+{"flow":"tap0|tcp|10.0.0.1:41006|10.0.0.2:443|0","dir":"orig","stream_off":40,"len":58,"window_start_ns":1800000001000000000,"index":35,"pkt_off":54,"ts_ns":1800000001512000000}
+{"flow":"tap0|tcp|10.0.0.1:41002|10.0.0.2:443|0","dir":"orig","stream_off":35,"len":44,"window_start_ns":1800000001000000000,"index":40,"pkt_off":54,"ts_ns":1800000001900000000}

@@ -6,6 +6,8 @@
 //! as a head, body bytes and an end; the decoder ([`crate::decode`]) pairs
 //! requests with responses and turns labels into byte-accounting buckets.
 
+use crate::tls::TlsRecord;
+
 /// What a run of stream bytes is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lab {
@@ -20,6 +22,8 @@ pub(crate) enum Lab {
     Unexplained,
     /// Bytes never captured.
     Gap,
+    /// Inside a protocol fact.
+    Fact,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +92,8 @@ pub(crate) struct HeadReply {
 
 /// Where a parser reports what it found.
 pub(crate) trait Out {
+    /// A ClientHello read at the start of the direction.
+    fn client_hello(&mut self, _rec: &TlsRecord) {}
     /// The next `len` bytes of the direction are `lab`.
     fn span(&mut self, len: u64, lab: Lab);
     /// A message head starting at stream offset `start`, whose first byte

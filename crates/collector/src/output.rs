@@ -2,7 +2,8 @@
 //!
 //! `packets`, `segments` (stream offset → packet), `events` (gaps,
 //! anomalies), `flows` (one row per Flow per Slice, with verdict and byte
-//! accounting), `dns` (one row per DNS message), `features` (covert-channel
+//! accounting), `dns` (one row per DNS message), `tls` (one row per TLS
+//! ClientHello), `features` (covert-channel
 //! features, one row per Slice that has any), `http` (one row per HTTP exchange), `workunits` (Request
 //! Workunits), and, when a [`StoreSink`](crate::store::StoreSink) writes the
 //! object store in front of this sink, `chunks` (one row per L0 chunk) and
@@ -36,14 +37,16 @@ use crate::dns::DnsRecord;
 use crate::manifest::{Log, WindowManifest};
 use crate::sign::KeyProvider;
 use crate::store::{BlobRecord, ChunkRecord, ObjectSink};
+use crate::tls::TlsRecord;
 use crate::{mh, views};
 
-pub const TABLES: [&str; 10] = [
+pub const TABLES: [&str; 11] = [
     "packets",
     "segments",
     "events",
     "flows",
     "dns",
+    "tls",
     "features",
     "http",
     "workunits",
@@ -60,6 +63,7 @@ pub struct JsonlSink {
     events: BufWriter<File>,
     flows: BufWriter<File>,
     dns: BufWriter<File>,
+    tls: BufWriter<File>,
     features: BufWriter<File>,
     http: BufWriter<File>,
     workunits: BufWriter<File>,
@@ -93,6 +97,7 @@ impl JsonlSink {
             events: open("events")?,
             flows: open("flows")?,
             dns: open("dns")?,
+            tls: open("tls")?,
             features: open("features")?,
             http: open("http")?,
             workunits: open("workunits")?,
@@ -149,13 +154,14 @@ impl JsonlSink {
         Ok(())
     }
 
-    fn tables(&mut self) -> [&mut BufWriter<File>; 10] {
+    fn tables(&mut self) -> [&mut BufWriter<File>; 11] {
         [
             &mut self.packets,
             &mut self.segments,
             &mut self.events,
             &mut self.flows,
             &mut self.dns,
+            &mut self.tls,
             &mut self.features,
             &mut self.http,
             &mut self.workunits,
@@ -210,6 +216,10 @@ impl RecordSink for JsonlSink {
 
     fn dns(&mut self, rec: &DnsRecord) {
         write_row(&mut self.dns, &mut self.error, rec);
+    }
+
+    fn tls(&mut self, rec: &TlsRecord) {
+        write_row(&mut self.tls, &mut self.error, rec);
     }
 
     fn features(&mut self, rec: &FeaturesRecord) {

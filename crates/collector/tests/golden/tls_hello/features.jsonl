@@ -1,0 +1,3 @@
+{"window_start_ns":1800000000000000000,"flow":"tap0|tcp|10.0.0.1:41002|10.0.0.2:443|0","link":"tap0","dns":null,"tls":{"client_hellos":1,"bytes":79,"sni_len":13}}
+{"window_start_ns":1800000001000000000,"flow":"tap0|tcp|10.0.0.1:41001|10.0.0.2:443|0","link":"tap0","dns":null,"tls":{"client_hellos":1,"bytes":98,"sni_len":11}}
+{"window_start_ns":1800000001000000000,"flow":"tap0|tcp|10.0.0.1:41003|10.0.0.2:443|0","link":"tap0","dns":null,"tls":{"client_hellos":1,"bytes":80,"sni_len":13}}

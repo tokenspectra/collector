@@ -224,7 +224,7 @@ function merkleRoot(hashNames) {
 }
 
 /* ===================== Loading ===================== */
-const TABLES = ["chunks", "packets", "segments", "flows", "dns", "features", "events", "http", "workunits", "blobs"];
+const TABLES = ["chunks", "packets", "segments", "flows", "dns", "tls", "features", "events", "http", "workunits", "blobs"];
 let D = null;         // the loaded capture
 let FILES = new Map(); // relative path -> File
 
@@ -351,6 +351,8 @@ function index(t, name, missing) {
   d.dnsByFlow = by(t.dns, r => r.flow);
   d.dnsBySlice = by(t.dns, r => r.flow + "@" + r.window_start_ns);
   d.dnsByPacket = new Map(t.dns.map(r => [r.flow + "@" + r.window_start_ns + "#" + r.index, r]));
+  d.tlsByFlow = by(t.tls, r => r.flow);
+  d.tlsByPacket = new Map(t.tls.map(r => [r.flow + "@" + r.window_start_ns + "#" + r.index, r]));
   d.featuresByFlow = by(t.features, r => r.flow);
   d.featuresBySlice = new Map(t.features.map(r => [r.flow + "@" + r.window_start_ns, r]));
   d.wuById = new Map(t.workunits.map(w => [w.workunit_id, w]));
@@ -429,7 +431,7 @@ const BUCKETS = ["workunit", "fact", "http_other", "framing", "unexplained", "ga
 // Collector's buckets grouped for reading, not Slice statuses: the Collector never assigns a status.
 const CLASSES = [
   { key: "green", label: "Workunit", parts: ["workunit"] },
-  // Whole protocol messages (DNS) on UDP: facts for the Classifier's Allowlist rules.
+  // Whole protocol messages (DNS, a TLS ClientHello): facts for the Classifier's Allowlist rules.
   { key: "violet", label: "Protocol fact", parts: ["fact"] },
   { key: "blue", label: "Other HTTP", parts: ["http_other", "framing"] },
   { key: "red", label: "Unexplained", parts: ["unexplained", "gap"] },
@@ -704,7 +706,7 @@ function vHome() {
   out += tiles([
     [D.links.length, "Links"], [D.flowsById.size, "Flows"], [num(t.flows.length), "Slices"],
     [num(t.http.length), "HTTP exchanges"], [wus, "Request Workunits"], [num(t.packets.length), "packets"],
-    [num(t.events.length), "events"], [D.bodyHashes.length, "bodies"], [num(t.dns.length), "DNS messages"],
+    [num(t.events.length), "events"], [D.bodyHashes.length, "bodies"], [num(t.dns.length), "DNS messages"], [num(t.tls.length), "TLS ClientHellos"],
   ]);
   out += `<div class="stacks">${D.links.map(l => stackChart("Link " + l, linkPoints(l))).join("")}</div>`;
   out += `<h3>Links</h3><table><tr><th>Link</th><th class="num">Flows</th><th class="num">windows</th><th class="num">packets</th></tr>`;
@@ -806,9 +808,11 @@ function vFlow(id) {
   if (f.exchanges.length) out += `<h3>HTTP exchanges</h3>` + exchangeTable(f.exchanges, false);
   out += `<h3>Slices</h3>` + sliceTable(f.slices, false);
   const feats = D.featuresByFlow.get(id) || [];
-  if (feats.length) out += `<h3>Covert-channel features</h3>${FEATURES_NOTE}` + featuresTable(feats);
+  if (feats.length) out += `<h3>Covert-channel features</h3>${FEATURES_NOTE}` + featuresTable(feats) + tlsFeaturesTable(feats);
   const dns = D.dnsByFlow.get(id) || [];
   if (dns.length) out += `<h3>DNS messages (${num(dns.length)})</h3>` + dnsTable(dns);
+  const tls = D.tlsByFlow.get(id) || [];
+  if (tls.length) out += `<h3>TLS ClientHello</h3>` + tlsTable(tls);
   if (ev.length) out += `<h3>Events</h3>` + eventTable(ev);
   return out;
 }
@@ -840,6 +844,7 @@ function vSlice(id, ws) {
     <div><h3>resp → orig</h3>${dirTable(s.resp_stats, s.resp_bytes, s.resp_desync)}</div></div>`;
   const feat = D.featuresBySlice.get(id + "@" + ws);
   if (feat?.dns) out += `<h3>Covert-channel features: DNS</h3>${FEATURES_NOTE}` + kv(dnsFeatureRows(feat.dns));
+  if (feat?.tls) out += `<h3>Covert-channel features: TLS</h3>${FEATURES_NOTE}` + kv(tlsFeatureRows(feat.tls));
   const dns = D.dnsBySlice.get(id + "@" + ws) || [];
   if (dns.length) out += `<h3>DNS messages (${num(dns.length)})</h3>` + dnsTable(dns);
   out += `<h3>Packets (${num(pk.length)})</h3>` + packetTable(pk, false);
@@ -893,6 +898,8 @@ function vPacket(l, ws, i) {
   if (ex.length) out += `<h3>Part of</h3>` + exchangeTable(ex, false);
   const dns = p.flow && D.dnsByPacket.get(p.flow + "@" + ws + "#" + i);
   if (dns) out += `<h3>DNS message</h3>` + kv(dnsRows(dns));
+  const tls = p.flow && D.tlsByPacket.get(p.flow + "@" + ws + "#" + i);
+  if (tls) out += `<h3>TLS ClientHello (starts here)</h3>` + kv(tlsRows(tls));
   return out;
 }
 
@@ -1054,6 +1061,7 @@ function dnsFeatureRows(f) {
   ];
 }
 function featuresTable(rows) {
+  if (!rows.some(r => r.dns)) return "";
   return `<table><tr><th>window</th><th class="num">DNS q/r</th><th class="num">not DNS</th><th class="num">DNS bytes</th><th class="num">queries/s</th>
       <th class="num">entropy max · mean</th><th class="num">qname max</th><th class="num">label max · mean</th><th class="num">TXT · bytes · largest</th></tr>` +
     rows.filter(r => r.dns).map(({ flow, window_start_ns: ws, dns: f }) => `<tr class="click" data-href="${R.slice(flow, ws)}"><td>${wsLabel(ws)}</td>
@@ -1061,6 +1069,27 @@ function featuresTable(rows) {
       <td class="num">${ratio(f.query_rate)}</td><td class="num">${ratio(f.qname_entropy_max)} · ${ratio(f.qname_entropy_mean)}</td>
       <td class="num">${num(f.qname_len_max)}</td><td class="num">${num(f.label_len_max)} · ${ratio(f.label_len_mean)}</td>
       <td class="num">${num(f.txt_records)} · ${bytes(f.txt_bytes)} · ${bytes(f.txt_max)}</td></tr>`).join("") + `</table>`;
+}
+const alpnLabel = t => t.alpn.length ? t.alpn.map(p => `<span class="mono">${esc(p)}</span>`).join(", ") : "—";
+const tlsFlags = t => t.trailing_bytes ? pill(`${t.trailing_bytes} trailing bytes`, "bad") : "";
+function tlsTable(rows) {
+  return `<table><tr><th>time</th><th>dir</th><th>SNI</th><th>ALPN</th><th class="num">size</th><th>flags</th><th>packet</th></tr>` +
+    rows.map(t => `<tr><td>${time(t.ts_ns)}</td><td>${esc(t.dir)}</td><td class="mono">${esc(t.sni ?? "—")}</td><td>${alpnLabel(t)}</td>
+      <td class="num">${bytes(t.size)}</td><td>${tlsFlags(t)}</td><td>${a(R.packet(linkOf(t.flow), t.window_start_ns, t.index), "#" + esc(t.index))}</td></tr>`).join("") + `</table>`;
+}
+function tlsRows(t) {
+  return [
+    ["SNI", `<span class="mono">${esc(t.sni ?? "—")}</span> ${tlsFlags(t)}`], ["SNI length", num(t.sni_len)], ["ALPN", alpnLabel(t)],
+    ["size / trailing bytes", `${bytes(t.size)} / ${num(t.trailing_bytes)}`],
+  ];
+}
+const tlsFeatureRows = f => [["ClientHellos", num(f.client_hellos)], ["ClientHello bytes", bytes(f.bytes)], ["SNI length", num(f.sni_len)]];
+function tlsFeaturesTable(rows) {
+  const tls = rows.filter(r => r.tls);
+  if (!tls.length) return "";
+  return `<table><tr><th>window</th><th class="num">ClientHellos</th><th class="num">bytes</th><th class="num">SNI length</th></tr>` +
+    tls.map(({ flow, window_start_ns: ws, tls: f }) => `<tr class="click" data-href="${R.slice(flow, ws)}"><td>${wsLabel(ws)}</td>
+      <td class="num">${num(f.client_hellos)}</td><td class="num">${bytes(f.bytes)}</td><td class="num">${num(f.sni_len)}</td></tr>`).join("") + `</table>`;
 }
 
 function vConvo(flow, n) {

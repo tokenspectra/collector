@@ -347,6 +347,95 @@ fn dns_messages_and_covert_channel_features() {
 }
 
 #[test]
+fn tls_client_hellos_and_their_features() {
+    let c = collect_files(&["tls_hello.pcapng"]);
+    let flow = |port: u16| format!("tap0|tcp|10.0.0.1:{port}|10.0.0.2:443|0");
+    let row = |port: u16| c.tls.iter().find(|r| r.flow.as_str() == flow(port));
+    let slices = |port: u16| -> Vec<_> {
+        c.flows
+            .iter()
+            .filter(|s| s.slice.flow.as_str() == flow(port))
+            .collect()
+    };
+    assert!(c.flows.iter().all(|s| s.verdict == Some(Verdict::Tls)));
+    assert_eq!(c.tls.len(), 3);
+
+    // Cut over two TCP segments: the row is at the packet of the first byte.
+    let a = row(41001).unwrap();
+    assert_eq!(a.sni.as_deref(), Some("api.example"));
+    assert_eq!(a.sni_len, Some(11));
+    assert_eq!(a.alpn, ["h2", "http/1.1"]);
+    assert_eq!((a.dir, a.trailing_bytes), (Dir::Orig, 0));
+    let first = c
+        .segments
+        .iter()
+        .find(|s| s.flow == a.flow && s.dir == Dir::Orig)
+        .unwrap();
+    assert_eq!(
+        (a.window_start_ns, a.index, a.ts_ns),
+        (first.window_start_ns, first.index, first.ts_ns)
+    );
+    let s = slices(41001);
+    assert_eq!(s[0].orig_bytes.fact, u64::from(a.size));
+    assert_eq!(s[0].orig_bytes.unexplained, fixtures::TLS_APP_DATA.len() as u64);
+    assert_eq!(
+        (s[0].resp_bytes.fact, s[0].resp_bytes.unexplained),
+        (0, fixtures::TLS_SERVER_HELLO.len() as u64)
+    );
+
+    // Over two records and two Slices: the features are in the first Slice,
+    // the fact bytes where they were sent.
+    let b = row(41002).unwrap();
+    assert_eq!(b.sni.as_deref(), Some("split.example"));
+    let s = slices(41002);
+    assert_eq!(s.len(), 2);
+    assert_eq!(s[0].orig_bytes.fact + s[1].orig_bytes.fact, u64::from(b.size));
+    assert!(s[0].orig_bytes.fact > 0 && s[1].orig_bytes.fact > 0);
+    let feats: Vec<_> = c.features.iter().filter(|f| f.flow == b.flow).collect();
+    assert_eq!(feats.len(), 1);
+    assert_eq!(feats[0].window_start_ns, b.window_start_ns);
+    assert_eq!(feats[0].window_start_ns, s[0].slice.window_start_ns);
+    assert!(feats[0].dns.is_none());
+    let t = feats[0].tls.as_ref().unwrap();
+    assert_eq!(
+        (t.client_hellos, t.bytes, t.sni_len),
+        (1, u64::from(b.size), Some(13))
+    );
+
+    // Bytes in the message past its extensions are in the fact and counted;
+    // those past the message are not in it.
+    let d = row(41003).unwrap();
+    assert_eq!(d.sni.as_deref(), Some("a\\\\b\\032\\255.example"));
+    assert_eq!(d.trailing_bytes, 6);
+    let s = slices(41003);
+    assert_eq!(
+        (s[0].orig_bytes.fact, s[0].orig_bytes.unexplained),
+        (u64::from(d.size), 5)
+    );
+
+    // Malformed, never complete or cut by a gap: no row, no features, and
+    // no byte is a fact.
+    for port in [41004, 41005, 41006] {
+        assert!(row(port).is_none());
+        assert!(c.features.iter().all(|f| f.flow.as_str() != flow(port)));
+        assert!(slices(port).iter().all(|s| s.orig_bytes.fact == 0));
+    }
+    assert_eq!(slices(41006)[0].orig_bytes.gap, 20);
+
+    // Every byte of every Slice is in a fact, a gap or unexplained.
+    for s in &c.flows {
+        for (b, st) in [
+            (&s.orig_bytes, &s.slice.orig_stats),
+            (&s.resp_bytes, &s.slice.resp_stats),
+        ] {
+            assert_eq!(b.fact + b.unexplained + b.gap, b.total());
+            let range = st.stream_end.unwrap_or(0) - st.stream_start.unwrap_or(0);
+            assert_eq!(b.total(), range, "{}", s.slice.flow);
+        }
+    }
+}
+
+#[test]
 fn non_http_tcp_and_tuple_reuse() {
     let c = collect_files(&["non_http_tcp.pcapng"]);
     let g0 = "tap0|tcp|10.0.0.1:40000|10.0.0.2:6379|0";
@@ -942,13 +1031,16 @@ fn http1_edge_cases() {
 }
 
 #[test]
-fn tls_and_grpc_flows_are_unexplained() {
+fn tls_and_grpc_flows_are_unexplained_past_the_client_hello() {
     let c = collect_files(&["tls_plaintext.pcapng"]);
     assert_eq!(c.flows[0].verdict, Some(Verdict::Tls));
     assert_eq!(
+        bytes_where(&c, |b| b.fact),
+        fixtures::TLS_CLIENT_HELLO.len() as u64
+    );
+    assert_eq!(
         bytes_where(&c, |b| b.unexplained),
-        (fixtures::TLS_CLIENT_HELLO.len() + fixtures::TLS_SERVER_HELLO.len() + fixtures::TLS_APP_DATA.len())
-            as u64
+        (fixtures::TLS_SERVER_HELLO.len() + fixtures::TLS_APP_DATA.len()) as u64
     );
     assert!(c.exchanges.is_empty());
 

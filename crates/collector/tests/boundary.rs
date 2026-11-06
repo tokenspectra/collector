@@ -26,6 +26,7 @@ const PARSE: &[&str] = &[
     "net",
     "packet",
     "tcp",
+    "tls",
     "wire",
 ];
 

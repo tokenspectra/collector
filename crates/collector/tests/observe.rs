@@ -209,7 +209,10 @@ fn expected_counter_tables() {
 
     let s = get("tls_plaintext");
     assert_eq!(s.flows_by(VerdictLabel::Tls), 1);
-    assert_eq!(s.bucket_bytes(Bucket::Unexplained), s.accounted_total());
+    assert_eq!(
+        s.bucket_bytes(Bucket::Unexplained) + s.bucket_bytes(Bucket::Fact),
+        s.accounted_total()
+    );
 
     let s = get("dumpcap_keepalive");
     assert_eq!((s.mid_stream_starts, s.windows_closed), (1, 3));
@@ -231,6 +234,7 @@ fn counting_changes_no_output() {
 struct Recording(Vec<String>);
 
 impl RecordSink for Recording {
+    fn tls(&mut self, _: &collector::tls::TlsRecord) {}
     fn packet(&mut self, rec: &PacketRecord) {
         self.0.push(format!("packet {rec:?}"));
     }
