@@ -43,6 +43,10 @@ use tracing::debug;
 use crate::mh;
 use crate::sign::{hex, parse_hex, KeyProvider};
 
+/// The fields [`Log::append`] leaves out when it compares a window with
+/// the one it holds.
+const NOT_CAPTURED: [&str; 3] = ["identity", "capture", "observed"];
+
 /// The append-only manifest log.
 pub struct Log {
     file: File,
@@ -130,7 +134,11 @@ impl Log {
     /// with other contents is an error, as a conflicting store put is.
     pub fn append(&mut self, m: &WindowManifest) -> io::Result<()> {
         let dedup = m.dedup_key();
-        let body = blake3::hash(&serde_json::to_vec(&serde_json::to_value(m)?)?);
+        let mut value = serde_json::to_value(m)?;
+        if let Some(obj) = value.as_object_mut() {
+            NOT_CAPTURED.iter().for_each(|f| drop(obj.remove(*f)));
+        }
+        let body = blake3::hash(&serde_json::to_vec(&value)?);
         match self.logged.get(&dedup) {
             Some(h) if *h == body => {
                 debug!(window = %dedup, "window already in the manifest log");
@@ -188,6 +196,7 @@ fn unchained(line: &[u8]) -> Option<(String, blake3::Hash)> {
     let obj = v.as_object_mut()?;
     obj.remove("sig");
     obj.remove("chain");
+    NOT_CAPTURED.iter().for_each(|f| drop(obj.remove(*f)));
     let dedup = format!(
         "{}/{}",
         obj.get("collector")?.as_str()?,
@@ -359,6 +368,39 @@ mod tests {
             pack: None,
             index: Vec::new(),
             totals: Totals::default(),
+            identity: None,
+            capture: None,
+            observed: None,
+        }
+    }
+
+    #[test]
+    fn a_window_that_differs_only_in_its_fleet_fields_is_a_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), key(SEED)).unwrap();
+        let mut m = manifest(0);
+        m.identity = Some(Identity { config: "a".into() });
+        m.capture = Some(CaptureInfo { epoch: Some(1) });
+        m.observed = Some(Observed { channel_cut: false });
+        log.append(&m).unwrap();
+        let logged = std::fs::read(dir.path().join(LOG)).unwrap();
+
+        m.identity = Some(Identity { config: "b".into() });
+        m.observed = Some(Observed { channel_cut: true });
+        log.append(&m).unwrap();
+        let mut reopened = Log::open(dir.path(), key(SEED)).unwrap();
+        reopened.append(&m).unwrap();
+        assert_eq!(std::fs::read(dir.path().join(LOG)).unwrap(), logged);
+
+        m.totals.packets = 1;
+        assert!(reopened.append(&m).is_err(), "what was captured still counts");
+    }
+
+    #[test]
+    fn fleet_fields_are_left_out_of_a_run_without_a_fleet() {
+        let text = serde_json::to_string(&manifest(0)).unwrap();
+        for field in NOT_CAPTURED {
+            assert!(!text.contains(field), "{text}");
         }
     }
 

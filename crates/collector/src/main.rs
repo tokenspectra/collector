@@ -1,19 +1,21 @@
 //! `collector`: run Flow assembly over capture files or a live dumpcap ring.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use collector::fleet::{Channel, Fleet, FleetOptions, StubEvidence};
 use collector::observe::{log_summary, Stats};
 use collector::output::JsonlSink;
 use collector::run::run;
 use collector::ship::{self, Ingest, Shipper};
-use collector::sign::{KeyProvider, SoftwareKey};
+use collector::sign::{parse_hex, KeyProvider, SoftwareKey};
 use collector::spool::{Spool, Uploaded, Uploader};
 use collector::stats::{serve_metrics, Registry};
 use collector::store::{StoreConfig, StoreSink};
@@ -59,8 +61,26 @@ struct Cli {
     /// Seconds to finish uploads at the end of a run
     #[arg(long, global = true, default_value_t = 30)]
     upload_wait_s: u64,
-    /// Control-plane ingest URL each window's manifest is POSTed to
+    /// Fleet URL to enrol with and pull config and seeds from (https://)
+    #[arg(long, global = true, requires_all = ["fleet_ca", "fleet_root"])]
+    fleet: Option<String>,
+    /// PEM file of the CA the Fleet's and ingest's TLS chain to
     #[arg(long, global = true)]
+    fleet_ca: Option<PathBuf>,
+    /// The Fleet's Ed25519 public key, 64 hex digits
+    #[arg(long, global = true)]
+    fleet_root: Option<String>,
+    /// File holding the site join token; needed to enrol
+    #[arg(long, global = true)]
+    join_token_file: Option<PathBuf>,
+    /// Fleet keys and state [default: <out>/fleet]
+    #[arg(long, global = true)]
+    fleet_dir: Option<PathBuf>,
+    /// Dev only: allow plain http:// to the ingest and the Fleet
+    #[arg(long, global = true)]
+    dev_plain_http: bool,
+    /// Dev only: plain http:// ingest URL; with --fleet, config names it
+    #[arg(long, global = true, conflicts_with = "fleet")]
     ingest: Option<String>,
     /// Seconds to finish shipping manifests at the end of a run
     #[arg(long, global = true, default_value_t = 30)]
@@ -74,11 +94,11 @@ struct Cli {
     /// The {collector} part of object keys
     #[arg(long, global = true, default_value = "local")]
     collector_id: String,
-    /// Capture Rate: share of Request Workunits kept in full (0 to 1)
+    /// Capture Rate: share of Request Workunits kept in full (0 to 1); --fleet's config wins
     #[arg(long, global = true, default_value_t = 1.0)]
     capture_rate: f64,
-    /// Capture Rate key, 64 hex digits; needed below rate 1
-    #[arg(long, global = true)]
+    /// Dev only: Capture Rate key, 64 hex digits; --fleet uses seeds
+    #[arg(long, global = true, conflicts_with = "fleet")]
     capture_key: Option<String>,
     /// Captured bytes left in a truncated packet
     #[arg(long, global = true, default_value_t = 128)]
@@ -232,13 +252,65 @@ fn parse_key(hex: &str) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
+/// The ingest of a run without a Fleet: for development, so plain only.
+fn dev_ingest(cli: &Cli) -> Result<Option<Ingest>, Box<dyn std::error::Error>> {
+    let Some(url) = cli.ingest.as_deref() else {
+        return Ok(None);
+    };
+    if !cli.dev_plain_http {
+        return Err(format!(
+            "--ingest {url}: the ingest is mTLS, with the certificate --fleet brings; plain http:// needs --dev-plain-http"
+        )
+        .into());
+    }
+    Ok(Some(Ingest::plain(url)?))
+}
+
+fn signing_key_path(flag: Option<&Path>, out: &Path) -> PathBuf {
+    flag.map_or_else(|| out.join("signing.key"), Path::to_path_buf)
+}
+
+/// Picks up this Collector's enrolment in the Fleet, or enrols it.
+fn open_fleet(cli: &Cli, url: &str, out: &Path) -> Result<Arc<Fleet>, Box<dyn std::error::Error>> {
+    let root = cli.fleet_root.as_deref().and_then(parse_hex::<32>);
+    let root = root.ok_or("--fleet-root must be 64 hex digits")?;
+    let ca = cli.fleet_ca.clone().ok_or("--fleet needs --fleet-ca")?;
+    std::fs::create_dir_all(out)?;
+    let key_path = signing_key_path(cli.signing_key.as_deref(), out);
+    let key = SoftwareKey::open_or_create(&key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
+    let join_token = cli
+        .join_token_file
+        .as_ref()
+        .map(|p| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display())))
+        .transpose()?
+        .map(|t| t.trim().to_string());
+    Ok(Fleet::open(FleetOptions {
+        url: url.to_string(),
+        ca,
+        root,
+        dir: cli.fleet_dir.clone().unwrap_or_else(|| out.join("fleet")),
+        join_token,
+        signing_key: key.public_key(),
+        evidence: Box::new(StubEvidence),
+        dev_plain_http: cli.dev_plain_http,
+    })?)
+}
+
 fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let decoder_cfg = DecoderConfig {
         keep_bodies: !cli.no_bodies,
         ..DecoderConfig::default()
     };
     let mut dumpcap_pid = None;
-    let ingest = cli.ingest.as_deref().map(Ingest::parse).transpose()?;
+    let ingest = dev_ingest(&cli)?;
+    // Enrolled before anything is captured: a Collector the Fleet won't
+    // have doesn't start. One enrolled before starts with the channel cut.
+    let fleet = match (&cli.cmd, cli.fleet.as_deref()) {
+        (Cmd::Files { out, .. } | Cmd::Ring { out, .. } | Cmd::Ship { out }, Some(url)) => {
+            Some(open_fleet(&cli, url, out)?)
+        }
+        _ => None,
+    };
     // An s3:// store without a named endpoint refuses to start, before
     // capture begins or anything is written.
     let s3_endpoint = match cli.store.as_deref() {
@@ -257,8 +329,20 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Cmd::Ship { out } => {
-            let ingest = ingest.ok_or("`collector ship` needs --ingest")?;
-            let s = ship::ship_pending(&out, &ingest, Duration::from_secs(10))?;
+            // The channel first: a certificate that ran out during a long
+            // cut renews before the first line, and a long drain goes on
+            // renewing.
+            let channel = fleet.clone().map(Channel::spawn).transpose()?;
+            let ingest: Box<dyn Fn() -> Ingest> = match (fleet, ingest) {
+                (Some(f), _) => Box::new(move || f.ingest()),
+                (None, Some(i)) => Box::new(move || i.clone()),
+                (None, None) => return Err("`collector ship` needs --fleet or --ingest".into()),
+            };
+            let shipped = ship::ship_from(&out, &*ingest, Duration::from_secs(10));
+            if let Some(channel) = channel {
+                channel.finish();
+            }
+            let s = shipped?;
             // No deadline here, so the count is always known.
             info!(
                 sent = s.sent,
@@ -314,16 +398,20 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     let window_ns = u64::from(window_s) * 1_000_000_000;
     let mut store_cfg = StoreConfig::new(window_ns);
-    store_cfg.site = cli.site.clone();
-    store_cfg.collector = cli.collector_id.clone();
+    store_cfg.site = fleet.as_ref().map_or_else(|| cli.site.clone(), |f| f.site());
+    store_cfg.collector = fleet
+        .as_ref()
+        .map_or_else(|| cli.collector_id.clone(), |f| f.member());
     store_cfg.capture.rate = cli.capture_rate;
     store_cfg.capture.truncate_to = cli.truncate_to;
     store_cfg.capture.alarm_cap_bytes = cli.alarm_cap;
     store_cfg.capture.key = cli.capture_key.as_deref().map(parse_key).transpose()?;
+    store_cfg.capture.seeds = fleet.as_ref().map(|f| f.seeds());
+    store_cfg.fleet = fleet.clone();
     if !(0.0..=1.0).contains(&cli.capture_rate) {
         return Err("--capture-rate must be between 0 and 1".into());
     }
-    if cli.capture_rate < 1.0 && store_cfg.capture.key.is_none() {
+    if cli.capture_rate < 1.0 && store_cfg.capture.key.is_none() && fleet.is_none() {
         return Err("--capture-rate below 1 needs --capture-key: the draw must be unpredictable".into());
     }
     std::fs::create_dir_all(&out)?;
@@ -376,7 +464,7 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let key_path = cli.signing_key.clone().unwrap_or_else(|| out.join("signing.key"));
+    let key_path = signing_key_path(cli.signing_key.as_deref(), &out);
     let key = SoftwareKey::open_or_create(&key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
     info!(
         key = %collector::sign::hex(&key.public_key()),
@@ -384,9 +472,17 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         "manifests signed with a software key"
     );
     let mut sink = JsonlSink::create(&out, Box::new(key))?;
-    let shipper = ingest
-        .map(|i| Shipper::spawn(out.clone(), i, Duration::from_secs(1)))
-        .transpose()?;
+    let shipper = match &fleet {
+        Some(f) => {
+            let f = f.clone();
+            let ingest = Box::new(move || f.ingest());
+            Some(Shipper::spawn_with(out.clone(), ingest, Duration::from_secs(1))?)
+        }
+        None => ingest
+            .map(|i| Shipper::spawn(out.clone(), i, Duration::from_secs(1)))
+            .transpose()?,
+    };
+    let channel = fleet.clone().map(Channel::spawn).transpose()?;
     let mut store = match &spooled {
         Some((spool, _)) => StoreSink::spooled(&mut sink, spool.clone(), store_cfg, Some(registry.clone())),
         None => StoreSink::new(
@@ -429,6 +525,9 @@ fn real_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(shipper) = shipper {
         ship::log_outcome(&shipper.finish(Duration::from_secs(cli.ship_wait_s)), &out);
+    }
+    if let Some(channel) = channel {
+        channel.finish();
     }
     log_summary(&registry.snapshot(), &out);
     Ok(())

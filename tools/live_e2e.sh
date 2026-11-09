@@ -37,7 +37,7 @@ trap 'kill $INGEST_PID 2>/dev/null || true' EXIT
 sleep 0.5
 
 # dumpcap stops on its own after the workload; the Collector then drains.
-"$BIN" -q --ingest "$INGEST" --collector-id live-e2e \
+"$BIN" -q --dev-plain-http --ingest "$INGEST" --collector-id live-e2e --signing-key "$WORK/e2e-signing.key" \
     ring -i lo -w "$WINDOW" -B 256 -f "$FILTER" -t $((DURATION + 15)) -d "$WORK/ring" -o "$WORK/live" \
     >"$WORK/live.log" 2>&1 &
 RING_PID=$!
@@ -46,7 +46,7 @@ uv run -q fixtures/capture/workload.py --duration "$DURATION" --workers "$WORKER
 wait $RING_PID
 tail -n 3 "$WORK/live.log"
 
-"$BIN" -q --ingest "$INGEST" --collector-id live-e2e \
+"$BIN" -q --dev-plain-http --ingest "$INGEST" --collector-id live-e2e --signing-key "$WORK/e2e-signing.key" \
     files -w "$WINDOW" -o "$WORK/offline" "$WORK"/ring/*.pcapng >"$WORK/offline.log" 2>&1
 
 echo "ring files: $(ls "$WORK"/ring/*.pcapng | wc -l), $(du -cb "$WORK"/ring/*.pcapng | tail -1 | cut -f1) bytes"

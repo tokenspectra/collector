@@ -192,7 +192,7 @@ fn manifests_name_every_object_and_sum_to_the_tables() {
 #[test]
 fn every_window_is_shipped_once_and_a_rerun_only_repeats_it() {
     let ingest = MockIngest::start();
-    let url = Ingest::parse(&ingest.url).unwrap();
+    let url = Ingest::plain(&ingest.url).unwrap();
     let mut windows = 0;
     for (case, files) in cases() {
         let out = tempfile::tempdir().unwrap();
@@ -228,7 +228,7 @@ fn every_window_is_shipped_once_and_a_rerun_only_repeats_it() {
 #[test]
 fn a_window_with_other_bytes_is_refused_and_stays_in_the_log() {
     let ingest = MockIngest::start();
-    let url = Ingest::parse(&ingest.url).unwrap();
+    let url = Ingest::plain(&ingest.url).unwrap();
     let files = vec!["openai_h1_sse.pcapng".to_string()];
     let first = tempfile::tempdir().unwrap();
     run_case(&files, first.path(), store_cfg("c1"));
@@ -269,13 +269,13 @@ fn shipping_resumes_where_it_stopped() {
         .unwrap()
         .local_addr()
         .unwrap();
-    let down = Ingest::parse(&format!("http://{down}/ingest/windows")).unwrap();
+    let down = Ingest::plain(&format!("http://{down}/ingest/windows")).unwrap();
     assert!(ship_pending(out.path(), &down, TIMEOUT).is_err());
     assert_eq!(pending_lines(out.path()).unwrap(), n);
 
     // Half shipped by an earlier pass, the rest now.
     let ingest = MockIngest::start();
-    let url = Ingest::parse(&ingest.url).unwrap();
+    let url = Ingest::plain(&ingest.url).unwrap();
     let log = std::fs::read(out.path().join(LOG)).unwrap();
     let first_line = log.iter().position(|&b| b == b'\n').unwrap() + 1;
     std::fs::write(out.path().join(CURSOR), format!("{first_line}\n")).unwrap();
@@ -329,6 +329,7 @@ fn the_cli_ships_to_the_ingest() {
         let status = Command::new(env!("CARGO_BIN_EXE_collector"))
             .args([
                 "-q",
+                "--dev-plain-http",
                 "--ingest",
                 &ingest.url,
                 "--collector-id",

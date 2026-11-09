@@ -28,6 +28,8 @@ To read existing captures instead: `cargo run -- files -o out/ capture.pcapng`. 
 
 S3 is optional. By default the object store is a local directory, `<out>/store`, or the one `--store <dir>` names: there is no spool and no network traffic, and the S3 options (`--s3-endpoint`, `--spool`, `--spool-max-mib`, `--upload-wait-s`, `upload`) don't apply. With `--store s3://bucket[/prefix]`, objects go through a local spool to that store, and the endpoint must be named. [docs/spec.md](docs/spec.md) ("Command line") explains each option in full.
 
+A real deployment runs under the Fleet: `--fleet` enrols the Collector, and signed config then sets the ingest and the Capture Rate. Manifests go to the ingest over mTLS. `--ingest` and `--capture-key` are development stand-ins; plain `http://` needs `--dev-plain-http`. See [docs/spec.md](docs/spec.md) §15.
+
 <!-- help: --help -->
 ```text
 TokenSpectra Collector
@@ -46,26 +48,58 @@ Options:
   -h, --help  Print help
 
 Global options:
-      --no-bodies                      Don't keep HTTP bodies (hashes and tables stay the same)
-  -v, --verbose...                     More log detail: -v DEBUG, -vv TRACE
-  -q, --quiet...                       Less log detail: -q WARN, -qq ERROR
-      --log-level <LOG_LEVEL>          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
-      --log-format <LOG_FORMAT>        Log line format on stdout [default: text] [possible values: text, json]
-      --metrics-addr <METRICS_ADDR>    Serve Prometheus metrics here, e.g. 127.0.0.1:9464
-      --store <STORE>                  Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
-      --s3-endpoint <S3_ENDPOINT>      S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
-      --spool <SPOOL>                  Local spool for s3:// uploads [default: <out>/spool]
-      --spool-max-mib <SPOOL_MAX_MIB>  Spool cap in MiB; a full spool holds the run back [default: 4096]
-      --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
-      --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
-      --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
-      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
-      --site <SITE>                    The {site} part of object keys [default: local]
-      --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
-      --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
-      --capture-key <CAPTURE_KEY>      Capture Rate key, 64 hex digits; needed below rate 1
-      --truncate-to <TRUNCATE_TO>      Captured bytes left in a truncated packet [default: 128]
-      --alarm-cap <ALARM_CAP>          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
+      --no-bodies
+          Don't keep HTTP bodies (hashes and tables stay the same)
+  -v, --verbose...
+          More log detail: -v DEBUG, -vv TRACE
+  -q, --quiet...
+          Less log detail: -q WARN, -qq ERROR
+      --log-level <LOG_LEVEL>
+          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
+      --log-format <LOG_FORMAT>
+          Log line format on stdout [default: text] [possible values: text, json]
+      --metrics-addr <METRICS_ADDR>
+          Serve Prometheus metrics here, e.g. 127.0.0.1:9464
+      --store <STORE>
+          Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
+      --s3-endpoint <S3_ENDPOINT>
+          S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
+      --spool <SPOOL>
+          Local spool for s3:// uploads [default: <out>/spool]
+      --spool-max-mib <SPOOL_MAX_MIB>
+          Spool cap in MiB; a full spool holds the run back [default: 4096]
+      --upload-wait-s <UPLOAD_WAIT_S>
+          Seconds to finish uploads at the end of a run [default: 30]
+      --fleet <FLEET>
+          Fleet URL to enrol with and pull config and seeds from (https://)
+      --fleet-ca <FLEET_CA>
+          PEM file of the CA the Fleet's and ingest's TLS chain to
+      --fleet-root <FLEET_ROOT>
+          The Fleet's Ed25519 public key, 64 hex digits
+      --join-token-file <JOIN_TOKEN_FILE>
+          File holding the site join token; needed to enrol
+      --fleet-dir <FLEET_DIR>
+          Fleet keys and state [default: <out>/fleet]
+      --dev-plain-http
+          Dev only: allow plain http:// to the ingest and the Fleet
+      --ingest <INGEST>
+          Dev only: plain http:// ingest URL; with --fleet, config names it
+      --ship-wait-s <SHIP_WAIT_S>
+          Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>
+          Manifest signing key, made if missing [default: <out>/signing.key]
+      --site <SITE>
+          The {site} part of object keys [default: local]
+      --collector-id <COLLECTOR_ID>
+          The {collector} part of object keys [default: local]
+      --capture-rate <CAPTURE_RATE>
+          Capture Rate: share of Request Workunits kept in full (0 to 1); --fleet's config wins [default: 1]
+      --capture-key <CAPTURE_KEY>
+          Dev only: Capture Rate key, 64 hex digits; --fleet uses seeds
+      --truncate-to <TRUNCATE_TO>
+          Captured bytes left in a truncated packet [default: 128]
+      --alarm-cap <ALARM_CAP>
+          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
 ```
 
 <details><summary><code>collector files --help</code></summary>
@@ -85,26 +119,58 @@ Options:
   -h, --help                 Print help
 
 Global options:
-      --no-bodies                      Don't keep HTTP bodies (hashes and tables stay the same)
-  -v, --verbose...                     More log detail: -v DEBUG, -vv TRACE
-  -q, --quiet...                       Less log detail: -q WARN, -qq ERROR
-      --log-level <LOG_LEVEL>          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
-      --log-format <LOG_FORMAT>        Log line format on stdout [default: text] [possible values: text, json]
-      --metrics-addr <METRICS_ADDR>    Serve Prometheus metrics here, e.g. 127.0.0.1:9464
-      --store <STORE>                  Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
-      --s3-endpoint <S3_ENDPOINT>      S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
-      --spool <SPOOL>                  Local spool for s3:// uploads [default: <out>/spool]
-      --spool-max-mib <SPOOL_MAX_MIB>  Spool cap in MiB; a full spool holds the run back [default: 4096]
-      --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
-      --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
-      --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
-      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
-      --site <SITE>                    The {site} part of object keys [default: local]
-      --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
-      --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
-      --capture-key <CAPTURE_KEY>      Capture Rate key, 64 hex digits; needed below rate 1
-      --truncate-to <TRUNCATE_TO>      Captured bytes left in a truncated packet [default: 128]
-      --alarm-cap <ALARM_CAP>          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
+      --no-bodies
+          Don't keep HTTP bodies (hashes and tables stay the same)
+  -v, --verbose...
+          More log detail: -v DEBUG, -vv TRACE
+  -q, --quiet...
+          Less log detail: -q WARN, -qq ERROR
+      --log-level <LOG_LEVEL>
+          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
+      --log-format <LOG_FORMAT>
+          Log line format on stdout [default: text] [possible values: text, json]
+      --metrics-addr <METRICS_ADDR>
+          Serve Prometheus metrics here, e.g. 127.0.0.1:9464
+      --store <STORE>
+          Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
+      --s3-endpoint <S3_ENDPOINT>
+          S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
+      --spool <SPOOL>
+          Local spool for s3:// uploads [default: <out>/spool]
+      --spool-max-mib <SPOOL_MAX_MIB>
+          Spool cap in MiB; a full spool holds the run back [default: 4096]
+      --upload-wait-s <UPLOAD_WAIT_S>
+          Seconds to finish uploads at the end of a run [default: 30]
+      --fleet <FLEET>
+          Fleet URL to enrol with and pull config and seeds from (https://)
+      --fleet-ca <FLEET_CA>
+          PEM file of the CA the Fleet's and ingest's TLS chain to
+      --fleet-root <FLEET_ROOT>
+          The Fleet's Ed25519 public key, 64 hex digits
+      --join-token-file <JOIN_TOKEN_FILE>
+          File holding the site join token; needed to enrol
+      --fleet-dir <FLEET_DIR>
+          Fleet keys and state [default: <out>/fleet]
+      --dev-plain-http
+          Dev only: allow plain http:// to the ingest and the Fleet
+      --ingest <INGEST>
+          Dev only: plain http:// ingest URL; with --fleet, config names it
+      --ship-wait-s <SHIP_WAIT_S>
+          Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>
+          Manifest signing key, made if missing [default: <out>/signing.key]
+      --site <SITE>
+          The {site} part of object keys [default: local]
+      --collector-id <COLLECTOR_ID>
+          The {collector} part of object keys [default: local]
+      --capture-rate <CAPTURE_RATE>
+          Capture Rate: share of Request Workunits kept in full (0 to 1); --fleet's config wins [default: 1]
+      --capture-key <CAPTURE_KEY>
+          Dev only: Capture Rate key, 64 hex digits; --fleet uses seeds
+      --truncate-to <TRUNCATE_TO>
+          Captured bytes left in a truncated packet [default: 128]
+      --alarm-cap <ALARM_CAP>
+          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
 ```
 
 </details>
@@ -124,26 +190,58 @@ Options:
   -h, --help  Print help
 
 Global options:
-      --no-bodies                      Don't keep HTTP bodies (hashes and tables stay the same)
-  -v, --verbose...                     More log detail: -v DEBUG, -vv TRACE
-  -q, --quiet...                       Less log detail: -q WARN, -qq ERROR
-      --log-level <LOG_LEVEL>          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
-      --log-format <LOG_FORMAT>        Log line format on stdout [default: text] [possible values: text, json]
-      --metrics-addr <METRICS_ADDR>    Serve Prometheus metrics here, e.g. 127.0.0.1:9464
-      --store <STORE>                  Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
-      --s3-endpoint <S3_ENDPOINT>      S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
-      --spool <SPOOL>                  Local spool for s3:// uploads [default: <out>/spool]
-      --spool-max-mib <SPOOL_MAX_MIB>  Spool cap in MiB; a full spool holds the run back [default: 4096]
-      --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
-      --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
-      --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
-      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
-      --site <SITE>                    The {site} part of object keys [default: local]
-      --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
-      --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
-      --capture-key <CAPTURE_KEY>      Capture Rate key, 64 hex digits; needed below rate 1
-      --truncate-to <TRUNCATE_TO>      Captured bytes left in a truncated packet [default: 128]
-      --alarm-cap <ALARM_CAP>          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
+      --no-bodies
+          Don't keep HTTP bodies (hashes and tables stay the same)
+  -v, --verbose...
+          More log detail: -v DEBUG, -vv TRACE
+  -q, --quiet...
+          Less log detail: -q WARN, -qq ERROR
+      --log-level <LOG_LEVEL>
+          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
+      --log-format <LOG_FORMAT>
+          Log line format on stdout [default: text] [possible values: text, json]
+      --metrics-addr <METRICS_ADDR>
+          Serve Prometheus metrics here, e.g. 127.0.0.1:9464
+      --store <STORE>
+          Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
+      --s3-endpoint <S3_ENDPOINT>
+          S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
+      --spool <SPOOL>
+          Local spool for s3:// uploads [default: <out>/spool]
+      --spool-max-mib <SPOOL_MAX_MIB>
+          Spool cap in MiB; a full spool holds the run back [default: 4096]
+      --upload-wait-s <UPLOAD_WAIT_S>
+          Seconds to finish uploads at the end of a run [default: 30]
+      --fleet <FLEET>
+          Fleet URL to enrol with and pull config and seeds from (https://)
+      --fleet-ca <FLEET_CA>
+          PEM file of the CA the Fleet's and ingest's TLS chain to
+      --fleet-root <FLEET_ROOT>
+          The Fleet's Ed25519 public key, 64 hex digits
+      --join-token-file <JOIN_TOKEN_FILE>
+          File holding the site join token; needed to enrol
+      --fleet-dir <FLEET_DIR>
+          Fleet keys and state [default: <out>/fleet]
+      --dev-plain-http
+          Dev only: allow plain http:// to the ingest and the Fleet
+      --ingest <INGEST>
+          Dev only: plain http:// ingest URL; with --fleet, config names it
+      --ship-wait-s <SHIP_WAIT_S>
+          Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>
+          Manifest signing key, made if missing [default: <out>/signing.key]
+      --site <SITE>
+          The {site} part of object keys [default: local]
+      --collector-id <COLLECTOR_ID>
+          The {collector} part of object keys [default: local]
+      --capture-rate <CAPTURE_RATE>
+          Capture Rate: share of Request Workunits kept in full (0 to 1); --fleet's config wins [default: 1]
+      --capture-key <CAPTURE_KEY>
+          Dev only: Capture Rate key, 64 hex digits; --fleet uses seeds
+      --truncate-to <TRUNCATE_TO>
+          Captured bytes left in a truncated packet [default: 128]
+      --alarm-cap <ALARM_CAP>
+          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
 ```
 
 </details>
@@ -163,26 +261,58 @@ Options:
   -h, --help  Print help
 
 Global options:
-      --no-bodies                      Don't keep HTTP bodies (hashes and tables stay the same)
-  -v, --verbose...                     More log detail: -v DEBUG, -vv TRACE
-  -q, --quiet...                       Less log detail: -q WARN, -qq ERROR
-      --log-level <LOG_LEVEL>          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
-      --log-format <LOG_FORMAT>        Log line format on stdout [default: text] [possible values: text, json]
-      --metrics-addr <METRICS_ADDR>    Serve Prometheus metrics here, e.g. 127.0.0.1:9464
-      --store <STORE>                  Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
-      --s3-endpoint <S3_ENDPOINT>      S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
-      --spool <SPOOL>                  Local spool for s3:// uploads [default: <out>/spool]
-      --spool-max-mib <SPOOL_MAX_MIB>  Spool cap in MiB; a full spool holds the run back [default: 4096]
-      --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
-      --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
-      --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
-      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
-      --site <SITE>                    The {site} part of object keys [default: local]
-      --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
-      --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
-      --capture-key <CAPTURE_KEY>      Capture Rate key, 64 hex digits; needed below rate 1
-      --truncate-to <TRUNCATE_TO>      Captured bytes left in a truncated packet [default: 128]
-      --alarm-cap <ALARM_CAP>          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
+      --no-bodies
+          Don't keep HTTP bodies (hashes and tables stay the same)
+  -v, --verbose...
+          More log detail: -v DEBUG, -vv TRACE
+  -q, --quiet...
+          Less log detail: -q WARN, -qq ERROR
+      --log-level <LOG_LEVEL>
+          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
+      --log-format <LOG_FORMAT>
+          Log line format on stdout [default: text] [possible values: text, json]
+      --metrics-addr <METRICS_ADDR>
+          Serve Prometheus metrics here, e.g. 127.0.0.1:9464
+      --store <STORE>
+          Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
+      --s3-endpoint <S3_ENDPOINT>
+          S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
+      --spool <SPOOL>
+          Local spool for s3:// uploads [default: <out>/spool]
+      --spool-max-mib <SPOOL_MAX_MIB>
+          Spool cap in MiB; a full spool holds the run back [default: 4096]
+      --upload-wait-s <UPLOAD_WAIT_S>
+          Seconds to finish uploads at the end of a run [default: 30]
+      --fleet <FLEET>
+          Fleet URL to enrol with and pull config and seeds from (https://)
+      --fleet-ca <FLEET_CA>
+          PEM file of the CA the Fleet's and ingest's TLS chain to
+      --fleet-root <FLEET_ROOT>
+          The Fleet's Ed25519 public key, 64 hex digits
+      --join-token-file <JOIN_TOKEN_FILE>
+          File holding the site join token; needed to enrol
+      --fleet-dir <FLEET_DIR>
+          Fleet keys and state [default: <out>/fleet]
+      --dev-plain-http
+          Dev only: allow plain http:// to the ingest and the Fleet
+      --ingest <INGEST>
+          Dev only: plain http:// ingest URL; with --fleet, config names it
+      --ship-wait-s <SHIP_WAIT_S>
+          Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>
+          Manifest signing key, made if missing [default: <out>/signing.key]
+      --site <SITE>
+          The {site} part of object keys [default: local]
+      --collector-id <COLLECTOR_ID>
+          The {collector} part of object keys [default: local]
+      --capture-rate <CAPTURE_RATE>
+          Capture Rate: share of Request Workunits kept in full (0 to 1); --fleet's config wins [default: 1]
+      --capture-key <CAPTURE_KEY>
+          Dev only: Capture Rate key, 64 hex digits; --fleet uses seeds
+      --truncate-to <TRUNCATE_TO>
+          Captured bytes left in a truncated packet [default: 128]
+      --alarm-cap <ALARM_CAP>
+          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
 ```
 
 </details>
@@ -202,26 +332,58 @@ Options:
   -h, --help  Print help
 
 Global options:
-      --no-bodies                      Don't keep HTTP bodies (hashes and tables stay the same)
-  -v, --verbose...                     More log detail: -v DEBUG, -vv TRACE
-  -q, --quiet...                       Less log detail: -q WARN, -qq ERROR
-      --log-level <LOG_LEVEL>          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
-      --log-format <LOG_FORMAT>        Log line format on stdout [default: text] [possible values: text, json]
-      --metrics-addr <METRICS_ADDR>    Serve Prometheus metrics here, e.g. 127.0.0.1:9464
-      --store <STORE>                  Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
-      --s3-endpoint <S3_ENDPOINT>      S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
-      --spool <SPOOL>                  Local spool for s3:// uploads [default: <out>/spool]
-      --spool-max-mib <SPOOL_MAX_MIB>  Spool cap in MiB; a full spool holds the run back [default: 4096]
-      --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
-      --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
-      --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
-      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
-      --site <SITE>                    The {site} part of object keys [default: local]
-      --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
-      --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
-      --capture-key <CAPTURE_KEY>      Capture Rate key, 64 hex digits; needed below rate 1
-      --truncate-to <TRUNCATE_TO>      Captured bytes left in a truncated packet [default: 128]
-      --alarm-cap <ALARM_CAP>          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
+      --no-bodies
+          Don't keep HTTP bodies (hashes and tables stay the same)
+  -v, --verbose...
+          More log detail: -v DEBUG, -vv TRACE
+  -q, --quiet...
+          Less log detail: -q WARN, -qq ERROR
+      --log-level <LOG_LEVEL>
+          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
+      --log-format <LOG_FORMAT>
+          Log line format on stdout [default: text] [possible values: text, json]
+      --metrics-addr <METRICS_ADDR>
+          Serve Prometheus metrics here, e.g. 127.0.0.1:9464
+      --store <STORE>
+          Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
+      --s3-endpoint <S3_ENDPOINT>
+          S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
+      --spool <SPOOL>
+          Local spool for s3:// uploads [default: <out>/spool]
+      --spool-max-mib <SPOOL_MAX_MIB>
+          Spool cap in MiB; a full spool holds the run back [default: 4096]
+      --upload-wait-s <UPLOAD_WAIT_S>
+          Seconds to finish uploads at the end of a run [default: 30]
+      --fleet <FLEET>
+          Fleet URL to enrol with and pull config and seeds from (https://)
+      --fleet-ca <FLEET_CA>
+          PEM file of the CA the Fleet's and ingest's TLS chain to
+      --fleet-root <FLEET_ROOT>
+          The Fleet's Ed25519 public key, 64 hex digits
+      --join-token-file <JOIN_TOKEN_FILE>
+          File holding the site join token; needed to enrol
+      --fleet-dir <FLEET_DIR>
+          Fleet keys and state [default: <out>/fleet]
+      --dev-plain-http
+          Dev only: allow plain http:// to the ingest and the Fleet
+      --ingest <INGEST>
+          Dev only: plain http:// ingest URL; with --fleet, config names it
+      --ship-wait-s <SHIP_WAIT_S>
+          Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>
+          Manifest signing key, made if missing [default: <out>/signing.key]
+      --site <SITE>
+          The {site} part of object keys [default: local]
+      --collector-id <COLLECTOR_ID>
+          The {collector} part of object keys [default: local]
+      --capture-rate <CAPTURE_RATE>
+          Capture Rate: share of Request Workunits kept in full (0 to 1); --fleet's config wins [default: 1]
+      --capture-key <CAPTURE_KEY>
+          Dev only: Capture Rate key, 64 hex digits; --fleet uses seeds
+      --truncate-to <TRUNCATE_TO>
+          Captured bytes left in a truncated packet [default: 128]
+      --alarm-cap <ALARM_CAP>
+          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
 ```
 
 </details>
@@ -246,26 +408,58 @@ Options:
   -h, --help                     Print help
 
 Global options:
-      --no-bodies                      Don't keep HTTP bodies (hashes and tables stay the same)
-  -v, --verbose...                     More log detail: -v DEBUG, -vv TRACE
-  -q, --quiet...                       Less log detail: -q WARN, -qq ERROR
-      --log-level <LOG_LEVEL>          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
-      --log-format <LOG_FORMAT>        Log line format on stdout [default: text] [possible values: text, json]
-      --metrics-addr <METRICS_ADDR>    Serve Prometheus metrics here, e.g. 127.0.0.1:9464
-      --store <STORE>                  Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
-      --s3-endpoint <S3_ENDPOINT>      S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
-      --spool <SPOOL>                  Local spool for s3:// uploads [default: <out>/spool]
-      --spool-max-mib <SPOOL_MAX_MIB>  Spool cap in MiB; a full spool holds the run back [default: 4096]
-      --upload-wait-s <UPLOAD_WAIT_S>  Seconds to finish uploads at the end of a run [default: 30]
-      --ingest <INGEST>                Control-plane ingest URL each window's manifest is POSTed to
-      --ship-wait-s <SHIP_WAIT_S>      Seconds to finish shipping manifests at the end of a run [default: 30]
-      --signing-key <SIGNING_KEY>      Manifest signing key, made if missing [default: <out>/signing.key]
-      --site <SITE>                    The {site} part of object keys [default: local]
-      --collector-id <COLLECTOR_ID>    The {collector} part of object keys [default: local]
-      --capture-rate <CAPTURE_RATE>    Capture Rate: share of Request Workunits kept in full (0 to 1) [default: 1]
-      --capture-key <CAPTURE_KEY>      Capture Rate key, 64 hex digits; needed below rate 1
-      --truncate-to <TRUNCATE_TO>      Captured bytes left in a truncated packet [default: 128]
-      --alarm-cap <ALARM_CAP>          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
+      --no-bodies
+          Don't keep HTTP bodies (hashes and tables stay the same)
+  -v, --verbose...
+          More log detail: -v DEBUG, -vv TRACE
+  -q, --quiet...
+          Less log detail: -q WARN, -qq ERROR
+      --log-level <LOG_LEVEL>
+          Log level; overrides -v/-q (RUST_LOG overrides it) [possible values: error, warn, info, debug, trace]
+      --log-format <LOG_FORMAT>
+          Log line format on stdout [default: text] [possible values: text, json]
+      --metrics-addr <METRICS_ADDR>
+          Serve Prometheus metrics here, e.g. 127.0.0.1:9464
+      --store <STORE>
+          Object store: a directory or s3://bucket[/prefix] [default: <out>/store]
+      --s3-endpoint <S3_ENDPOINT>
+          S3 endpoint; required for s3:// unless AWS_ENDPOINT is set
+      --spool <SPOOL>
+          Local spool for s3:// uploads [default: <out>/spool]
+      --spool-max-mib <SPOOL_MAX_MIB>
+          Spool cap in MiB; a full spool holds the run back [default: 4096]
+      --upload-wait-s <UPLOAD_WAIT_S>
+          Seconds to finish uploads at the end of a run [default: 30]
+      --fleet <FLEET>
+          Fleet URL to enrol with and pull config and seeds from (https://)
+      --fleet-ca <FLEET_CA>
+          PEM file of the CA the Fleet's and ingest's TLS chain to
+      --fleet-root <FLEET_ROOT>
+          The Fleet's Ed25519 public key, 64 hex digits
+      --join-token-file <JOIN_TOKEN_FILE>
+          File holding the site join token; needed to enrol
+      --fleet-dir <FLEET_DIR>
+          Fleet keys and state [default: <out>/fleet]
+      --dev-plain-http
+          Dev only: allow plain http:// to the ingest and the Fleet
+      --ingest <INGEST>
+          Dev only: plain http:// ingest URL; with --fleet, config names it
+      --ship-wait-s <SHIP_WAIT_S>
+          Seconds to finish shipping manifests at the end of a run [default: 30]
+      --signing-key <SIGNING_KEY>
+          Manifest signing key, made if missing [default: <out>/signing.key]
+      --site <SITE>
+          The {site} part of object keys [default: local]
+      --collector-id <COLLECTOR_ID>
+          The {collector} part of object keys [default: local]
+      --capture-rate <CAPTURE_RATE>
+          Capture Rate: share of Request Workunits kept in full (0 to 1); --fleet's config wins [default: 1]
+      --capture-key <CAPTURE_KEY>
+          Dev only: Capture Rate key, 64 hex digits; --fleet uses seeds
+      --truncate-to <TRUNCATE_TO>
+          Captured bytes left in a truncated packet [default: 128]
+      --alarm-cap <ALARM_CAP>
+          Alarm-packet bytes kept in full per Flow per Slice [default: 16777216]
 ```
 
 </details>

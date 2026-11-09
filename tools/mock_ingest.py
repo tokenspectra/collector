@@ -9,7 +9,7 @@ or a repeat of the same bytes, 409 for other bytes. GET /stats returns the
 counts. Standard library only:
 
     python3 tools/mock_ingest.py --port 18090 --dir /tmp/ingest
-    collector --ingest http://127.0.0.1:18090/ingest/windows files ...
+    collector --dev-plain-http --ingest http://127.0.0.1:18090/ingest/windows files ...
 """
 
 import argparse

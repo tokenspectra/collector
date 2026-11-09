@@ -23,14 +23,15 @@
 //! Any other status, such as 409 for a window the ingest already holds
 //! with other bytes, stops the shipper: retrying cannot fix it.
 //!
-//! v1 speaks plain `http://` only, like the Tap (spec "Settled" 6).
+//! The ingest is reached over mTLS with the Fleet's short-lived certificate
+//! ([`crate::fleet`]); plain `http://` is for development only
+//! (`--dev-plain-http`).
 //!
 //! [`CURSOR`] is the shipper's own state, not an output of the run: two
 //! runs over the same capture write the same log whether or not they ship.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::thread::JoinHandle;
@@ -38,6 +39,8 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
+use crate::client::ClientError;
+pub use crate::client::Endpoint as Ingest;
 use crate::manifest::LOG;
 
 /// How far the log has been shipped: a byte offset, in decimal.
@@ -45,7 +48,7 @@ pub const CURSOR: &str = "manifests.shipped";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShipError {
-    #[error("ingest URL {0:?}: only http://host[:port]/path is supported")]
+    #[error("ingest: {0}")]
     Url(String),
     #[error("{0}")]
     Io(#[from] io::Error),
@@ -59,156 +62,34 @@ pub enum ShipError {
     BadLine(u64),
 }
 
+impl From<ClientError> for ShipError {
+    fn from(e: ClientError) -> Self {
+        match e {
+            ClientError::Io(e) => ShipError::Io(e),
+            ClientError::Unavailable(e) => ShipError::Unavailable(e),
+            e => ShipError::Url(e.to_string()),
+        }
+    }
+}
+
 impl ShipError {
     fn retryable(&self) -> bool {
         matches!(self, ShipError::Unavailable(_))
     }
 }
 
-/// Where the ingest is.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Ingest {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-impl Ingest {
-    /// Parses `http://host[:port][/path]`.
-    pub fn parse(url: &str) -> Result<Self, ShipError> {
-        let bad = || ShipError::Url(url.to_string());
-        let rest = url.strip_prefix("http://").ok_or_else(bad)?;
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
-        };
-        let (host, port) = match authority.strip_prefix('[') {
-            // An IPv6 literal: `[::1]` or `[::1]:8080`.
-            Some(v6) => {
-                let (h, rest) = v6.split_once(']').ok_or_else(bad)?;
-                match rest {
-                    "" => (h, 80),
-                    p => (
-                        h,
-                        p.strip_prefix(':').and_then(|p| p.parse().ok()).ok_or_else(bad)?,
-                    ),
-                }
-            }
-            None => match authority.split_once(':') {
-                Some((h, p)) => (h, p.parse::<u16>().map_err(|_| bad())?),
-                None => (authority, 80),
-            },
-        };
-        if host.is_empty() || path.chars().any(|c| c.is_ascii_control() || c == ' ') {
-            return Err(bad());
-        }
-        Ok(Ingest {
-            host: host.to_string(),
-            port,
-            path: path.to_string(),
-        })
-    }
-
-    /// POSTs one manifest line; returns the HTTP status. Gives up once
-    /// `until()` has passed; it is asked again at least every [`SLICE`]
-    /// while the address is looked up, the connection made, the request
-    /// written and the response awaited, so a deadline that moves closer
-    /// cuts the request short at any of them.
-    fn post(
-        &self,
-        key: &str,
-        body: &[u8],
-        until: &mut dyn FnMut() -> Instant,
-    ) -> Result<(u16, String), ShipError> {
-        let unavailable = |e: io::Error| ShipError::Unavailable(format!("{}:{}: {e}", self.host, self.port));
-        let mut left = || match until().checked_duration_since(Instant::now()) {
-            Some(d) if !d.is_zero() => Ok(d),
-            _ => Err(ShipError::Unavailable(format!(
-                "{}:{}: timed out",
-                self.host, self.port
-            ))),
-        };
-        let mut conn = self.connect(&mut left)?;
-        let host = if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        };
-        let head = format!(
-            "POST {} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nIdempotency-Key: {key}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            self.path,
-            body.len()
-        );
-        for mut part in [head.as_bytes(), body] {
-            while !part.is_empty() {
-                conn.set_write_timeout(Some(left()?.min(SLICE)))
-                    .map_err(unavailable)?;
-                match conn.write(part) {
-                    Ok(0) => return Err(unavailable(io::ErrorKind::WriteZero.into())),
-                    Ok(n) => part = &part[n..],
-                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(unavailable(e)),
-                }
-            }
-        }
-        let mut resp = Vec::new();
-        let mut buf = [0u8; 4096];
-        while resp.len() < 64 << 10 {
-            conn.set_read_timeout(Some(left()?.min(SLICE)))
-                .map_err(unavailable)?;
-            match conn.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => resp.extend_from_slice(&buf[..n]),
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(unavailable(e)),
-            }
-        }
-        let text = String::from_utf8_lossy(&resp);
-        let status = text
-            .lines()
-            .next()
-            .and_then(|l| l.split(' ').nth(1))
-            .and_then(|s| s.parse::<u16>().ok())
-            .ok_or_else(|| ShipError::Unavailable("no HTTP status in the response".into()))?;
-        let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b).trim();
-        Ok((status, body.chars().take(200).collect()))
-    }
-
-    /// Looks up the ingest and connects to it on a helper thread, waiting
-    /// on it in [`SLICE`]s so that `left()` running out is noticed. A
-    /// thread given up on finishes on its own: its connect is bounded by
-    /// the time left when it started, its lookup only by the resolver.
-    fn connect(&self, left: &mut dyn FnMut() -> Result<Duration, ShipError>) -> Result<TcpStream, ShipError> {
-        let (host, port, budget) = (self.host.clone(), self.port, left()?);
-        let (tx, rx) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("shipper-connect".into())
-            .spawn(move || {
-                let conn = (host.as_str(), port)
-                    .to_socket_addrs()
-                    .and_then(|mut addrs| {
-                        addrs
-                            .next()
-                            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))
-                    })
-                    .and_then(|addr| TcpStream::connect_timeout(&addr, budget));
-                let _ = tx.send(conn);
-            })?;
-        loop {
-            match rx.recv_timeout(left()?.min(SLICE)) {
-                Ok(conn) => {
-                    return conn
-                        .map_err(|e| ShipError::Unavailable(format!("{}:{}: {e}", self.host, self.port)))
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(ShipError::Io(io::Error::other("shipper connect thread panicked")))
-                }
-            }
-        }
-    }
+/// POSTs one manifest line; returns the HTTP status and the start of the
+/// reply. `until` is the request's deadline ([`Ingest::post`]).
+fn post(
+    ingest: &Ingest,
+    key: &str,
+    body: &[u8],
+    until: &mut dyn FnMut() -> Instant,
+) -> Result<(u16, String), ShipError> {
+    let headers = [("Content-Type", "application/json"), ("Idempotency-Key", key)];
+    let (status, reply) = ingest.post("", &headers, body, 64 << 10, until)?;
+    let text = String::from_utf8_lossy(&reply);
+    Ok((status, text.trim().chars().take(200).collect()))
 }
 
 /// What one pass shipped.
@@ -251,6 +132,12 @@ fn dedup_key(line: &[u8]) -> Option<String> {
 /// and stops at the first failure. The cursor advances past each line the
 /// ingest accepts.
 pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Shipped, ShipError> {
+    ship_from(out, &|| ingest.clone(), timeout)
+}
+
+/// [`ship_pending`], asking `ingest` where to ship before each line: a long
+/// drain can outlast the certificate it started with.
+pub fn ship_from(out: &Path, ingest: &dyn Fn() -> Ingest, timeout: Duration) -> Result<Shipped, ShipError> {
     ship_within(out, ingest, timeout, &mut || None)
 }
 
@@ -261,7 +148,7 @@ pub fn ship_pending(out: &Path, ingest: &Ingest, timeout: Duration) -> Result<Sh
 /// read the rest of the log.
 fn ship_within(
     out: &Path,
-    ingest: &Ingest,
+    ingest: &dyn Fn() -> Ingest,
     timeout: Duration,
     shutdown: &mut dyn FnMut() -> Option<Instant>,
 ) -> Result<Shipped, ShipError> {
@@ -308,20 +195,21 @@ fn ship_within(
         let request = Instant::now() + timeout;
         let sent = match dedup_key(body) {
             None => Err(ShipError::BadLine(offset)),
-            Some(key) => ingest
-                .post(&key, body, &mut || shutdown().map_or(request, |d| d.min(request)))
-                .and_then(|(status, text)| match status {
-                    200..=299 => {
-                        debug!(window = %key, status, "manifest shipped");
-                        Ok(())
-                    }
-                    408 | 429 | 500..=599 => Err(ShipError::Unavailable(format!("HTTP {status}: {text}"))),
-                    _ => Err(ShipError::Refused {
-                        key,
-                        status,
-                        body: text,
-                    }),
+            Some(key) => post(&ingest(), &key, body, &mut || {
+                shutdown().map_or(request, |d| d.min(request))
+            })
+            .and_then(|(status, text)| match status {
+                200..=299 => {
+                    debug!(window = %key, status, "manifest shipped");
+                    Ok(())
+                }
+                408 | 429 | 500..=599 => Err(ShipError::Unavailable(format!("HTTP {status}: {text}"))),
+                _ => Err(ShipError::Refused {
+                    key,
+                    status,
+                    body: text,
                 }),
+            }),
         };
         match sent {
             Ok(()) => {
@@ -347,10 +235,20 @@ pub struct Shipper {
 
 impl Shipper {
     pub fn spawn(out: PathBuf, ingest: Ingest, poll: Duration) -> io::Result<Self> {
+        Self::spawn_with(out, Box::new(move || ingest.clone()), poll)
+    }
+
+    /// As [`Shipper::spawn`], asking `ingest` where to ship before each
+    /// line: the Fleet can move the ingest and renews the certificate.
+    pub fn spawn_with(
+        out: PathBuf,
+        ingest: Box<dyn Fn() -> Ingest + Send>,
+        poll: Duration,
+    ) -> io::Result<Self> {
         let (stop, stopped) = mpsc::channel::<Instant>();
         let thread = std::thread::Builder::new()
             .name("shipper".into())
-            .spawn(move || run(&out, &ingest, poll, &stopped))?;
+            .spawn(move || run(&out, &*ingest, poll, &stopped))?;
         Ok(Shipper { stop, thread })
     }
 
@@ -368,13 +266,10 @@ impl Shipper {
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// The longest a request waits on the socket before the shutdown deadline
-/// is checked again.
-const SLICE: Duration = Duration::from_millis(50);
 
 fn run(
     out: &Path,
-    ingest: &Ingest,
+    ingest: &dyn Fn() -> Ingest,
     poll: Duration,
     stopped: &mpsc::Receiver<Instant>,
 ) -> Result<Shipped, ShipError> {
@@ -471,24 +366,9 @@ pub fn log_outcome(res: &Result<Shipped, ShipError>, out: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::{Read, Write};
 
-    #[test]
-    fn parses_http_urls_only() {
-        let i = Ingest::parse("http://127.0.0.1:8080/ingest/windows").unwrap();
-        assert_eq!(
-            (i.host.as_str(), i.port, i.path.as_str()),
-            ("127.0.0.1", 8080, "/ingest/windows")
-        );
-        let i = Ingest::parse("http://cp.local").unwrap();
-        assert_eq!((i.host.as_str(), i.port, i.path.as_str()), ("cp.local", 80, "/"));
-        let i = Ingest::parse("http://[::1]:9/x").unwrap();
-        assert_eq!((i.host.as_str(), i.port), ("::1", 9));
-        assert!(Ingest::parse("https://cp.local/").is_err());
-        assert!(Ingest::parse("http://:80/").is_err());
-        assert!(Ingest::parse("http://h:x/").is_err());
-        assert!(Ingest::parse("http://h/a b").is_err());
-    }
+    use super::*;
 
     #[test]
     fn dedup_key_is_collector_and_window() {
@@ -513,7 +393,7 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let ingest = Ingest::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let ingest = Ingest::plain(&format!("http://127.0.0.1:{port}/")).unwrap();
         let err = ship_pending(dir.path(), &ingest, Duration::from_secs(1)).unwrap_err();
         assert!(err.retryable(), "{err}");
         assert_eq!(pending_lines(dir.path()).unwrap(), 2);
@@ -562,7 +442,20 @@ mod tests {
                 }
             }
         });
-        Ingest::parse(&format!("http://127.0.0.1:{port}/")).unwrap()
+        Ingest::plain(&format!("http://127.0.0.1:{port}/")).unwrap()
+    }
+
+    #[test]
+    fn the_ingest_is_asked_again_for_each_line() {
+        let dir = log_of(3);
+        let ingest = slow_ingest(Some(Duration::ZERO));
+        let asked = std::cell::Cell::new(0);
+        let from = || {
+            asked.set(asked.get() + 1);
+            ingest.clone()
+        };
+        let s = ship_from(dir.path(), &from, Duration::from_secs(5)).unwrap();
+        assert_eq!((s.sent, asked.get()), (3, 3));
     }
 
     #[test]
@@ -645,7 +538,7 @@ mod tests {
                 let _ = accepted.send(());
             }
         });
-        let ingest = Ingest::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let ingest = Ingest::plain(&format!("http://127.0.0.1:{port}/")).unwrap();
         let shipper = Shipper::spawn(dir.to_owned(), ingest, Duration::from_secs(1)).unwrap();
         connected.recv_timeout(Duration::from_secs(10)).unwrap();
         std::thread::sleep(Duration::from_millis(200)); // the upload is stuck
