@@ -2,11 +2,11 @@
 
 **Status**: Draft
 
-> Moved from [tokenspectra `docs/design/collector.md`](https://github.com/tokenspectra/tokenspectra/blob/fc185ea/docs/design/collector.md) so the spec sits next to its code. Section numbers are unchanged; earlier history is in that repo.
+> Moved from TokenSpectra's Collector design doc so the spec sits next to its code. Section numbers are unchanged; earlier history is in TokenSpectra's design repo.
 
-How the Phase 2 Rust Collector turns traffic on a Link into hashed, stored evidence: pcapng chunks, Flows, Slices and Request Workunits, all addressable by BLAKE3 hash. It runs live or on `.pcap`/`.pcapng` files. Terms are in [CONTEXT.md](https://github.com/tokenspectra/tokenspectra/blob/main/CONTEXT.md). Evidence is in [collector-capture-and-store.md](https://github.com/tokenspectra/tokenspectra/blob/main/docs/research/collector-capture-and-store.md). The Collector's place in the system is in [architecture.md](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/architecture.md) §3–4.
+How the Phase 2 Rust Collector turns traffic on a Link into hashed, stored evidence: pcapng chunks, Flows, Slices and Request Workunits, all addressable by BLAKE3 hash. It runs live or on `.pcap`/`.pcapng` files. Terms are in TokenSpectra's glossary. Evidence is in TokenSpectra's research note on Collector capture and storage. The Collector's place in the system is in TokenSpectra's architecture design doc, §3–4.
 
-## Settled (TS-22, Ángel Manuel Martín, 2026-11-01)
+## Settled (TS-22)
 
 1. **Hash function: BLAKE3.**
 2. **Hash at three levels:** L0 pcapng chunks, each Flow's byte stream per Slice, and Request Workunit bodies.
@@ -19,7 +19,7 @@ How the Phase 2 Rust Collector turns traffic on a Link into hashed, stored evide
 
 Everything below these eight points is proposal, not settled.
 
-> _Contradicts [ADR-0001](https://github.com/tokenspectra/tokenspectra/blob/main/docs/adr/0001-plaintext-via-key-disclosure-first.md) and [poc.md](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/poc.md) (Approved)._ Both put key disclosure (Envoy `key_log`) first and plaintext tap points later. Point 6 swaps that order for v1. It matches the v1 API Tap, which serves plain HTTP with no TLS (TS-15). The keylog path stays possible later (§9). ADR-0001 and poc.md need an owner's note or a superseding ADR.
+> TokenSpectra's earlier plan (its decision record on plaintext via key disclosure, and its PoC design doc) put key disclosure (Envoy `key_log`) first and plaintext tap points later. Point 6 swaps that order for v1. It matches the v1 API Tap, which serves plain HTTP with no TLS (TS-15). The keylog path stays possible later (§9).
 
 ## 1. Scope
 
@@ -80,7 +80,7 @@ trait PacketSource {           // yields packets in capture order
 - **Windows:** the Slice window length `W` comes from the control plane. `-b interval:W` cuts dumpcap files at wall-clock multiples of `W`, so file boundaries match Slice boundaries (research §1).
   - Offline input is re-cut into windows by packet timestamp.
 - **Links:** one dumpcap per Link, or one pcapng with an Interface Description Block per Link. `link_id` comes from the interface.
-  - The PoC has a single Software Tap Link (poc.md).
+  - The PoC has a single Software Tap Link (TokenSpectra's PoC design doc).
 
 ## 4. Flow assembly (L1)
 
@@ -165,7 +165,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
 - Outcome (§14): `done` is set only by `message_stop`, so only a stream that reaches it is `ok`, whatever its `stop_reason` (`max_tokens` is a whole response, recorded as the finish reason). A stream that ends cleanly without `message_stop`, and one with an in-band `error` event behind HTTP 200, are counted as not read, so they are `errored`; a gap makes the Workunit `incomplete` first. An error body on a non-2xx status is read: an `ok` Workunit with that status and `error_type` set. A whole JSON body of any other `type` (the API names every stream event, so an unnamed frame is a body) is not read, so it is `errored`.
 - `extra`: `cache_creation_input_tokens`, `cache_read_input_tokens`, `stop_sequence`, and `error_type` (`error.type` of an error body or event, e.g. `overloaded_error`).
 
-**DNS and covert-channel features (TS-51).** Decoded at the edge, at 100%, because they are parsers of adversary bytes that are cheap here and expensive to rebuild from L0 later ([verification-pipeline §5](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/verification-pipeline.md)). They are facts: Allowlist rules ("DNS to resolver X, zones in Y, ≤ N B/s"), Signatures and statuses stay in the Classifier.
+**DNS and covert-channel features (TS-51).** Decoded at the edge, at 100%, because they are parsers of adversary bytes that are cheap here and expensive to rebuild from L0 later (TokenSpectra's verification pipeline design doc, §5). They are facts: Allowlist rules ("DNS to resolver X, zones in Y, ≤ N B/s"), Signatures and statuses stay in the Classifier.
 - **Which datagrams.** Every UDP datagram, on any port, is tried as one DNS message (RFC 1035 §4.1); a datagram is DNS only when it parses. Ports never count: DNS to a non-standard port is DNS, and a datagram to port 53 that does not parse is not.
 - **Narrow on purpose.** The parse reads what a rule like "DNS to resolver X, zones in Y, ≤ N B/s" needs (the resolver is the Flow's endpoint, the zone comes from the qname, the rate from byte counts), plus the content features below. It is not a full DNS parser, and nothing here says a message is valid DNS beyond these checks.
   - **Header and first question: strict.** A 12-byte header with opcode QUERY and at least one question, then the qname, qtype and qclass. A qname has at most 63 bytes a label and 255 a name; label types `01` and `10` are rejected. Only the header comes before the first qname, so a compression pointer in it could reach only the header or the name's own labels: any pointer there is rejected. A datagram the capture cut is not read.
@@ -175,7 +175,7 @@ Everything else is `http:other`, e.g. `/health`, `/metrics`, `/v1/models`, other
   - Bytes after the last record do not stop the parse; they are counted in `trailing_bytes`, since data hidden there is worth seeing.
 - **Byte accounting.** Each payload byte of a UDP Flow is in exactly one bucket (below): `fact` when its datagram walks as a whole DNS message, `gap` when the capture cut it, `unexplained` otherwise. So the bytes of a UDP/53 Flow are all in a DNS fact or explicitly unexplained, and per direction and Slice `fact` equals the `size` of that direction's `dns` rows.
 - **Not changed:** a UDP Flow's verdict stays `opaque`, and the Capture Rate keeps it as an alarm Flow whatever its buckets (§7). The Classifier reads the `dns` and `features` tables to match an Allowlist rule.
-- **A pure parse.** `dns.rs` reads bytes and returns rows: no clock, no I/O, no store, stats or manifest; it is meant for the `parse` crate ([hardware-collector §4, §7](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/hardware-collector.md#protocol-facts-dns-tls-clienthello-ntp)).
+- **A pure parse.** `dns.rs` reads bytes and returns rows: no clock, no I/O, no store, stats or manifest; it is meant for the `parse` crate (TokenSpectra's hardware Collector design doc, §4 and §7).
 - **A fact is not a check of the bytes.** `fact` says a datagram walked as DNS, not that its RDATA is what its type claims: data can ride in any record, and it counts in the byte columns but in no content feature except TXT sizes. A bound on what a Flow can carry comes from all its bytes, not from what parsed.
 - **Not in TS-51:** DNS over TCP (it stays `opaque`), DNS over TLS or HTTPS (opaque by design), non-QUERY opcodes, names and RDATA outside the first question and TXT sizes, EDNS options, mDNS-specific fields.
 
@@ -217,9 +217,9 @@ Name features are taken over queries only, so a name its response repeats counts
 | `gap` | Bytes counted by sequence numbers (TCP) or by length (UDP) but never captured |
 
 - The Collector reports buckets and verdicts. **It never assigns a status.**
-- The Classifier applies the rules from [architecture.md](https://github.com/tokenspectra/tokenspectra/blob/main/docs/design/architecture.md) §5:
+- The Classifier applies the rules from TokenSpectra's architecture design doc, §5:
   - `http_other` needs an Allowlist rule;
-  - on a Flow covered by a Placement, `unexplained` bytes mean no Provenance, so Refuted ([ADR-0002](https://github.com/tokenspectra/tokenspectra/blob/main/docs/adr/0002-reproduce-every-byte-no-byte-accounting.md));
+  - on a Flow covered by a Placement, `unexplained` bytes mean no Provenance, so Refuted (TokenSpectra's decision record on reproducing every byte);
   - elsewhere, they leave the Slice Characterized or Unknown.
 - **Flows with no Workunit are hashed and stored like every other Flow.** L0 and L1 don't care about the protocol. The only difference is retention (§7): these Flows are the alarm, so they're kept in full.
 
@@ -268,8 +268,8 @@ The Collector holds one window in memory (or on local disk), hashes all of it, t
 | Everything else (Workunits not kept) | Truncated to headers (e.g. 128 B captured) |
 
 - **Truncation keeps the original length.** pcapng records captured and original length per packet (research §2). Metadata and byte accounting stay at 100% while payload follows the Capture Rate.
-- **Unpredictable sampling.** The Capture Rate draw needs randomness the Operator can't predict (CONTEXT.md). The Collector uses a per-window secret from the control plane, never derived from the traffic.
-  - This is separate from the Sampler's Recompute Rate secret, which never reaches the edge (architecture.md §3).
+- **Unpredictable sampling.** The Capture Rate draw needs randomness the Operator can't predict (TokenSpectra's glossary). The Collector uses a per-window secret from the control plane, never derived from the traffic.
+  - This is separate from the Sampler's Recompute Rate secret, which never reaches the edge (TokenSpectra's architecture design doc, §3).
 - **Deletion is the control plane's job**, under the Retention Policy. The Collector only writes.
 
 **As built (TS-26).**
@@ -285,7 +285,7 @@ The Collector holds one window in memory (or on local disk), hashes all of it, t
 ## 8. Object-store layout
 
 The seam is the `object_store` crate's `ObjectStore` trait (research §3):
-- `LocalFileSystem` for the PoC. Retention beyond a local buffer is out of PoC scope (poc.md).
+- `LocalFileSystem` for the PoC. Retention beyond a local buffer is out of PoC scope (TokenSpectra's PoC design doc).
 - `AmazonS3` for any S3-compatible service later. Community MinIO is now source-only and unmaintained (research §4), so the self-hosted store is an open choice.
 
 **Keys.** Everything is written once with `PutMode::Create`: `If-None-Match: *` on S3; on local FS a repeat put fails with `AlreadyExists` (research §3–4).
@@ -365,7 +365,7 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
 
 ## 9. TLS, later
 
-- When TLS returns (ADR-0001), dumpcap still captures ciphertext into the same L0 chunks.
+- When TLS returns (key disclosure, as TokenSpectra's earlier plan had it), dumpcap still captures ciphertext into the same L0 chunks.
 - The Collector decrypts with a disclosed key log and runs the same L1–L3 on the plaintext.
 - L1 hashing is then done twice: over the ciphertext stream (the Observation) and over the plaintext stream (what the Workunits index into).
 - Stored chunks can carry the key log in a pcapng Decryption Secrets Block, so a human can open them decrypted in Wireshark (research §2). Keys are as sensitive as payload and follow the same retention.
@@ -374,7 +374,7 @@ index/{site}/{collector}/{yyyy}/{mm}/{dd}/{window_start}/{table}.parquet
 
 - **Why it matters:** a plain hash used as a name lets anyone who sees the names test a guess.
   - Example: hash "Summarize Acme's Q3 losses" and look for that hash in a bucket listing or index. A match confirms the text was sent, without opening any object.
-  - Long, unique prompts are safe in practice; short or templated ones are guessable. [dynamo-mooncake-xllm-wire.md](https://github.com/tokenspectra/tokenspectra/blob/main/docs/research/dynamo-mooncake-xllm-wire.md) flags the same risk for Dynamo's `tokens_hash`.
+  - Long, unique prompts are safe in practice; short or templated ones are guessable. TokenSpectra's research note on the Dynamo, Mooncake and xLLM wire formats flags the same risk for Dynamo's `tokens_hash`.
 - **Keyed BLAKE3** (`keyed_hash`, 256-bit key; research §3) fixes this. Only holders of the auditor's key can compute names. An outside verifier needs the key for that audit.
 - **v1 (settled):** plain BLAKE3, a private bucket, encryption at rest.
 - **Before a real Site (proposal):** keyed hashes for L2 body names and the `blobs` index, alongside the "Payload privacy" roadmap item. L0 chunk names can stay plain: they hash a whole window of packets, which nobody can guess.

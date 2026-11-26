@@ -1,6 +1,9 @@
 # TokenSpectra Collector
 
-The Rust Collector for [TokenSpectra](https://github.com/tokenspectra/tokenspectra). It reads network traffic from a live interface or from pcap files. It accounts for every byte, decodes LLM requests (OpenAI, Anthropic and Ollama) into Request Workunits, and stores everything under BLAKE3 hashes as evidence an auditor can check.
+> [!WARNING]
+> **Prototype software in fast development.** Interfaces, file formats and the spec change without notice. Not for production use.
+
+The Rust Collector for [TokenSpectra](https://tokenspectra.com). It reads network traffic from a live interface or from pcap files. It accounts for every byte, decodes LLM requests (OpenAI, Anthropic and Ollama) into Request Workunits, and stores everything under BLAKE3 hashes as evidence a Verifier can check.
 
 ![The capture viewer on local Ollama traffic](docs/viewer.png)
 
@@ -21,6 +24,14 @@ python3 tools/llm_traffic.py --stream --count 5 --interval 10
 Press Ctrl-C in terminal 1, open `viewer/index.html` in a browser and choose `ts-captures-demo/`.
 
 To read existing captures instead: `cargo run -- files -o out/ capture.pcapng`. Run the tests with `cargo test --workspace`.
+
+## Status and limitations
+
+- **Plaintext only.** The Collector reads unencrypted traffic; TLS must be terminated before the Tap.
+- **The spec is a Draft.** [docs/spec.md](docs/spec.md) is still changing, and so are the output formats it describes.
+- **Not for production.** This is a prototype for research and demos.
+
+Ids like `TS-22` in code and docs refer to TokenSpectra's internal issue tracker.
 
 
 
@@ -269,3 +280,7 @@ Global options:
 ```
 
 </details>
+
+## License
+
+Apache-2.0; see [LICENSE](LICENSE).
