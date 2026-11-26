@@ -8,3 +8,13 @@
 # id = "RUSTSEC-0000-0000"
 # ignoreUntil = 2027-01-01
 # reason = "Why this does not apply here."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2027-03-01
+reason = "chrono is flagged unmaintained: an informational notice, not a vulnerability, with no fixed version. It comes in transitively through object_store 0.14.2 and parquet 60.2.0, whose latest releases still depend on it."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0542"
+ignoreUntil = 2027-03-01
+reason = "humantime is flagged unmaintained: an informational notice, not a vulnerability, with no fixed version. It comes in transitively through object_store 0.14.2, whose latest release still depends on it."
