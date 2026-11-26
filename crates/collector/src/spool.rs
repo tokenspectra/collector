@@ -446,8 +446,15 @@ mod tests {
                 })
             })
             .collect();
+        // The winner's synced put can be slow on a loaded runner: wait for it,
+        // then give the loser time to (wrongly) pass the cap.
+        let finished = || writers.iter().filter(|w| w.is_finished()).count();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while finished() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(writers.iter().filter(|w| w.is_finished()).count(), 1);
+        assert_eq!(finished(), 1);
         assert_eq!(spool.pending(), (1, 8));
 
         let remote = Arc::new(InMemory::new());
