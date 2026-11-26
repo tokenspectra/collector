@@ -563,7 +563,7 @@ fn quiet_run_logs_nothing_and_log_level_overrides() {
 #[test]
 fn capture_drops_come_from_interface_statistics() {
     use pcap_file::pcapng::blocks::interface_description::{
-        InterfaceDescriptionBlock, InterfaceDescriptionOption,
+        InterfaceDescriptionBlock, InterfaceDescriptionOption, InterfaceTsResolution,
     };
     use pcap_file::pcapng::blocks::interface_statistics::{
         InterfaceStatisticsBlock, InterfaceStatisticsOption,
@@ -581,13 +581,13 @@ fn capture_drops_come_from_interface_statistics() {
         snaplen: 0,
         options: vec![
             InterfaceDescriptionOption::IfName(Cow::Borrowed("tap0")),
-            InterfaceDescriptionOption::IfTsResol(9),
+            InterfaceDescriptionOption::IfTsResol(InterfaceTsResolution::NANO),
         ],
     })
     .unwrap();
     let isb = |n| InterfaceStatisticsBlock {
         interface_id: 0,
-        timestamp: 0,
+        timestamp: Duration::ZERO,
         options: vec![InterfaceStatisticsOption::IsbIfDrop(n)],
     };
     for (i, f) in frames.iter().enumerate() {

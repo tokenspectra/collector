@@ -106,7 +106,7 @@ mod tests {
         let mut r = pcap_file::pcapng::PcapNgReader::new(&bytes[..]).unwrap();
         let mut seen = Vec::new();
         while let Some(block) = r.next_block() {
-            if let pcap_file::pcapng::Block::EnhancedPacket(p) = block.unwrap() {
+            if let (pcap_file::pcapng::Block::EnhancedPacket(p), _) = block.unwrap() {
                 seen.push((p.timestamp.as_nanos() as u64, p.original_len, p.data.to_vec()));
             }
         }
