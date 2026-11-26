@@ -4,5 +4,5 @@ members = ["crates/bundle", "crates/collector", "crates/commit"]
 
 [workspace.package]
 edition = "2021"
-license = "UNLICENSED"
+license = "Apache-2.0"
 publish = false
