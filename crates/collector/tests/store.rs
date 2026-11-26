@@ -72,7 +72,7 @@ fn pcapng_packets(bytes: &[u8]) -> Vec<(Vec<u8>, u32)> {
     let mut r = pcap_file::pcapng::PcapNgReader::new(bytes).unwrap();
     let mut out = Vec::new();
     while let Some(block) = r.next_block() {
-        if let pcap_file::pcapng::Block::EnhancedPacket(p) = block.unwrap() {
+        if let (pcap_file::pcapng::Block::EnhancedPacket(p), _) = block.unwrap() {
             out.push((p.data.to_vec(), p.original_len));
         }
     }

@@ -8,13 +8,12 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use pcap_file::pcap::PcapReader;
+use pcap_file::pcap::{PcapReadError, PcapReader, PcapTsResolution};
 use pcap_file::pcapng::blocks::interface_description::{
     InterfaceDescriptionBlock, InterfaceDescriptionOption,
 };
 use pcap_file::pcapng::blocks::interface_statistics::InterfaceStatisticsOption;
-use pcap_file::pcapng::{Block, PcapNgReader};
-use pcap_file::TsResolution;
+use pcap_file::pcapng::{Block, PcapNgReadError, PcapNgReader};
 
 pub use crate::packet::{CapturedPacket, LinkId};
 
@@ -30,7 +29,13 @@ pub enum SourceError {
     Pcap {
         path: PathBuf,
         #[source]
-        source: pcap_file::PcapError,
+        source: PcapReadError,
+    },
+    #[error("{path}: {source}")]
+    PcapNg {
+        path: PathBuf,
+        #[source]
+        source: PcapNgReadError,
     },
     #[error("{path}: {msg}")]
     Format { path: PathBuf, msg: String },
@@ -150,19 +155,23 @@ impl OpenFile {
             path: path.to_owned(),
             source,
         };
+        let pcapng_err = |source| SourceError::PcapNg {
+            path: path.to_owned(),
+            source,
+        };
         let mut file = File::open(path).map_err(io_err)?;
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic).map_err(io_err)?;
         file.seek(SeekFrom::Start(0)).map_err(io_err)?;
         let buf = BufReader::new(file);
         let reader = if magic == PCAPNG_MAGIC {
-            Reader::Ng(Box::new(PcapNgReader::new(buf).map_err(pcap_err)?))
+            Reader::Ng(Box::new(PcapNgReader::new(buf).map_err(pcapng_err)?))
         } else {
             let reader = PcapReader::new(buf).map_err(pcap_err)?;
             let header = reader.header();
             Reader::Legacy {
                 link_type: u32::from(header.datalink),
-                nanos: header.ts_resolution == TsResolution::NanoSecond,
+                nanos: header.ts_resolution == PcapTsResolution::NanoSecond,
                 reader: Box::new(reader),
             }
         };
@@ -205,21 +214,21 @@ fn next_pcapng(
     drops: &mut BTreeMap<LinkId, u64>,
 ) -> Option<Result<CapturedPacket, SourceError>> {
     loop {
-        let block = match reader.next_block()? {
-            Ok(block) => block,
+        let (block, state) = match reader.next_block()? {
+            Ok(next) => next,
             Err(source) => {
-                return Some(Err(SourceError::Pcap {
+                return Some(Err(SourceError::PcapNg {
                     path: path.to_owned(),
                     source,
                 }))
             }
         };
-        let (interface_id, raw_ts, orig_len, data) = match block {
+        let (interface_id, ts, orig_len, data) = match block {
             Block::EnhancedPacket(epb) => (
                 epb.interface_id,
-                // pcap-file stores the raw timestamp units as nanoseconds; the
-                // real unit comes from the interface's if_tsresol.
-                epb.timestamp.as_nanos() as u64,
+                // pcap-file applies the interface's if_tsresol and
+                // if_tsoffset: this is the time since the Unix epoch.
+                epb.timestamp,
                 epb.original_len,
                 epb.data.into_owned(),
             ),
@@ -228,11 +237,9 @@ fn next_pcapng(
                     InterfaceStatisticsOption::IsbIfDrop(n) => Some(*n),
                     _ => None,
                 });
-                let interface_id = isb.interface_id;
-                drop(isb);
-                let idb = reader.interfaces().get(interface_id as usize);
+                let idb = state.interfaces().get(isb.interface_id as usize);
                 if let (Some(n), Some(idb)) = (dropped, idb) {
-                    drops.insert(link_id(idb, interface_id), n);
+                    drops.insert(link_id(idb, isb.interface_id), n);
                 }
                 continue;
             }
@@ -244,15 +251,14 @@ fn next_pcapng(
             }
             _ => continue,
         };
-        let Some(idb) = reader.interfaces().get(interface_id as usize) else {
+        let Some(idb) = state.interfaces().get(interface_id as usize) else {
             return Some(Err(format_err(
                 path,
                 format!("packet refers to unknown interface {interface_id}"),
             )));
         };
-        let ts_ns = match pcapng_ts_ns(idb, raw_ts) {
-            Some(ts) => ts,
-            None => return Some(Err(format_err(path, "timestamp out of range"))),
+        let Ok(ts_ns) = u64::try_from(ts.as_nanos()) else {
+            return Some(Err(format_err(path, "timestamp out of range")));
         };
         return Some(Ok(CapturedPacket {
             link_id: link_id(idb, interface_id),
@@ -271,37 +277,6 @@ fn link_id(idb: &InterfaceDescriptionBlock, interface_id: u32) -> LinkId {
         }
     }
     LinkId::new(&format!("if{interface_id}"))
-}
-
-/// Converts a raw pcapng timestamp to nanoseconds using `if_tsresol`
-/// (default 10^-6) and `if_tsoffset` (seconds, default 0).
-fn pcapng_ts_ns(idb: &InterfaceDescriptionBlock, raw: u64) -> Option<u64> {
-    let mut resol = 6u8;
-    let mut offset_s = 0u64;
-    for opt in &idb.options {
-        match opt {
-            InterfaceDescriptionOption::IfTsResol(r) => resol = *r,
-            InterfaceDescriptionOption::IfTsOffset(o) => offset_s = *o,
-            _ => {}
-        }
-    }
-    let raw = raw as u128;
-    let ns: u128 = if resol & 0x80 == 0 {
-        let exp = u32::from(resol);
-        if exp <= 9 {
-            raw.checked_mul(10u128.pow(9 - exp))?
-        } else {
-            raw / 10u128.checked_pow(exp - 9)?
-        }
-    } else {
-        let exp = u32::from(resol & 0x7f);
-        if exp > 64 {
-            return None;
-        }
-        raw.checked_mul(1_000_000_000)? >> exp
-    };
-    let ns = ns.checked_add(u128::from(offset_s).checked_mul(1_000_000_000)?)?;
-    u64::try_from(ns).ok()
 }
 
 fn next_legacy(
@@ -345,6 +320,11 @@ fn next_legacy(
 mod tests {
     use super::*;
     use std::borrow::Cow;
+    use std::time::Duration;
+
+    use pcap_file::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
+    use pcap_file::pcapng::blocks::interface_description::InterfaceTsResolution;
+    use pcap_file::pcapng::PcapNgWriter;
 
     fn idb(opts: Vec<InterfaceDescriptionOption<'static>>) -> InterfaceDescriptionBlock<'static> {
         InterfaceDescriptionBlock {
@@ -354,22 +334,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ts_default_resolution_is_microseconds() {
-        assert_eq!(pcapng_ts_ns(&idb(vec![]), 1_500_000), Some(1_500_000_000));
+    /// Writes one packet per (if_tsresol, if_tsoffset) interface, timestamped
+    /// `ts`, and reads the file back.
+    fn read_back(interfaces: &[(InterfaceTsResolution, i64)], ts: Duration) -> Vec<u64> {
+        let mut w = PcapNgWriter::new(Vec::new()).unwrap();
+        for (resol, offset) in interfaces {
+            let mut idb = idb(vec![InterfaceDescriptionOption::IfTsResol(*resol)]);
+            if *offset != 0 {
+                idb.options.push(InterfaceDescriptionOption::IfTsOffset(*offset));
+            }
+            w.write_pcapng_block(idb).unwrap();
+        }
+        for interface_id in 0..interfaces.len() as u32 {
+            w.write_pcapng_block(EnhancedPacketBlock {
+                interface_id,
+                timestamp: ts,
+                original_len: 4,
+                data: Cow::Borrowed(&[0; 4]),
+                options: vec![],
+            })
+            .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ts.pcapng");
+        std::fs::write(&path, w.into_inner()).unwrap();
+        let mut src = FileSource::new([path]);
+        std::iter::from_fn(|| src.next())
+            .map(|p| p.unwrap().ts_ns)
+            .collect()
     }
 
+    /// if_tsresol (decimal and binary) and if_tsoffset all land on the same
+    /// nanoseconds since the Unix epoch.
     #[test]
-    fn ts_nanosecond_and_binary_resolution() {
-        let ns = idb(vec![InterfaceDescriptionOption::IfTsResol(9)]);
-        assert_eq!(pcapng_ts_ns(&ns, 42), Some(42));
-        let bin = idb(vec![InterfaceDescriptionOption::IfTsResol(0x80 | 10)]);
-        assert_eq!(pcapng_ts_ns(&bin, 1024), Some(1_000_000_000));
-        let off = idb(vec![
-            InterfaceDescriptionOption::IfTsResol(9),
-            InterfaceDescriptionOption::IfTsOffset(2),
-        ]);
-        assert_eq!(pcapng_ts_ns(&off, 5), Some(2_000_000_005));
+    fn ts_honours_resolution_and_offset() {
+        let ts = Duration::new(1_793_620_800, 0);
+        let got = read_back(
+            &[
+                (InterfaceTsResolution::MICRO, 0),
+                (InterfaceTsResolution::NANO, 0),
+                (InterfaceTsResolution::new(true, 10).unwrap(), 0),
+                (InterfaceTsResolution::NANO, 1_000),
+            ],
+            ts,
+        );
+        assert_eq!(got, vec![1_793_620_800_000_000_000; 4]);
     }
 
     #[test]

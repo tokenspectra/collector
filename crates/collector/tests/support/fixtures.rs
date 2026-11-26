@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use pcap_file::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
 use pcap_file::pcapng::blocks::interface_description::{
-    InterfaceDescriptionBlock, InterfaceDescriptionOption,
+    InterfaceDescriptionBlock, InterfaceDescriptionOption, InterfaceTsResolution,
 };
 use pcap_file::pcapng::PcapNgWriter;
 use pcap_file::DataLink;
@@ -174,7 +174,7 @@ pub fn pcapng(frames: &[Frame]) -> Vec<u8> {
         snaplen: 0,
         options: vec![
             InterfaceDescriptionOption::IfName(Cow::Borrowed("tap0")),
-            InterfaceDescriptionOption::IfTsResol(9),
+            InterfaceDescriptionOption::IfTsResol(InterfaceTsResolution::NANO),
         ],
     })
     .expect("idb");
